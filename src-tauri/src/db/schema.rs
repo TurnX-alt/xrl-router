@@ -1,0 +1,140 @@
+/// Database schema migrations.
+/// Each element in the array is a complete migration SQL statement.
+pub const MIGRATIONS: &[&str] = &[
+    // V1: Initial schema
+    r#"
+CREATE TABLE IF NOT EXISTS providers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_path TEXT DEFAULT '/chat/completions',
+    enabled INTEGER DEFAULT 1,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS models (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    tier TEXT NOT NULL DEFAULT 'custom',
+    context_window INTEGER DEFAULT 128000,
+    max_output_tokens INTEGER DEFAULT 4096,
+    cost_per_1k_input REAL DEFAULT 0.0,
+    cost_per_1k_output REAL DEFAULT 0.0,
+    enabled INTEGER DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE,
+    UNIQUE(provider_id, model_id)
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    key_hash TEXT NOT NULL,
+    key_masked TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'unknown',
+    last_error TEXT,
+    last_error_code INTEGER,
+    last_error_time INTEGER,
+    last_used_at INTEGER,
+    balance REAL,
+    balance_updated_at INTEGER,
+    total_requests INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS routes (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    priority INTEGER DEFAULT 100,
+    weight REAL DEFAULT 1.0,
+    enabled INTEGER DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (model_id) REFERENCES models(id) ON DELETE CASCADE,
+    FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    key_id TEXT,
+    request_type TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    success INTEGER NOT NULL,
+    error_message TEXT,
+    cost_estimate REAL,
+    FOREIGN KEY (provider_id) REFERENCES providers(id),
+    FOREIGN KEY (model_id) REFERENCES models(id),
+    FOREIGN KEY (key_id) REFERENCES api_keys(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_models_provider ON models(provider_id);
+CREATE INDEX IF NOT EXISTS idx_keys_provider ON api_keys(provider_id);
+CREATE INDEX IF NOT EXISTS idx_keys_status ON api_keys(status);
+CREATE INDEX IF NOT EXISTS idx_routes_model ON routes(model_id);
+CREATE INDEX IF NOT EXISTS idx_routes_provider ON routes(provider_id);
+CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_log(provider_id);
+
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at INTEGER NOT NULL
+);
+"#,
+    // V2: Provider config (endpoint_type, key/model sources) + service_keys
+    r#"
+CREATE TABLE IF NOT EXISTS service_keys (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    key_hash TEXT NOT NULL,
+    key_masked TEXT NOT NULL,
+    allowed_models TEXT NOT NULL DEFAULT '[]',
+    total_requests INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    last_used_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_keys_hash ON service_keys(key_hash);
+"#,
+    // V3: models.capabilities + clear legacy keys (encryption/hashing format change) + drop custom/deap providers
+    r#"
+ALTER TABLE models ADD COLUMN capabilities TEXT NOT NULL DEFAULT '["text"]';
+DELETE FROM api_keys;
+DELETE FROM service_keys;
+DELETE FROM providers WHERE kind IN ('custom', 'deap');
+"#,
+    // V4: usage_log.service_key_id — record which service key (client-facing)
+    // made each request, so stats can group by service key instead of the
+    // internal round-robin provider key.
+    r#"
+ALTER TABLE usage_log ADD COLUMN service_key_id TEXT REFERENCES service_keys(id);
+CREATE INDEX IF NOT EXISTS idx_usage_service_key ON usage_log(service_key_id);
+"#,
+    // V5: 可用性不再持久化到 DB —— 清掉之前持久化时代留下的 status/last_error 残留。
+    // 运行时状态纯内存（启动全 green），DB 的 status 列从此不再被读写。
+    r#"
+UPDATE api_keys SET status = 'green', last_error = NULL, last_error_code = NULL, last_error_time = NULL;
+"#,
+    // V6: 通用应用设置表（key-value），如 websearch_hijack 开关。
+    r#"
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"#,
+];

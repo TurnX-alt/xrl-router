@@ -1,0 +1,143 @@
+name: build
+
+# Builds macOS arm64 (.dmg) and Windows amd64 (.msi) installers on every push
+# to main, and on manual dispatch. After all platform builds complete,
+# artifacts are published as a GitHub Release.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Safety net: force any remaining Node 20 actions (e.g. rust-cache,
+  # rust-toolchain) onto the Node 24 runtime.  All actions/* are already
+  # on Node-24-native major versions.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write # needed by gh release create
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon runner → arm64 native
+            target: aarch64-apple-darwin
+            label: macos-arm64
+          - os: windows-latest # x86_64 runner
+            target: x86_64-pc-windows-msvc
+            label: windows-amd64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          # Disable v5's automatic package-manager cache — pnpm manages its own.
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build installers (tauri)
+        run: pnpm tauri build --target ${{ matrix.target }}
+
+      - name: Strip language suffix from MSI filename
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd "src-tauri/target/${{ matrix.target }}/release/bundle/msi"
+          for f in *_en-US.msi; do
+            [ -f "$f" ] || continue
+            new="${f//_en-US/}"
+            mv "$f" "$new"
+            echo "Renamed $f → $new"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: XRL Router-${{ matrix.label }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+  # ── Release ──────────────────────────────────────────────────────────
+  # Waits for ALL platform builds, then publishes a single GitHub Release
+  # with every installer attached.  The release tag & title are driven by
+  # the version field in src-tauri/tauri.conf.json; the body is the commit
+  # message that triggered the build.
+  # ──────────────────────────────────────────────────────────────────────
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          TAG="${VER}"
+          TITLE="XRL Router v${VER}"
+          # Use the triggering commit's message as the release body.
+          BODY="$(git log -1 --pretty=%B)"
+
+          echo "→ version : ${VER}"
+          echo "→ tag     : ${TAG}"
+          echo "→ title   : ${TITLE}"
+          ls -R artifacts/
+
+          # Idempotent: if we're re-running for the same version (manual
+          # dispatch), drop the old release + tag first.
+          gh release delete "${TAG}" --yes --cleanup-tag 2>/dev/null || true
+          sleep 2
+
+          # Collect files into an array so paths with spaces survive word-splitting.
+          shopt -s globstar
+          FILES=(
+            "artifacts/XRL Router-macos-arm64"/**/*.dmg
+            "artifacts/XRL Router-windows-amd64"/**/*.msi
+          )
+
+          gh release create "${TAG}" \
+            --title "${TITLE}" \
+            --notes "${BODY}" \
+            "${FILES[@]}"
+
+          echo "✅ Release ${TAG} published"

@@ -1,0 +1,180 @@
+pub mod adapter;
+pub mod anthropic;
+pub mod openai;
+
+use crate::db::Database;
+use crate::types::{Provider, ProviderKind};
+use anyhow::Result;
+use dashmap::DashMap;
+use rusqlite::params;
+use tracing::info;
+
+/// Provider registry with in-memory cache backed by database.
+#[derive(Clone)]
+pub struct ProviderRegistry {
+    database: Database,
+    providers: DashMap<String, Provider>,
+}
+
+impl ProviderRegistry {
+    pub fn new(database: Database) -> Self {
+        Self {
+            database,
+            providers: DashMap::new(),
+        }
+    }
+
+    /// Load all providers from database into memory cache.
+    pub fn load_from_db(&self) -> Result<()> {
+        let conn = self.database.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind, base_url, api_path, enabled, config_json, created_at, updated_at
+             FROM providers ORDER BY created_at"
+        )?;
+
+        let providers: Vec<Provider> = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let kind_str: String = row.get(2)?;
+                let base_url: String = row.get(3)?;
+                let api_path: String = row.get(4)?;
+                let enabled_i: i32 = row.get(5)?;
+                let config_json: String = row.get(6)?;
+                let created_at: i64 = row.get(7)?;
+                let updated_at: i64 = row.get(8)?;
+
+                let kind = match kind_str.as_str() {
+                    "openai" => ProviderKind::Openai,
+                    "anthropic" => ProviderKind::Anthropic,
+                    _ => ProviderKind::Openai,
+                };
+
+                let config: serde_json::Value = serde_json::from_str(&config_json)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+
+                Ok(Provider {
+                    id,
+                    name,
+                    kind,
+                    base_url,
+                    api_path,
+                    enabled: enabled_i != 0,
+                    config,
+                    created_at,
+                    updated_at,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for p in providers {
+            self.providers.insert(p.id.clone(), p);
+        }
+
+        info!("Loaded {} providers from database", self.providers.len());
+        Ok(())
+    }
+
+    /// Get all enabled providers.
+    pub fn get_enabled(&self) -> Vec<Provider> {
+        self.providers
+            .iter()
+            .filter(|p| p.value().enabled)
+            .map(|p| p.value().clone())
+            .collect()
+    }
+
+    /// Find a provider by ID.
+    pub fn find_by_id(&self, id: &str) -> Option<Provider> {
+        self.providers.get(id).map(|p| p.value().clone())
+    }
+
+    /// Create a new provider.
+    pub fn create(&self, provider: &Provider) -> Result<()> {
+        let conn = self.database.conn();
+        let config_json = serde_json::to_string(&provider.config)?;
+        conn.execute(
+            "INSERT INTO providers (id, name, kind, base_url, api_path, enabled, config_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                provider.id,
+                provider.name,
+                provider.kind.to_string(),
+                provider.base_url,
+                provider.api_path,
+                provider.enabled as i32,
+                config_json,
+                provider.created_at,
+                provider.updated_at,
+            ],
+        )?;
+        self.providers.insert(provider.id.clone(), provider.clone());
+        info!("Created provider: {}", provider.id);
+        Ok(())
+    }
+
+    /// Delete a provider.
+    pub fn delete(&self, id: &str) -> Result<()> {
+        let conn = self.database.conn();
+        conn.execute("DELETE FROM providers WHERE id = ?", params![id])?;
+        self.providers.remove(id);
+        info!("Deleted provider: {}", id);
+        Ok(())
+    }
+
+    /// Get provider count.
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Check if registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// Get all providers (not just enabled).
+    pub fn list_all(&self) -> Vec<Provider> {
+        self.providers.iter().map(|p| p.value().clone()).collect()
+    }
+
+    /// Get a provider by ID.
+    pub fn get(&self, id: &str) -> Option<Provider> {
+        self.providers.get(id).map(|p| p.value().clone())
+    }
+
+    /// Insert or update a provider.
+    pub fn insert(&self, provider: Provider) {
+        self.providers.insert(provider.id.clone(), provider);
+    }
+
+    /// Check if a provider exists.
+    pub fn contains(&self, id: &str) -> bool {
+        self.providers.contains_key(id)
+    }
+
+    /// Remove a provider.
+    pub fn remove(&self, id: &str) -> Option<Provider> {
+        self.providers.remove(id).map(|(_, p)| p)
+    }
+
+    /// Create a new adapter for a provider with the given API key.
+    pub fn create_adapter(
+        &self,
+        provider: &Provider,
+        api_key: &str,
+    ) -> Result<Box<dyn adapter::Adapter>> {
+        use crate::providers::{anthropic::AnthropicAdapter, openai::OpenAIAdapter};
+
+        let key = api_key.to_string();
+
+        let adapter: Box<dyn adapter::Adapter> = match provider.kind {
+            ProviderKind::Openai => Box::new(OpenAIAdapter::new(provider.base_url.clone(), key)),
+            ProviderKind::Anthropic => {
+                Box::new(AnthropicAdapter::new(provider.base_url.clone(), key))
+            }
+        };
+
+        Ok(adapter)
+    }
+}
