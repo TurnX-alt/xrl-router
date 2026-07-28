@@ -1,0 +1,46 @@
+# xrl-router - AI LLM API Router
+
+# =========================
+# Frontend (Vue + Vite + pnpm)
+# =========================
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# =========================
+# Tauri desktop (Rust / Cargo)
+# =========================
+# Cargo 编译产物（根 target/ 孤儿 + src-tauri/target/）
+target/
+src-tauri/gen/
+
+# =========================
+# Runtime data (敏感！)
+# =========================
+# SQLite 数据库 + AES-256-GCM 加密主密钥 master.key
+# master.key 泄露 = 所有 Provider Key 可被解密，绝不能进版本库
+data/
+
+# =========================
+# Test artifacts
+# =========================
+test-results/
+playwright-report/
+playwright/.cache/
+
+# =========================
+# Environment / Editor
+# =========================
+.env
+.env.*
+!.env.example
+*.log
+.vscode/
+.idea/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
