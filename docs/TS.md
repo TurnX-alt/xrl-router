@@ -1,6 +1,6 @@
 # xrl-router — 技术规格说明书
 
-> **版本**: 26.7.31+0505 · **文档类型**: Technical Specification
+> **版本**: 26.7.31+2230 · **文档类型**: Technical Specification
 
 ---
 
@@ -62,8 +62,8 @@ xrl-router 是一个**多 Provider AI LLM API 路由网关**，以 Tauri 2 桌�
 | **后端语言** | Rust | edition 2021 |
 | **桌面框架** | Tauri 2 | WebView 加载前端，后端在同一进程内启动 HTTP 服务 |
 | **HTTP 框架** | axum | 0.7 + tokio 异步运行时 |
-| **HTTP 客户端** | reqwest | 0.12，异步，支持流式 SSE |
-| **数据库** | SQLite 3 | 通过 rusqlite 0.32 (bundled) |
+| **HTTP 客户端** | reqwest | 0.12，异步，支持流式 SSE + 超时保护（60s 请求头 + 120s 响应体） |
+| **数据库** | SQLite 3 | 通过 rusqlite 0.32 (bundled)，WAL 模式 |
 | **序列化** | serde + serde_json | |
 | **日志** | tracing + tracing-subscriber | |
 | **前端框架** | Vue 3 | Composition API + `<script setup>` |
@@ -188,13 +188,13 @@ xrl-router/
 │   │   │   └── server.rs        # AppState（含 MasterKey/broadcast/websearch_hijack）、CORS
 │   │   ├── api/                 # HTTP API 处理器
 │   │   │   ├── mod.rs           # 路由构建 + CRUD + WebSocket + Settings + Argon2 Service Key
-│   │   │   ├── proxy.rs         # LLM 代理核心（双协议入口 + WebSearch 劫持）
+│   │   │   ├── proxy.rs         # LLM 代理核心（双协议入口 + WebSearch 劫持 + 超时保护）
 │   │   │   └── proxy/
 │   │   │       ├── translate.rs # Anthropic ↔ OpenAI 协议转换
-│   │   │       └── sniff.rs     # 透传流嗅探（SniffStream 提取 token 用量）
+│   │   │       └── sniff.rs     # 透传流嗅探（SniffStream 提取 token 用量 + 缓存追踪）
 │   │   ├── db/                  # 数据库层
 │   │   │   ├── mod.rs           # SQLite (rusqlite) 封装 + CRUD（WAL 模式）
-│   │   │   ├── schema.rs        # 6 版迁移 SQL
+│   │   │   ├── schema.rs        # 10 版迁移 SQL（V1-V10）
 │   │   │   └── queries.rs       # 预定义 SQL 查询
 │   │   ├── types/               # 数据结构定义
 │   │   │   ├── mod.rs           # 统一导出
@@ -211,7 +211,7 @@ xrl-router/
 │   │   │   └── anthropic.rs     # Anthropic 适配器（内置）
 │   │   ├── keys/                # 密钥管理
 │   │   │   ├── mod.rs
-│   │   │   └── pool.rs          # KeyPool — 红绿灯轮询（状态纯内存，V5 后不持久化）
+│   │   │   └── pool.rs          # KeyPool — 红绿灯轮询（状态纯内存 + 指针持久化）
 │   │   ├── models/              # 模型注册
 │   │   │   └── mod.rs           # ModelRegistry
 │   │   ├── middleware/          # 中间件
@@ -277,11 +277,11 @@ run()
   │       create_dir_all(data_dir)              → 确保数据目录存在
   │       crypto::load_or_create_master_key()   → 加载/生成 AES-256-GCM 主密钥
   │       Database::new(db_path)                → 打开 SQLite 数据库（WAL 模式）
-  │       database.migrate()                    → 执行所有待应用的迁移（V1-V6）
+  │       database.migrate()                    → 执行所有待应用的迁移（V1-V10）
   │       AppState::new(config, database, master_key) → 创建共享状态
   │         ├── ProviderRegistry::load_from_db()
   │         ├── ModelRegistry::load_from_db()
-  │         ├── KeyPool::load_all_keys_from_db() → AES-256-GCM 解密加载密钥
+  │         ├── KeyPool::load_all_keys_from_db() → AES-256-GCM 解密加载密钥 + 恢复轮询指针
   │         ├── RateLimiter::new()
   │         └── websearch_hijack ← settings 表
   │       系统托盘（显示窗口 / 退出）
@@ -382,27 +382,104 @@ proxy_anthropic_messages / proxy_openai_chat
   │      ├── 同协议（Anthropic→Anthropic / OpenAI→OpenAI）: 直接透传 + SniffStream
   │      └── 异协议: translate 双向转换
   │
-  ├── 8. Key 轮询重试循环
-  │      └── pick_key_for() 从 KeyPool 取 key
+  ├── 8. 超时保护机制（防止死锁和挂起）
+  │      ├── 请求头超时: 60 秒（上游不返回响应头 → 504 Gateway Timeout）
+  │      └── 响应体超时: 120 秒（上游断流但不关闭连接 → 主动断开并记录）
+  │
+  ├── 9. Key 轮询重试循环
+  │      └── pick_key_for() 从 KeyPool 取 key（指针持久化到 settings 表）
   │      └── 401/403 → mark_key_invalid(Red) → rotate → replay
   │      └── 402/429 → mark_key_low_quota(Yellow) → rotate → replay
   │
-  └── 9. 流式转发
-        ├── 同协议: SniffStream 包装字节流（无修改转发 + 后台嗅探 token）
+  └── 10. 流式转发 + 缓存追踪
+        ├── 同协议: SniffStream 包装字节流（无修改转发 + 后台嗅探 token + 缓存命中）
         ├── 异协议: 逐 SSE frame 解析 + translate_chunk + 重新 emit
-        └── Usage 记录到 usage_log（token 不足时用 chars/4 兜底估算）
+        └── Usage 记录到 usage_log（含 cache_read_input_tokens）
 ```
 
 > **设计决策**：仅支持流式响应（`stream: true`），非流式分支已移除。理由：Claude Code 等主流客户端始终使用流式，非流式无实际场景，可大幅简化代码逻辑喵。
 
-**SniffStream 透传嗅探** (`api/proxy/sniff.rs`):
+**超时保护机制**（V7 新增）:
+
+网关面临上游挂起导致死锁的风险。`reqwest::Client` 的 `connect_timeout` 仅保护 TCP 握手，无法防止上游在建立连接后不返回响应头或不关闭连接。
+
+```rust
+// 常量定义（api/proxy.rs）
+const UPSTREAM_HEADER_TIMEOUT_SECS: u64 = 60;  // 等待上游响应头
+const UPSTREAM_CHUNK_TIMEOUT_SECS: u64 = 120;  // 流式响应 chunk 间隔
+
+// 请求头超时：防止上游不返回响应头
+match tokio::time::timeout(
+    Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
+    client.send().await
+) {
+    Ok(Ok(resp)) => resp,
+    Ok(Err(e)) => 网络错误，重试下一个 key
+    Err(_) => 超时，返回 504 Gateway Timeout
+}
+
+// 响应体超时：防止上游断流但不关闭连接
+match tokio::time::timeout(
+    Duration::from_secs(UPSTREAM_CHUNK_TIMEOUT_SECS),
+    stream.next()
+) {
+    Ok(Some(chunk)) => 正常处理
+    Ok(None) => 流正常结束
+    Err(_) => 超时，主动断开并记录 usage_log
+}
+```
+
+**SniffStream 透传嗅探 + 缓存追踪** (`api/proxy/sniff.rs`):
 
 当客户端协议与上游协议相同时（如 Anthropic 客户端 → Anthropic 上游），无需翻译但仍需记录 token 用量。`SniffStream` 包装 `reqwest` 字节流：
 - **不修改字节**：每个 chunk 原样转发给客户端
 - **后台解析 SSE**：按 `\n\n` 分割帧，提取 `usage` 字段
-- **Anthropic 模式**：`message_start` → input_tokens，`message_delta` → output_tokens，`content_block_delta` → output_chars
-- **OpenAI 模式**：最终 chunk 的 `usage.prompt_tokens/completion_tokens`
+- **Anthropic 模式**：`message_start` → input_tokens，`message_delta` → output_tokens + cache_read_input_tokens，`content_block_delta` → output_chars
+- **OpenAI 模式**：最终 chunk 的 `usage.prompt_tokens/completion_tokens` + `prompt_tokens_details.cached_tokens`
 - **兜底估算**：当上游未报 token 数时，用 `output_chars / 4` 估算
+- **缓存追踪**：自动提取并持久化上游 API 的缓存命中信息（V7 新增）
+
+**缓存追踪实现**（V7 新增）:
+
+上游 API（尤其是 Anthropic）会返回缓存命中信息，网关需要提取并持久化到 `usage_log` 表。
+
+```rust
+// SniffedUsage 结构体（api/proxy/sniff.rs）
+pub struct SniffedUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,  // V7 新增：缓存命中的输入 token
+    pub output_chars: u64,  // 兜底估算用
+}
+
+// Anthropic 模式提取（message_delta 事件）
+"message_delta" => {
+    let usage = &json["usage"];
+    if let Some(ot) = usage["output_tokens"].as_u64() {
+        self.usage.output_tokens = ot;
+    }
+    // V7: 提取缓存命中信息
+    if let Some(cr) = usage["cache_read_input_tokens"].as_u64() {
+        self.usage.cache_read_input_tokens = cr;
+    }
+}
+
+// OpenAI 模式提取（最终 chunk）
+_ => {
+    if let Some(usage) = json.get("usage") {
+        if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+            self.usage.input_tokens = pt;
+        }
+        if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            self.usage.output_tokens = ct;
+        }
+        // V7: 提取缓存命中信息
+        if let Some(cr) = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+            self.usage.cache_read_input_tokens = cr;
+        }
+    }
+}
+```
 
 **模型别名系统**:
 
@@ -449,7 +526,7 @@ display_name = "my-alias"     -- 别名（暴露给客户端）
 
 **迁移系统** (`schema.rs`):
 
-6 版迁移，通过 `schema_version` 表跟踪：
+10 版迁移，通过 `schema_version` 表跟踪：
 
 | 版本 | 内容 |
 |------|------|
@@ -459,14 +536,20 @@ display_name = "my-alias"     -- 别名（暴露给客户端）
 | V4 | usage_log 新增 `service_key_id` 列 + 索引（按服务密钥分组统计） |
 | V5 | 密钥可用性状态不再持久化（清掉 DB 中的 status/last_error 残留，运行时全内存 green） |
 | V6 | 新增 `settings` key-value 表（存储 websearch_hijack 等运行时开关） |
+| V7 | **缓存 token 追踪** — usage_log 新增 `cache_read_input_tokens`、`cache_creation_input_tokens` 列；models 新增 cache 价格列 |
+| V8 | 价格单位从 per 1K token 改为 per MTok（每百万 token），与 Anthropic/OpenAI 官方定价一致 |
+| V9 | **移除价格字段** — 删除 models 的所有 cost_per_mtok_* 列和 usage_log.cost_estimate（从未被 UI 使用的死代码） |
+| V10 | **概念纠正** — 删除 usage_log.cache_creation_input_tokens（写缓存只是首次处理输入，并入 prompt_tokens） |
+
+> **V7-V10 演进说明**：V7 引入了完整的缓存追踪，但 V8 的价格单位转换和 V9 的字段清理表明价格追踪从未真正被使用。V10 进一步纠正了"缓存写入"的概念——它本质上只是首次处理的输入，不应该单独计数。最终 schema 只保留 `cache_read_input_tokens`（真正的缓存命中）。
 
 ### 4.7 密钥池 — `keys/pool.rs`
 
 ```
 KeyPool
   ├── keys: HashMap<provider_id, Vec<KeyEntry>>  ← 按 provider 分组（Arc<RwLock>）
-  ├── current_index: HashMap<provider_id, usize>  ← 当前轮询位置
-  ├── database: Option<Database>                   ← DB 引用（仅用于 token 统计持久化）
+  ├── current_index: HashMap<provider_id, usize>  ← 当前轮询位置（V8 新增：持久化到 settings 表）
+  ├── database: Option<Database>                   ← DB 引用（token 统计 + 轮询指针持久化）
   └── key_stats_tx: broadcast::Sender<Value>       ← WebSocket 广播
 
 get_next_key(provider_id)
@@ -475,6 +558,7 @@ get_next_key(provider_id)
   → 跳过 🟡 Yellow 密钥（冷却 300 秒后自动恢复）
   → 返回第一个 🟢 Green 密钥
   → 全部失效时返回 None
+  → V8: 成功取到 key 后持久化指针到 settings 表（键名：keypool_index_{provider_id}）
 
 mark_key_invalid()    → 401/403 → 🔴 Red → 永久跳过 → 广播 key_stats
 mark_key_low_quota()  → 402/429 → 🟡 Yellow → 冷却 5 分钟后恢复 → 广播 key_stats
@@ -484,9 +568,12 @@ load_all_keys_from_db()
   → AES-256-GCM 解密 DB 中的 key_hash → 内存 KeyEntry
   → 解密失败 fallback 明文（兼容旧格式）
   → 所有 key 启动时一律 Green（V5 后 DB status 列不再被读写）
+  → V8: 从 settings 表恢复轮询指针（键名：keypool_index_{provider_id}），越界时重置为 0
 ```
 
 > **V5 设计决策**：密钥健康状态改为纯内存管理，启动时所有 Key 均为绿色。DB 的 `status` 列保留但不再被读写，避免每次状态变更都写 DB 的开销喵～
+>
+> **V8 设计决策**：轮询指针持久化到 `settings` 表，避免每次重启后从 key[0] 重新开始轮询。这样如果前几个 key 已经失效（Red），重启后可以直接跳过它们，从上次成功使用的 key 位置继续轮询。
 
 ### 4.8 Provider 适配器 — `providers/`
 
@@ -664,9 +751,9 @@ proxy: {
 
 ## 6. 数据模型
 
-### 6.1 数据库 Schema (V6)
+### 6.1 数据库 Schema (V10)
 
-> **Schema 说明**：当前为 V6，providers 表已使用规范化设计（`base_url + api_path` 拼接 endpoint，密钥统一由 `api_keys` 表管理，模型统一由 `models` 表管理。V3 新增 capabilities，V4 新增 service_key_id，V5 密钥状态纯内存化，V6 新增 settings 表）。
+> **Schema 说明**：当前为 V10，providers 表已使用规范化设计（`base_url + api_path` 拼接 endpoint，密钥统一由 `api_keys` 表管理，模型统一由 `models` 表管理。V3 新增 capabilities，V4 新增 service_key_id，V5 密钥状态纯内存化，V6 新增 settings 表，V7 新增缓存追踪，V8 价格单位转换，V9-V10 清理未使用的价格字段并纠正缓存概念）。
 
 ```sql
 -- 供应商 (Provider)
@@ -683,6 +770,7 @@ CREATE TABLE providers (
 );
 
 -- 模型 (Model)
+-- V7-V9 演进：曾添加价格字段但从未被 UI 使用，V9 清理以简化 schema
 CREATE TABLE models (
     id TEXT PRIMARY KEY,
     provider_id TEXT NOT NULL REFERENCES providers(id),
@@ -692,8 +780,6 @@ CREATE TABLE models (
     capabilities TEXT NOT NULL DEFAULT '["text"]',
     context_window INTEGER NOT NULL DEFAULT 128000,
     max_output_tokens INTEGER NOT NULL DEFAULT 4096,
-    cost_per_1k_input REAL NOT NULL DEFAULT 0.0,
-    cost_per_1k_output REAL NOT NULL DEFAULT 0.0,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -737,7 +823,7 @@ CREATE TABLE routes (
 CREATE TABLE service_keys (
     id TEXT PRIMARY KEY,              -- "skey_{timestamp}_{random}"
     name TEXT NOT NULL DEFAULT '',
-    key_hash TEXT NOT NULL,           -- 密钥哈希值
+    key_hash TEXT NOT NULL,           -- Argon2 哈希（仅存储哈希，不存储明文）
     key_masked TEXT NOT NULL,         -- 脱敏显示（xrl-xxxx****xxxx）
     allowed_models TEXT NOT NULL DEFAULT '[]',  -- JSON 数组，限制可使用的模型
     total_requests INTEGER NOT NULL DEFAULT 0,
@@ -748,6 +834,7 @@ CREATE TABLE service_keys (
 );
 
 -- 用量日志
+-- V7 添加缓存追踪，V9-V10 清理并纠正概念
 CREATE TABLE usage_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp INTEGER NOT NULL,
@@ -756,12 +843,12 @@ CREATE TABLE usage_log (
     key_id TEXT,                      -- Provider API Key
     service_key_id TEXT,              -- V4: 客户端 Service Key（用于按 Service Key 分组统计）
     request_type TEXT NOT NULL,
-    prompt_tokens INTEGER NOT NULL,
+    prompt_tokens INTEGER NOT NULL,   -- V10: 包含写缓存（首次处理的输入）
     completion_tokens INTEGER NOT NULL,
     latency_ms INTEGER NOT NULL,
     success INTEGER NOT NULL,
     error_message TEXT,
-    cost_estimate REAL
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0  -- V7: 缓存命中读取的 token（真正的缓存）
 );
 
 -- 迁移版本跟踪
@@ -771,6 +858,7 @@ CREATE TABLE schema_version (
 );
 
 -- V6: 通用应用设置表（key-value）
+-- V8: 也用于存储密钥轮询指针（keypool_index_{provider_id}）
 CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -778,13 +866,17 @@ CREATE TABLE settings (
 ```
 
 > **设计说明**：
-> - `key_hash`：V3 后存储 AES-256-GCM 密文（`base64(nonce || ciphertext)`），而非哈希。GET /api/keys 时解密返回 `key_plain` 字段
+> - `key_hash`（api_keys）：V3 后存储 AES-256-GCM 密文（`base64(nonce || ciphertext)`），而非哈希。GET /api/keys 时解密返回 `key_plain` 字段
+> - `key_hash`（service_keys）：V3 后存储 Argon2 哈希（仅存储哈希，不存储明文，安全性更高）
 > - `key_masked` 保留：虽然理论上是派生字段，但原始密钥加密后不可直接截取，脱敏值必须在创建时保存
 > - `total_requests`/`total_tokens` 保留：作为 `usage_log` 的聚合缓存，避免每次查询都全表扫描，属于合理的反规范化
 > - `routes` 表保留：为未来多 Provider 负载分发预留，当前未使用
 > - `status` 列保留但 V5 后不再被读写：密钥健康状态改为纯内存管理
 > - `service_key_id`（V4）：记录请求来自哪个 Service Key，统计可按客户端维度分组
-> - `settings`（V6）：存储 `websearch_hijack` 等运行时开关
+> - `settings`（V6）：存储 `websearch_hijack` 等运行时开关；V8 扩展用于密钥轮询指针持久化
+> - `cache_read_input_tokens`（V7）：记录缓存命中的 token 数（真正的缓存读取）
+> - **V9 清理**：删除 models 表的所有 `cost_per_mtok_*` 列和 usage_log.cost_estimate（从未被 UI 使用的死代码）
+> - **V10 概念纠正**：删除 usage_log.cache_creation_input_tokens——写缓存本质上只是首次处理的输入，不应该单独计数，已并入 prompt_tokens
 
 ### 6.2 模型层级系统
 
@@ -992,38 +1084,127 @@ CREATE TABLE settings (
    → 如果 websearch_hijack 开关开 + tools 含 web_search*
    → → run_websearch_loop()：用本地 Bing 搜索代替上游（最多 5 轮 tool-calling）
 
-6. 协议转换 + 强制流式
+6. 超时保护机制（V7 新增）
+   → 请求头超时: 60 秒（防止上游不返回响应头导致死锁）
+   → 响应体超时: 120 秒（防止上游断流但不关闭连接）
+
+7. 协议转换 + 强制流式
    → 同协议: 直接透传 + SniffStream
    → 异协议: translate 双向转换
    → 插入 stream: true, model: real_model_id
 
-7. Key 轮询重试循环
-   → pick_key_for() 从 KeyPool 取 key
+8. Key 轮询重试循环（V8 新增：指针持久化）
+   → pick_key_for() 从 KeyPool 取 key（从持久化的指针位置开始）
    → 401/403 → mark_key_invalid(Red) → rotate → replay
    → 402/429 → mark_key_low_quota(Yellow, 5min 冷却) → rotate → replay
+   → 成功取到 key 后持久化指针到 settings 表
 
-8. 流式转发
-   → response.bytes_stream() 逐 chunk 读取
-   → 同协议: SniffStream 无修改转发 + 后台嗅探 token
+9. 流式转发 + 缓存追踪（V7 新增）
+   → response.bytes_stream() 逐 chunk 读取（带 120 秒超时保护）
+   → 同协议: SniffStream 无修改转发 + 后台嗅探 token + cache_read_input_tokens
    → 异协议: 逐 SSE frame 解析 + translate_chunk + 重新 emit
-   → Usage 记录到 usage_log（token 不足时用 chars/4 兜底估算）
+   → Usage 记录到 usage_log（含 cache_read_input_tokens，token 不足时用 chars/4 兜底估算）
 ```
 
-### 8.2 密钥选择流程
+### 8.2 密钥选择流程（V8 更新）
 
 ```
 收到 LLM 请求
   → KeyPool.get_next_key(provider_id)
-     ├── 从 current_index 开始轮询
+     ├── 从 settings 表加载的 current_index 开始轮询（V8: 持久化指针）
      ├── 跳过 🔴 Red 密钥
      ├── 跳过 🟡 Yellow 密钥（冷却 300 秒后自动恢复）
      └── 返回 🟢 Green 密钥
+     → V8: 成功取到 key 后持久化指针到 settings 表（keypool_index_{provider_id}）
 
   上游返回:
   ├── 200 OK → record_key_success(tokens) → 保持 🟢 → 持久化 total_requests/total_tokens 到 DB
   ├── 401/403 → mark_key_invalid() → 🔴 Red → 永久跳过 → 广播 key_stats
   ├── 402/429 → mark_key_low_quota() → 🟡 Yellow → 冷却 5 分钟 → 广播 key_stats
   └── 其他错误 → 不改变状态，forward_upstream_error 原样转给客户端
+
+V8 优势: 重启后从上次成功使用的 key 位置继续轮询，避免每次都从 key[0] 开始
+（如果前几个 key 已经 Red，重启后可以直接跳过它们）
+```
+
+### 8.3 超时保护机制（V7 新增）
+
+**问题背景**：网关面临上游挂起导致死锁的风险。`reqwest::Client` 的 `connect_timeout` 仅保护 TCP 握手，无法防止以下场景：
+1. 上游建立连接后不返回响应头
+2. 上游开始流式响应但中途断流且不关闭连接
+
+**解决方案**：在两个关键点添加独立超时：
+
+```rust
+// 1. 请求头超时（60 秒）—— 防止上游不返回响应头
+let response = tokio::time::timeout(
+    Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
+    client.send().await
+).await?;
+
+// 超时处理:
+// - Ok(Ok(resp)) => 正常处理
+// - Ok(Err(e)) => 网络错误，重试下一个 key
+// - Err(_) => 超时，返回 504 Gateway Timeout，记录 usage_log
+
+// 2. 响应体超时（120 秒）—— 防止上游断流但不关闭连接
+while let Ok(Some(chunk)) = tokio::time::timeout(
+    Duration::from_secs(UPSTREAM_CHUNK_TIMEOUT_SECS),
+    stream.next()
+).await? {
+    // 处理 chunk
+}
+
+// 超时处理:
+// - Ok(Some(chunk)) => 正常处理
+// - Ok(None) => 流正常结束
+// - Err(_) => 超时，主动断开，记录已收集的 usage_log
+```
+
+**效果**：即使上游完全挂起，网关也能在限定时间内主动断开并返回错误，避免客户端无限等待。
+
+### 8.4 缓存追踪机制（V7-V10 演进）
+
+**V7 初始设计**：添加 `cache_read_input_tokens` 和 `cache_creation_input_tokens` 两列
+
+**V10 概念纠正**：删除 `cache_creation_input_tokens`——"写缓存"本质上只是首次处理的输入，不应该单独计数
+
+**最终方案**：
+- `prompt_tokens`：包含所有输入（普通输入 + 写缓存）
+- `cache_read_input_tokens`：仅记录真正的缓存命中（读取已缓存的内容）
+
+**SniffStream 提取逻辑**：
+```rust
+// Anthropic 模式
+if let Some(usage) = chunk.get("usage") {
+    if let Some(it) = usage.get("input_tokens") {
+        self.usage.input_tokens = it;  // 普通输入（不含写缓存）
+    }
+    if let Some(cr) = usage.get("cache_read_input_tokens") {
+        self.usage.cache_read_input_tokens = cr;  // 真正的缓存命中
+    }
+    // 注意：不单独追踪 cache_creation_input_tokens（已并入 prompt_tokens）
+}
+
+// OpenAI 模式
+if let Some(usage) = chunk.get("usage") {
+    if let Some(pt) = usage.get("prompt_tokens") {
+        self.usage.input_tokens = pt;  // 总输入（含写缓存）
+    }
+    if let Some(cr) = usage.get("cache_read_input_tokens") {
+        self.usage.cache_read_input_tokens = cr;  // 缓存命中
+    }
+}
+```
+
+**usage_log 记录**：
+```sql
+INSERT INTO usage_log (..., prompt_tokens, completion_tokens, cache_read_input_tokens)
+VALUES (..., 1000, 500, 2000);
+-- prompt_tokens = 1000（包含写缓存）
+-- completion_tokens = 500
+-- cache_read_input_tokens = 2000（真正的缓存命中）
+-- 总输入 = prompt_tokens + cache_read_input_tokens = 3000
 ```
 
 ---
@@ -1159,7 +1340,7 @@ export PORT=19068
 
 - [x] Rust + Tauri 2 桌面应用
 - [x] axum 异步 HTTP 服务器
-- [x] SQLite 数据库 + 6 版迁移 (rusqlite bundled, WAL 模式)
+- [x] SQLite 数据库 + 10 版迁移 (rusqlite bundled, WAL 模式)
 - [x] Provider CRUD + 管理面板
 - [x] API Key CRUD + 管理面板（含 AES-256-GCM 加解密）
 - [x] Model CRUD + 管理面板
@@ -1167,9 +1348,9 @@ export PORT=19068
 - [x] OpenAI Chat Completions API 代理 (`/v1/chat/completions`)
 - [x] Anthropic ↔ OpenAI 协议转换（双向）
 - [x] 流式 SSE 代理 + 转换（仅流式，非流式已移除）
-- [x] SniffStream 透传流嗅探（token 用量提取）
+- [x] SniffStream 透传流嗅探（token 用量提取 + 缓存命中追踪）
 - [x] 模型别名系统
-- [x] 密钥池 + 红绿灯健康状态（纯内存，V5 后不持久化）
+- [x] 密钥池 + 红绿灯健康状态（纯内存 + 轮询指针持久化到 settings 表）
 - [x] Service Key 认证（Argon2 哈希存储）
 - [x] Service Key `allowed_models` 白名单
 - [x] Service Key 管理 API (`/api/service-keys`)
@@ -1187,6 +1368,12 @@ export PORT=19068
 - [x] 前端离线状态处理（ConnectionStatus 组件）
 - [x] 前端全局错误边界（errorHandler + unhandledrejection）
 - [x] 结构化日志（tracing + JSON 输出，含 trace_id/provider/model/latency）
+- [x] 缓存追踪（cache_read_input_tokens，V7-V10：提取 + 持久化 + 概念纠正）
+- [x] 请求超时保护（V7：60s 请求头 + 120s 响应体，防止死锁和挂起）
+- [x] 密钥轮询指针持久化（V8：重启后从上次位置继续轮询）
+- [x] 数据库 UPSERT 修复（INSERT OR REPLACE → ON CONFLICT DO UPDATE，避免级联删除）
+- [x] 死锁防护（修复 Mutex 锁的二次加锁问题）
+- [x] 价格字段清理（V9：删除从未使用的 cost_per_mtok_* 列和 cost_estimate）
 
 ### 12.2 未完成 / 待改进
 
@@ -1283,11 +1470,11 @@ export PORT=19068
 
 ~~**问题**：`KeyPool` 的红绿灯状态、当前轮询位置都在内存中，进程重启后丢失。~~
 
-**V2 曾解决**（持久化到 DB）→ **V5 重新改为纯内存**：
-- V5 迁移后，密钥健康状态不再持久化到 DB
-- 启动时所有 Key 均为绿色初始状态
+**V2 曾解决**（持久化到 DB）→ **V5 重新改为纯内存** → **V8 部分恢复持久化**：
+- V5 迁移后，密钥健康状态不再持久化到 DB（启动时所有 Key 均为绿色初始状态）
 - DB 的 `status`/`last_error` 列保留但不再被读写
 - **理由**：减少每次状态变更的 DB 写入开销，通过 WebSocket 实时推送状态变更到前端
+- **V8 补充**：轮询指针（current_index）持久化到 settings 表（`keypool_index_{provider_id}`），解决"重启后从 key[0] 重新轮询"的问题——健康状态仍纯内存，但轮询位置可恢复
 
 #### ⚠️ 13.1.3 管理 API 无认证，但端口已绑定本机
 
@@ -1520,7 +1707,7 @@ export PORT=19068
 
 | 风险等级 | 数量 | 关键项 |
 |---------|------|--------|
-| 🟢 **已解决** | 3 | Service Key Argon2 哈希、Provider Key AES-256-GCM 加密、CORS 白名单 |
+| 🟢 **已解决** | 9 | Service Key Argon2 哈希、Provider Key AES-256-GCM 加密、CORS 白名单、缓存追踪、超时保护、密钥指针持久化、死锁防护、数据库 UPSERT 修复、价格字段清理 |
 | ⚠️ **中风险** | 4 | 管理 API 无认证、协议转换完整性、SQLite 并发、Adapter 遗留设计 |
 | ⚠️ **低风险** | 4 | 时间戳格式、Tier 硬编码、占位模块、routes 表未使用 |
 
@@ -1539,18 +1726,76 @@ export PORT=19068
 8. ~~统一错误响应格式~~ ⚠️ Proxy 端点已完成，CRUD 端点待改进
 9. ~~WebSocket 实时推送~~ ✅
 
-**P2 — 已完成/进行中**（v0.2）：
+**P2 — 已完成/进行中**（v0.2-v0.2.3）：
 10. ~~结构化日志规范~~ ✅（tracing + JSON 输出已启用）
 11. ~~健康检查详细指标~~ ✅（`/health` 已返回详细状态）
 12. Metrics 导出（Prometheus）— v0.3
 13. ~~WebSearch 劫持~~ ✅
 14. ~~Settings API~~ ✅
+15. ~~缓存 token 追踪~~ ✅（V7: cache_read_input_tokens，V10: 纠正概念删除 cache_creation）
+16. ~~请求超时保护~~ ✅（V7: 60s 头超时 + 120s 流超时，防止死锁和挂起）
+17. ~~密钥轮询指针持久化~~ ✅（V8: 重启后从上次位置继续轮询）
+18. ~~死锁防护~~ ✅（修复 Mutex 锁的二次加锁问题）
+19. ~~数据库 UPSERT 修复~~ ✅（INSERT OR REPLACE → ON CONFLICT DO UPDATE，避免级联删除）
+20. ~~价格字段清理~~ ✅（V9: 删除从未使用的 cost_per_mtok_* 列和 cost_estimate）
+21. ~~缓存概念纠正~~ ✅（V10: 删除 cache_creation_input_tokens，写缓存并入 prompt_tokens）
 
 **P3 — 可选改进**（扩展性）：
-15. ~~协议转换不兼容性文档化~~ ✅（见 §15）
-16. 模型 Tier 开放化
-17. `routes` 表功能实现或移除
-18. `providers/` Adapter trait 清理（当前 proxy.rs 未使用）
+22. ~~协议转换不兼容性文档化~~ ✅（见 §15）
+23. 模型 Tier 开放化
+24. `routes` 表功能实现或移除
+25. `providers/` Adapter trait 清理（当前 proxy.rs 未使用）
+
+### 14.3 关键改进记录
+
+#### V7: 缓存追踪与超时保护（2026-07-31）
+
+**问题**：
+- 应用内统计与 CCSwitch 严重不对齐（缺少缓存命中信息）
+- 网关可能因上游挂起而永久阻塞
+
+**解决方案**：
+1. **缓存追踪**：添加 `cache_read_input_tokens` 和 `cache_creation_input_tokens` 列
+2. **超时保护**：请求头 60s 超时 + 响应体 120s 超时
+3. **SniffStream 增强**：提取 Anthropic 和 OpenAI 的缓存命中信息
+
+**效果**：应用内统计与 CCSwitch 对齐，网关不再因上游问题而卡死
+
+#### V8: 密钥轮询指针持久化（2026-07-31）
+
+**问题**：重启后密钥轮询总是从 key[0] 开始，如果前几个 key 已经 Red，每次都要跳过它们
+
+**解决方案**：将轮询指针持久化到 `settings` 表（keypool_index_{provider_id}），重启后从上次位置继续
+
+**效果**：重启后可以直接跳过失效的 key，提升轮询效率
+
+#### V9: 价格字段清理（2026-07-31）
+
+**问题**：models 表的 cost_per_mtok_* 列和 usage_log.cost_estimate 从未被 UI 使用，属于死代码
+
+**解决方案**：删除所有价格相关字段，简化 schema
+
+**效果**：减少存储开销，简化数据模型
+
+#### V10: 缓存概念纠正（2026-07-31）
+
+**问题**：`cache_creation_input_tokens`（写缓存）本质上只是首次处理的输入，不应该单独计数
+
+**解决方案**：删除 `cache_creation_input_tokens` 列，将写缓存并入 `prompt_tokens`
+
+**效果**：概念更清晰——只有 `cache_read_input_tokens` 才是真正的缓存（读取已缓存的内容）
+
+#### 死锁防护与数据库修复（2026-07-31）
+
+**问题**：
+1. 测试中 Mutex 锁的二次加锁导致死锁
+2. `INSERT OR REPLACE` 会触发级联删除，导致保存 Provider 时误删子表数据
+
+**解决方案**：
+1. 将数据库连接的作用域限制在局部块内，避免跨函数持锁
+2. 将 `INSERT OR REPLACE` 改为 `ON CONFLICT DO UPDATE`（UPSERT），避免触发 DELETE
+
+**效果**：测试不再卡死，保存 Provider 时不会误删 models 和 api_keys
 
 ---
 

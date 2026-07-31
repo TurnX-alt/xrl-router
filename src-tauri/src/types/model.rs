@@ -101,10 +101,6 @@ pub struct Model {
     pub context_window: usize,
     /// Max output tokens
     pub max_output_tokens: usize,
-    /// Pricing for cost tracking (per 1k input tokens)
-    pub cost_per_1k_input: f64,
-    /// Pricing for cost tracking (per 1k output tokens)
-    pub cost_per_1k_output: f64,
     /// Whether model is enabled
     pub enabled: bool,
     /// Creation timestamp

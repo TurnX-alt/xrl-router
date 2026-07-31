@@ -132,8 +132,6 @@ export interface Model {
   tier: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'custom';
   context_window: number;
   max_output_tokens: number;
-  cost_per_1k_input: number;
-  cost_per_1k_output: number;
   enabled: boolean;
 }
 
@@ -164,6 +162,7 @@ export interface StatsRow {
   key_id: string;
   prompt_tokens: number;
   completion_tokens: number;
+  cache_read_input_tokens: number;
   total_tokens: number;
   requests: number;
   day: string;

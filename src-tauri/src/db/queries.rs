@@ -16,8 +16,8 @@ impl Queries {
     pub const LIST_MODELS_BY_PROVIDER: &str = "SELECT * FROM models WHERE provider_id = ? ORDER BY tier, display_name";
     pub const GET_MODEL_BY_ID: &str = "SELECT * FROM models WHERE id = ?";
     pub const GET_MODEL_BY_PROVIDER_AND_MODEL_ID: &str = "SELECT * FROM models WHERE provider_id = ? AND model_id = ?";
-    pub const INSERT_MODEL: &str = "INSERT INTO models (id, provider_id, model_id, display_name, tier, context_window, max_output_tokens, cost_per_1k_input, cost_per_1k_output, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    pub const UPDATE_MODEL: &str = "UPDATE models SET display_name=?, tier=?, context_window=?, max_output_tokens=?, cost_per_1k_input=?, cost_per_1k_output=?, enabled=?, updated_at=? WHERE id=?";
+    pub const INSERT_MODEL: &str = "INSERT INTO models (id, provider_id, model_id, display_name, tier, context_window, max_output_tokens, capabilities, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    pub const UPDATE_MODEL: &str = "UPDATE models SET display_name=?, tier=?, context_window=?, max_output_tokens=?, capabilities=?, enabled=?, updated_at=? WHERE id=?";
     pub const DELETE_MODEL: &str = "DELETE FROM models WHERE id = ?";
 
     // --- API Keys ---
@@ -39,7 +39,7 @@ impl Queries {
     pub const DELETE_ROUTE: &str = "DELETE FROM routes WHERE id = ?";
 
     // --- Usage Log ---
-    pub const INSERT_USAGE_LOG: &str = "INSERT INTO usage_log (timestamp, provider_id, model_id, key_id, request_type, prompt_tokens, completion_tokens, latency_ms, success, error_message, cost_estimate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    pub const INSERT_USAGE_LOG: &str = "INSERT INTO usage_log (timestamp, provider_id, model_id, key_id, request_type, prompt_tokens, completion_tokens, latency_ms, success, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     pub const GET_USAGE_SUMMARY: &str = "SELECT provider_id, model_id, SUM(prompt_tokens) as total_prompt, SUM(completion_tokens) as total_completion, COUNT(*) as request_count, AVG(latency_ms) as avg_latency FROM usage_log WHERE timestamp >= ? AND timestamp <= ? GROUP BY provider_id, model_id ORDER BY request_count DESC";
 
     // --- Dashboard ---

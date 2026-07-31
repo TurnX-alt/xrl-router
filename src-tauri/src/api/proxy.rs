@@ -13,10 +13,17 @@ use axum::{
 use futures::stream::StreamExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// 等待上游返回响应头的最大时长。上游建连后挂起不响应时，send() 会卡死，
+/// 这里用超时兜底，避免整个重试循环被一次挂起的请求拖住。
+const UPSTREAM_HEADER_TIMEOUT_SECS: u64 = 60;
+/// 流式响应中相邻 chunk 之间的最大间隔。上游中途断流但不关连接时，
+/// stream.next() 会永久挂起；超过该间隔即视为断流，正常收尾返回。
+const UPSTREAM_CHUNK_TIMEOUT_SECS: u64 = 120;
 
 /// POST /v1/messages - Anthropic Messages API proxy (streaming only).
 pub async fn proxy_anthropic_messages(
@@ -173,14 +180,17 @@ pub async fn proxy_anthropic_messages(
             req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
         }
 
-        let resp = match req_builder
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
+        let resp = match tokio::time::timeout(
+            Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
+            req_builder
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send(),
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(e) => {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 // Network error (not a key problem) — don't retry, record and bail.
                 let duration_ms = start_time.elapsed().as_millis() as i64;
                 error!(trace_id = %trace_id, duration_ms, error = %e, "Upstream call failed");
@@ -189,11 +199,31 @@ pub async fn proxy_anthropic_messages(
                     &provider_id, &model_row_id,
                     Some(&key_id), Some(service_key_id.as_str()),
                     "/v1/messages",
-                    0, 0, duration_ms, false, Some(&e.to_string()), None,
+                    0, 0, duration_ms, false, Some(&e.to_string()), 0,
                 );
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
+                ));
+            }
+            Err(_) => {
+                // 上游建连成功但迟迟不返回响应头 → 视为该 key 不可用，跳出重试。
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+                let msg = format!(
+                    "upstream timed out after {}s waiting for response headers",
+                    UPSTREAM_HEADER_TIMEOUT_SECS
+                );
+                warn!(trace_id = %trace_id, duration_ms, key_id = %key_id, "{}", msg);
+                let _ = state.database.insert_usage_log(
+                    chrono::Utc::now().timestamp(),
+                    &provider_id, &model_row_id,
+                    Some(&key_id), Some(service_key_id.as_str()),
+                    "/v1/messages",
+                    0, 0, duration_ms, false, Some(&msg), 0,
+                );
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({"error": {"type": "api_error", "message": msg}})),
                 ));
             }
         };
@@ -238,22 +268,38 @@ pub async fn proxy_anthropic_messages(
         let model_id_log = resolved.model_row_id.clone();
         let key_id_log = last_key_id.clone();
         let service_key_id_log = service_key_id.clone();
+        let state_clone = state.clone();
+        // message_start 阶段上游尚未返回 usage，先给一个非零估算占位，
+        // 避免客户端（CCSwitch 等）把 input 记成 0。真实值在流末尾覆盖。
+        let est_input = translate::estimate_input_tokens(&body);
 
         tokio::spawn(async move {
             let mut buffer = String::new();
             let mut chunk_count = 0u64;
             let mut stream_state = translate::StreamState::new();
-            // Whether the Anthropic envelope has been closed with message_stop.
-            let mut stopped = false;
+            stream_state.input_tokens = est_input;
             // Whether the OpenAI upstream sent its [DONE] terminator.
             let mut saw_done = false;
-            // TEMP DEBUG: capture upstream behavior + translated event sequence to
-            // diagnose why Claude Code sees a malformed stream. Remove once stable.
-            let mut saw_reasoning = false;
-            let mut saw_finish: Option<String> = None;
-            let mut event_seq: Vec<String> = Vec::new();
 
-            'outer: while let Some(chunk) = stream.next().await {
+            'outer: loop {
+                // 包装 chunk 读取：上游中途断流不关连接时，next() 会永久挂起。
+                let chunk = match tokio::time::timeout(
+                    Duration::from_secs(UPSTREAM_CHUNK_TIMEOUT_SECS),
+                    stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!(
+                            trace_id = %trace_id_clone,
+                            "upstream stream silent for {}s, closing",
+                            UPSTREAM_CHUNK_TIMEOUT_SECS
+                        );
+                        break;
+                    }
+                };
                 if let Ok(bytes) = chunk {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -270,28 +316,6 @@ pub async fn proxy_anthropic_messages(
                             }
 
                             if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
-                                // TEMP DEBUG: record upstream delta composition.
-                                let first_delta = chunk_json
-                                    .get("choices")
-                                    .and_then(|c| c.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|c| c.get("delta"));
-                                if first_delta
-                                    .and_then(|d| d.get("reasoning_content"))
-                                    .is_some()
-                                {
-                                    saw_reasoning = true;
-                                }
-                                if let Some(fr) = chunk_json
-                                    .get("choices")
-                                    .and_then(|c| c.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|c| c.get("finish_reason"))
-                                    .and_then(|f| f.as_str())
-                                {
-                                    saw_finish = Some(fr.to_string());
-                                }
-
                                 let events: Vec<Value> = translate::translate_openai_chunk_to_anthropic(
                                     &chunk_json,
                                     &model_name_clone,
@@ -303,15 +327,6 @@ pub async fn proxy_anthropic_messages(
                                         // Anthropic SSE requires an `event: <type>` line;
                                         // without it Claude Code treats the frame as malformed.
                                         let event_type = ev["type"].as_str().unwrap_or("message");
-                                        if event_type == "message_stop" {
-                                            stopped = true;
-                                        }
-                                        // TEMP DEBUG: record type (and block index when present).
-                                        if let Some(idx) = ev.get("index").and_then(|i| i.as_i64()) {
-                                            event_seq.push(format!("{}:{}", event_type, idx));
-                                        } else {
-                                            event_seq.push(event_type.to_string());
-                                        }
                                         let json_str = serde_json::to_string(&ev).unwrap();
                                         let _ = tx.send(
                                             Ok(Event::default().event(event_type).data(json_str)),
@@ -325,37 +340,15 @@ pub async fn proxy_anthropic_messages(
                 }
             }
 
-            // If the upstream ended without emitting message_stop (no finish_reason and
-            // no [DONE]), close any still-open content block, then synthesize a clean
-            // message_delta + message_stop so the client sees a well-formed close
-            // instead of a truncated stream with an unclosed block.
-            if !stopped {
-                for ev in stream_state.close_open_blocks() {
-                    let event_type = ev["type"].as_str().unwrap_or("message");
-                    event_seq.push(format!("{}:0(synth)", event_type));
-                    let json_str = serde_json::to_string(&ev).unwrap();
-                    let _ = tx.send(
-                        Ok(Event::default().event(event_type).data(json_str)),
-                    )
-                    .await;
-                }
-                let md = json!({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                    "usage": {"output_tokens": 0},
-                });
-                event_seq.push("message_delta(synth)".to_string());
+            // message_delta/message_stop 统一在流结束后通过 finalize 发出。
+            // OpenAI 上游的 usage 在最后一个 chunk 才到（晚于 finish_reason），
+            // 若提前发 message_delta 会把 input/cache 报成 0。这里等流处理完，
+            // 用 stream_state 里已累积的真实 usage 收尾。
+            for ev in translate::finalize_openai_to_anthropic(&mut stream_state) {
+                let event_type = ev["type"].as_str().unwrap_or("message");
+                let json_str = serde_json::to_string(&ev).unwrap();
                 let _ = tx.send(
-                    Ok(Event::default()
-                        .event("message_delta")
-                        .data(serde_json::to_string(&md).unwrap())),
-                )
-                .await;
-                event_seq.push("message_stop(synth)".to_string());
-                let _ = tx.send(
-                    Ok(Event::default()
-                        .event("message_stop")
-                        .data(serde_json::to_string(&json!({"type": "message_stop"})).unwrap())),
+                    Ok(Event::default().event(event_type).data(json_str)),
                 )
                 .await;
             }
@@ -364,9 +357,6 @@ pub async fn proxy_anthropic_messages(
                 trace_id = %trace_id_clone,
                 total_chunks = chunk_count,
                 done = saw_done,
-                saw_reasoning,
-                saw_finish = ?saw_finish,
-                seq = ?event_seq,
                 "Stream ended"
             );
 
@@ -377,6 +367,8 @@ pub async fn proxy_anthropic_messages(
             } else {
                 (stream_state.output_chars / 4) as i64
             };
+            let input_t = stream_state.input_tokens as i64;
+            let cr = stream_state.cache_read_input_tokens as i64;
             let _ = db.insert_usage_log(
                 chrono::Utc::now().timestamp(),
                 &provider_id_log,
@@ -384,12 +376,12 @@ pub async fn proxy_anthropic_messages(
                 key_id_log.as_deref(),
                 Some(service_key_id_log.as_str()),
                 "/v1/messages",
-                stream_state.input_tokens as i64,
+                input_t,
                 output_tokens,
                 start_time.elapsed().as_millis() as i64,
                 true,
                 None,
-                None,
+                cr,
             );
         });
 
@@ -404,11 +396,28 @@ pub async fn proxy_anthropic_messages(
         let key_id_log = last_key_id.clone();
         let service_key_id_log = service_key_id.clone();
         let db = state.database.clone();
+        let state_clone = state.clone();
         let mut sniff = sniff::SniffStream::new(response.bytes_stream(), &provider_kind);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(100);
 
         tokio::spawn(async move {
-            while let Some(item) = sniff.next().await {
+            loop {
+                let item = match tokio::time::timeout(
+                    Duration::from_secs(UPSTREAM_CHUNK_TIMEOUT_SECS),
+                    sniff.next(),
+                )
+                .await
+                {
+                    Ok(Some(i)) => i,
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!(
+                            "upstream stream silent for {}s, closing",
+                            UPSTREAM_CHUNK_TIMEOUT_SECS
+                        );
+                        break;
+                    }
+                };
                 if tx.send(item).await.is_err() {
                     break;
                 }
@@ -419,6 +428,8 @@ pub async fn proxy_anthropic_messages(
             } else {
                 (usage.output_chars / 4) as i64
             };
+            let input_t = usage.input_tokens as i64;
+            let cr = usage.cache_read_input_tokens as i64;
             let _ = db.insert_usage_log(
                 chrono::Utc::now().timestamp(),
                 &provider_id_log,
@@ -426,12 +437,12 @@ pub async fn proxy_anthropic_messages(
                 key_id_log.as_deref(),
                 Some(service_key_id_log.as_str()),
                 "/v1/messages",
-                usage.input_tokens as i64,
+                input_t,
                 output_tokens,
                 start_time.elapsed().as_millis() as i64,
                 true,
                 None,
-                None,
+                cr,
             );
         });
 
@@ -587,14 +598,17 @@ pub async fn proxy_openai_chat(
             req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
         }
 
-        let resp = match req_builder
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
+        let resp = match tokio::time::timeout(
+            Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
+            req_builder
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send(),
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(e) => {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 let duration_ms = start_time.elapsed().as_millis() as i64;
                 error!(trace_id = %trace_id, duration_ms, error = %e, "Upstream call failed");
                 let _ = state.database.insert_usage_log(
@@ -602,11 +616,30 @@ pub async fn proxy_openai_chat(
                     &provider_id, &model_row_id,
                     Some(&key_id), Some(service_key_id.as_str()),
                     "/v1/chat/completions",
-                    0, 0, duration_ms, false, Some(&e.to_string()), None,
+                    0, 0, duration_ms, false, Some(&e.to_string()), 0,
                 );
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
+                ));
+            }
+            Err(_) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+                let msg = format!(
+                    "upstream timed out after {}s waiting for response headers",
+                    UPSTREAM_HEADER_TIMEOUT_SECS
+                );
+                warn!(trace_id = %trace_id, duration_ms, key_id = %key_id, "{}", msg);
+                let _ = state.database.insert_usage_log(
+                    chrono::Utc::now().timestamp(),
+                    &provider_id, &model_row_id,
+                    Some(&key_id), Some(service_key_id.as_str()),
+                    "/v1/chat/completions",
+                    0, 0, duration_ms, false, Some(&msg), 0,
+                );
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({"error": {"type": "api_error", "message": msg}})),
                 ));
             }
         };
@@ -646,6 +679,7 @@ pub async fn proxy_openai_chat(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(100);
         let trace_id_clone = trace_id.clone();
         let db = state.database.clone();
+        let state_clone = state.clone();
         let provider_id_log = provider_id.clone();
         let model_id_log = resolved.model_row_id.clone();
         let key_id_log = last_key_id.clone();
@@ -656,15 +690,18 @@ pub async fn proxy_openai_chat(
             let mut chunk_count = 0u64;
             let mut accum_input: u64 = 0;
             let mut accum_output: u64 = 0;
+            let mut accum_cache_read: u64 = 0;
             let mut accum_chars: u64 = 0;
+            let mut oa_state = translate::OaStreamState::new();
 
             // Record usage with the chars/4 fallback. Borrows the log fields.
-            let record_usage = |input_tokens: u64, output_tokens: u64, output_chars: u64| {
+            let record_usage = |input_tokens: u64, output_tokens: u64, output_chars: u64, cache_read: u64| {
                 let output_tokens = if output_tokens > 0 {
                     output_tokens as i64
                 } else {
                     (output_chars / 4) as i64
                 };
+                let cr = cache_read as i64;
                 let _ = db.insert_usage_log(
                     chrono::Utc::now().timestamp(),
                     &provider_id_log,
@@ -677,11 +714,29 @@ pub async fn proxy_openai_chat(
                     start_time.elapsed().as_millis() as i64,
                     true,
                     None,
-                    None,
+                    cr,
                 );
             };
 
-            while let Some(chunk) = stream.next().await {
+            loop {
+                // 包装 chunk 读取：上游中途断流不关连接时，next() 会永久挂起。
+                let chunk = match tokio::time::timeout(
+                    Duration::from_secs(UPSTREAM_CHUNK_TIMEOUT_SECS),
+                    stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!(
+                            trace_id = %trace_id_clone,
+                            "upstream stream silent for {}s, closing",
+                            UPSTREAM_CHUNK_TIMEOUT_SECS
+                        );
+                        break;
+                    }
+                };
                 if let Ok(bytes) = chunk {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -697,19 +752,20 @@ pub async fn proxy_openai_chat(
                                     "Stream completed"
                                 );
                                 let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-                                record_usage(accum_input, accum_output, accum_chars);
+                                record_usage(accum_input, accum_output, accum_chars, accum_cache_read);
                                 return;
                             }
 
                             if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
-                                let (it, ot, ch) = translate::extract_anthropic_usage(&chunk_json);
+                                let (it, ot, cr, ch) = translate::extract_anthropic_usage(&chunk_json);
                                 accum_input = accum_input.max(it);
                                 if ot > 0 {
                                     accum_output = ot;
                                 }
+                                accum_cache_read = accum_cache_read.max(cr);
                                 accum_chars += ch;
 
-                                let translated = translate::translate_anthropic_chunk_to_openai(&chunk_json);
+                                let translated = translate::translate_anthropic_chunk_to_openai(&chunk_json, &mut oa_state);
                                 if translated != Value::Null {
                                     chunk_count += 1;
                                     let json_str = serde_json::to_string(&translated).unwrap();
@@ -725,7 +781,10 @@ pub async fn proxy_openai_chat(
                 total_chunks = chunk_count,
                 "Stream ended (no [DONE] received)"
             );
-            record_usage(accum_input, accum_output, accum_chars);
+            // Anthropic 流以 message_stop 结束（不会发 OpenAI 的 [DONE]），
+            // 这里补发一个 [DONE] 让 OpenAI 客户端正常结束读取。
+            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+            record_usage(accum_input, accum_output, accum_chars, accum_cache_read);
         });
 
         Ok(Sse::new(ReceiverStream::new(rx))
@@ -739,11 +798,28 @@ pub async fn proxy_openai_chat(
         let key_id_log = last_key_id.clone();
         let service_key_id_log = service_key_id.clone();
         let db = state.database.clone();
+        let state_clone = state.clone();
         let mut sniff = sniff::SniffStream::new(response.bytes_stream(), &provider_kind);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(100);
 
         tokio::spawn(async move {
-            while let Some(item) = sniff.next().await {
+            loop {
+                let item = match tokio::time::timeout(
+                    Duration::from_secs(UPSTREAM_CHUNK_TIMEOUT_SECS),
+                    sniff.next(),
+                )
+                .await
+                {
+                    Ok(Some(i)) => i,
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!(
+                            "upstream stream silent for {}s, closing",
+                            UPSTREAM_CHUNK_TIMEOUT_SECS
+                        );
+                        break;
+                    }
+                };
                 if tx.send(item).await.is_err() {
                     break;
                 }
@@ -754,6 +830,8 @@ pub async fn proxy_openai_chat(
             } else {
                 (usage.output_chars / 4) as i64
             };
+            let input_t = usage.input_tokens as i64;
+            let cr = usage.cache_read_input_tokens as i64;
             let _ = db.insert_usage_log(
                 chrono::Utc::now().timestamp(),
                 &provider_id_log,
@@ -761,12 +839,12 @@ pub async fn proxy_openai_chat(
                 key_id_log.as_deref(),
                 Some(service_key_id_log.as_str()),
                 "/v1/chat/completions",
-                usage.input_tokens as i64,
+                input_t,
                 output_tokens,
                 start_time.elapsed().as_millis() as i64,
                 true,
                 None,
-                None,
+                cr,
             );
         });
 
@@ -1020,7 +1098,7 @@ async fn forward_upstream_error(
         duration_ms as i64,
         false,
         Some(&format!("upstream status {}", upstream_status)),
-        None,
+        0,
     );
     (code, Json(err_body)).into_response()
 }
@@ -1145,21 +1223,27 @@ async fn run_websearch_loop(
 
     let mut accumulated: Vec<Value> = Vec::new();
     let mut final_stop = "end_turn".to_string();
-    let mut final_usage = json!({"input_tokens": 0, "output_tokens": 0});
+    // Accumulate usage across all tool-calling loop rounds.
+    let mut accum_input: i64 = 0;
+    let mut accum_output: i64 = 0;
+    let mut accum_cache_read: i64 = 0;
 
     // Some(Response) = 上游错误，直接返客户端；None = loop 正常结束
     let early: Option<Response> = if provider_is_anthropic {
         hijack_anthropic(
             &client, upstream_url, model, &api_key, body, max_tokens,
             &state.keys, &resolved.provider_id,
-            &mut accumulated, &mut final_stop, &mut final_usage,
+            &mut accumulated, &mut final_stop,
+            &mut accum_input, &mut accum_output,
+            &mut accum_cache_read,
         )
         .await?
     } else {
         hijack_openai(
             &client, upstream_url, model, &api_key, body, max_tokens,
             &state.keys, &resolved.provider_id,
-            &mut accumulated, &mut final_stop, &mut final_usage,
+            &mut accumulated, &mut final_stop,
+            &mut accum_input, &mut accum_output,
         )
         .await?
     };
@@ -1167,8 +1251,6 @@ async fn run_websearch_loop(
         return Ok(resp);
     }
 
-    let in_t = final_usage["input_tokens"].as_i64().unwrap_or(0);
-    let out_t = final_usage["output_tokens"].as_i64().unwrap_or(0);
     let _ = state.database.insert_usage_log(
         chrono::Utc::now().timestamp(),
         &resolved.provider_id,
@@ -1176,14 +1258,19 @@ async fn run_websearch_loop(
         Some(&key_id),
         Some(service_key_id),
         "/v1/messages",
-        in_t,
-        out_t,
+        accum_input,
+        accum_output,
         0,
         true,
         None,
-        None,
+        accum_cache_read,
     );
 
+    let final_usage = json!({
+        "input_tokens": accum_input,
+        "output_tokens": accum_output,
+        "cache_read_input_tokens": accum_cache_read,
+    });
     let events = build_sse_events(&msg_id, model, &accumulated, &final_stop, &final_usage);
     let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>));
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
@@ -1201,7 +1288,9 @@ async fn hijack_anthropic(
     provider_id: &str,
     accumulated: &mut Vec<Value>,
     final_stop: &mut String,
-    final_usage: &mut Value,
+    accum_input: &mut i64,
+    accum_output: &mut i64,
+    accum_cache_read: &mut i64,
 ) -> Result<Option<Response>, (StatusCode, Json<Value>)> {
     let custom_tool = json!({
         "name": "web_search",
@@ -1248,7 +1337,13 @@ async fn hijack_anthropic(
 
         let stop = msg_val["stop_reason"].as_str().unwrap_or("end_turn").to_string();
         let content = msg_val["content"].as_array().cloned().unwrap_or_default();
-        *final_usage = msg_val["usage"].clone();
+        // Accumulate usage across all tool-calling rounds (not overwrite).
+        let usage = &msg_val["usage"];
+        // input 含写缓存（cache_creation 只是首次处理输入，并入输入）
+        *accum_input += usage["input_tokens"].as_i64().unwrap_or(0)
+            + usage["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+        *accum_output += usage["output_tokens"].as_i64().unwrap_or(0);
+        *accum_cache_read += usage["cache_read_input_tokens"].as_i64().unwrap_or(0);
         accumulated.extend(content.clone());
 
         if stop != "tool_use" {
@@ -1287,7 +1382,8 @@ async fn hijack_openai(
     provider_id: &str,
     accumulated: &mut Vec<Value>,
     final_stop: &mut String,
-    final_usage: &mut Value,
+    accum_input: &mut i64,
+    accum_output: &mut i64,
 ) -> Result<Option<Response>, (StatusCode, Json<Value>)> {
     let custom_fn = json!({
         "type": "function",
@@ -1332,10 +1428,9 @@ async fn hijack_openai(
         let finish = choice["finish_reason"].as_str().unwrap_or("stop");
         let content_text = choice["message"]["content"].as_str().unwrap_or("");
         let tool_calls = choice["message"]["tool_calls"].as_array().cloned().unwrap_or_default();
-        *final_usage = json!({
-            "input_tokens": msg_val["usage"]["prompt_tokens"].as_i64().unwrap_or(0),
-            "output_tokens": msg_val["usage"]["completion_tokens"].as_i64().unwrap_or(0),
-        });
+        // Accumulate usage across all tool-calling rounds (not overwrite).
+        *accum_input += msg_val["usage"]["prompt_tokens"].as_i64().unwrap_or(0);
+        *accum_output += msg_val["usage"]["completion_tokens"].as_i64().unwrap_or(0);
 
         if !content_text.is_empty() {
             accumulated.push(json!({"type": "text", "text": content_text}));

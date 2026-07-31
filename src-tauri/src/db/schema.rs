@@ -137,4 +137,45 @@ UPDATE api_keys SET status = 'green', last_error = NULL, last_error_code = NULL,
     r#"
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#,
+    // V7: 缓存 token 追踪 + 缓存价格字段。
+    // Anthropic prompt caching 会产生 cache_read_input_tokens 和
+    // cache_creation_input_tokens，之前这两类 token 完全没被记录，
+    // 导致应用内统计与 CCSwitch 等外部工具严重不对齐。
+    // models 表新增 cache 价格列（Anthropic: cache write = 1.25× input,
+    // cache read = 0.1× input），用于准确的费用估算。
+    r#"
+ALTER TABLE usage_log ADD COLUMN cache_read_input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_log ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE models ADD COLUMN cost_per_1k_cache_read REAL DEFAULT 0.0;
+ALTER TABLE models ADD COLUMN cost_per_1k_cache_write REAL DEFAULT 0.0;
+"#,
+    // V8: 价格单位从 per 1K token 改为 per MTok（每百万 token），
+    // 与 Anthropic / OpenAI 官方定价一致。
+    r#"
+ALTER TABLE models RENAME COLUMN cost_per_1k_input TO cost_per_mtok_input;
+ALTER TABLE models RENAME COLUMN cost_per_1k_output TO cost_per_mtok_output;
+ALTER TABLE models RENAME COLUMN cost_per_1k_cache_read TO cost_per_mtok_cache_read;
+ALTER TABLE models RENAME COLUMN cost_per_1k_cache_write TO cost_per_mtok_cache_write;
+UPDATE models SET cost_per_mtok_input = cost_per_mtok_input * 1000.0;
+UPDATE models SET cost_per_mtok_output = cost_per_mtok_output * 1000.0;
+UPDATE models SET cost_per_mtok_cache_read = cost_per_mtok_cache_read * 1000.0;
+UPDATE models SET cost_per_mtok_cache_write = cost_per_mtok_cache_write * 1000.0;
+"#,
+    // V9: 移除无用的模型价格列和 usage_log.cost_estimate。
+    // 历史上价格相关字段从未被 UI 展示或使用，属于死代码；清理掉以简化 schema。
+    r#"
+ALTER TABLE models DROP COLUMN cost_per_mtok_input;
+ALTER TABLE models DROP COLUMN cost_per_mtok_output;
+ALTER TABLE models DROP COLUMN cost_per_mtok_cache_read;
+ALTER TABLE models DROP COLUMN cost_per_mtok_cache_write;
+ALTER TABLE usage_log DROP COLUMN cost_estimate;
+"#,
+    // V10: 概念纠正——缓存只有「读」（命中复用），「写缓存」只是首次处理输入，
+    // 属于输入的一部分，不该单列。把历史的 cache_creation 并入 prompt_tokens
+    // 后删除该列；之后 input_tokens（含写缓存）+ cache_read 即完整口径。
+    r#"
+UPDATE usage_log SET prompt_tokens = prompt_tokens + COALESCE(cache_creation_input_tokens, 0)
+    WHERE cache_creation_input_tokens IS NOT NULL AND cache_creation_input_tokens > 0;
+ALTER TABLE usage_log DROP COLUMN cache_creation_input_tokens;
+"#,
 ];

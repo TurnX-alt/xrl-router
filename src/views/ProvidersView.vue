@@ -22,7 +22,6 @@
         v-for="p in providers"
         :key="p.id"
         class="card"
-        @contextmenu.prevent="openDeleteMenu(p)"
       >
         <span class="card__avatar mdi" :class="p.kind === 'anthropic' ? 'avatar--anthropic' : 'avatar--openai'">
             <!-- Official Anthropic logo from simple-icons -->
@@ -49,14 +48,32 @@
           <span v-if="p.base_url" class="card__endpoint md-typescale-body-medium mono">{{ p.base_url }}</span>
         </div>
         <div class="card__actions">
-          <md-text-button class="edit-btn" @click="$router.push(`/providers/${p.id}/edit`)">
-            编辑
-          </md-text-button>
+          <md-icon-button
+            :id="'prov-btn-' + p.id"
+            class="card__more-btn"
+            @click="toggleMenu(p)"
+          >
+            <span class="mdi mdi-dots-vertical"></span>
+          </md-icon-button>
         </div>
       </article>
     </div>
 
-    <!-- Right-click delete dialog -->
+    <!-- Shared action menu (single instance, re-anchors per card) -->
+    <md-menu
+      :open="menuOpen != null"
+      :anchor="menuAnchor"
+      positioning="fixed"
+      @closed="menuOpen = null"
+    >
+      <md-menu-item @click="editFromMenu">
+        <span class="mdi mdi-pencil-outline"></span> 编辑
+      </md-menu-item>
+      <md-menu-item class="menu-item--danger" @click="deleteFromMenu">
+        <span class="mdi mdi-delete-outline"></span> 删除
+      </md-menu-item>
+    </md-menu>
+
     <md-dialog :open="deleteOpen" @close="deleteOpen = false">
       <div slot="headline">删除供应商</div>
       <div slot="content" class="form">
@@ -72,13 +89,41 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted } from 'vue';
+import { useRouter } from 'vue-router';
 import { providersApi, keysApi, type Provider } from '../api';
 import { wsClient } from '../ws';
+
+const router = useRouter();
 
 const providers = ref<Provider[]>([]);
 const loading = ref(true);
 const deleteOpen = ref(false);
 const deleteTarget = ref<Provider | null>(null);
+const menuOpen = ref<string | null>(null);
+const menuAnchor = ref('');
+const menuTarget = ref<Provider | null>(null);
+
+function toggleMenu(p: Provider) {
+  if (menuOpen.value === p.id) {
+    menuOpen.value = null;
+  } else {
+    menuTarget.value = p;
+    menuAnchor.value = 'prov-btn-' + p.id;
+    menuOpen.value = p.id;
+  }
+}
+
+function editFromMenu() {
+  if (menuTarget.value) {
+    router.push(`/providers/${menuTarget.value.id}/edit`);
+  }
+}
+
+function deleteFromMenu() {
+  if (menuTarget.value) {
+    openDeleteConfirm(menuTarget.value);
+  }
+}
 
 // Key stats map: provider_id -> { green, total }
 const keyStatsMap = reactive<Record<string, { green: number; total: number }>>({});
@@ -116,7 +161,7 @@ function onKeyStats(event: any) {
   }
 }
 
-function openDeleteMenu(p: Provider) {
+function openDeleteConfirm(p: Provider) {
   deleteTarget.value = p;
   deleteOpen.value = true;
 }
@@ -184,9 +229,14 @@ onUnmounted(() => {
 .card__chip { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: var(--md-sys-shape-corner-full); font-size: 0.75rem; font-weight: 500; }
 .chip { display: inline-flex; align-items: center; padding: 2px 10px; border-radius: var(--md-sys-shape-corner-full); background: var(--md-sys-color-secondary-container); color: var(--md-sys-color-on-secondary-container); font-size: 0.75rem; width: fit-content; margin-top: 2px; }
 .card__endpoint { color: var(--md-sys-color-on-surface-variant); font-size: 0.75rem; word-break: break-all; display: block; margin-top: 4px; }
-.card__actions { display: flex; justify-content: flex-end; }
-.edit-btn { min-width: 0; padding: 0 4px; }
+.card__actions { display: flex; justify-content: flex-end; position: relative; }
+.card__more-btn { --md-icon-button-icon-size: 20px; width: 36px; height: 36px; }
 .form { min-width: 300px; }
 .confirm-del { color: var(--md-sys-color-error); }
 .mono { font-family: 'Roboto Mono', monospace; }
+</style>
+
+<!-- md-menu teleports to document root, so its styles must not be scoped -->
+<style>
+.menu-item--danger { --md-menu-item-label-text-color: var(--md-sys-color-error); color: var(--md-sys-color-error); }
 </style>

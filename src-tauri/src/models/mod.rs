@@ -27,7 +27,6 @@ impl ModelRegistry {
         let mut stmt = conn.prepare(
             "SELECT id, provider_id, model_id, display_name, tier,
                     context_window, max_output_tokens,
-                    cost_per_1k_input, cost_per_1k_output,
                     capabilities,
                     enabled, created_at, updated_at
              FROM models ORDER BY tier, display_name"
@@ -43,12 +42,10 @@ impl ModelRegistry {
                     tier: row.get(4)?,
                     context_window: row.get(5)?,
                     max_output_tokens: row.get(6)?,
-                    cost_per_1k_input: row.get(7)?,
-                    cost_per_1k_output: row.get(8)?,
-                    capabilities: row.get(9)?,
-                    enabled: row.get::<_, i32>(10)? != 0,
-                    created_at: row.get(11)?,
-                    updated_at: row.get(12)?,
+                    capabilities: row.get(7)?,
+                    enabled: row.get::<_, i32>(8)? != 0,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             })?
             .filter_map(|r| r.ok())

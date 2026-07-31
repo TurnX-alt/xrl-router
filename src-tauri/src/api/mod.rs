@@ -252,6 +252,8 @@ async fn delete_provider(
     }
 
     state.providers.remove(&id);
+    // 同步 KeyPool 内存：移除该 provider 的密钥 + 轮询指针。
+    state.keys.remove_provider(&id);
 
     if let Err(e) = state.database.delete_provider(&id) {
         return Err((
@@ -433,12 +435,26 @@ async fn delete_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // 先查 provider_id（KeyPool 的 remove_key 需要它），再删 DB + 同步内存。
+    let provider_id = match state.database.get_api_key(&id) {
+        Ok(Some(k)) => k.provider_id,
+        _ => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Key not found"})),
+            ))
+        }
+    };
+
     if let Err(e) = state.database.delete_api_key(&id) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         ));
     }
+
+    // 同步 KeyPool 内存：移除 key 并修正轮询指针（越界自动回退 0）。
+    state.keys.remove_key(&provider_id, &id);
 
     Ok(Json(serde_json::json!({"status": "deleted"})))
 }
@@ -472,8 +488,6 @@ struct CreateModelRequest {
     tier: String,
     context_window: Option<i64>,
     max_output_tokens: Option<i64>,
-    cost_per_1k_input: Option<f64>,
-    cost_per_1k_output: Option<f64>,
     capabilities: Option<String>,
 }
 
@@ -496,8 +510,6 @@ async fn create_model(
         tier: req.tier,
         context_window: req.context_window.unwrap_or(128000),
         max_output_tokens: req.max_output_tokens.unwrap_or(4096),
-        cost_per_1k_input: req.cost_per_1k_input.unwrap_or(0.0),
-        cost_per_1k_output: req.cost_per_1k_output.unwrap_or(0.0),
         capabilities: req.capabilities.unwrap_or_else(|| "[\"text\"]".to_string()),
         enabled: true,
         created_at: Utc::now().timestamp(),
@@ -537,8 +549,6 @@ struct UpdateModelRequest {
     tier: Option<String>,
     context_window: Option<i64>,
     max_output_tokens: Option<i64>,
-    cost_per_1k_input: Option<f64>,
-    cost_per_1k_output: Option<f64>,
     enabled: Option<bool>,
 }
 
@@ -575,12 +585,6 @@ async fn update_model(
     }
     if let Some(max_output_tokens) = req.max_output_tokens {
         updated.max_output_tokens = max_output_tokens;
-    }
-    if let Some(cost_per_1k_input) = req.cost_per_1k_input {
-        updated.cost_per_1k_input = cost_per_1k_input;
-    }
-    if let Some(cost_per_1k_output) = req.cost_per_1k_output {
-        updated.cost_per_1k_output = cost_per_1k_output;
     }
     if let Some(enabled) = req.enabled {
         updated.enabled = enabled;
