@@ -1,6 +1,8 @@
 # xrl-router
 
 > **多 Provider AI LLM API 路由网关** — 桌面端 Tauri 2 应用，下游统一暴露 Anthropic Messages API，内置支持 Anthropic 和 OpenAI
+>
+> **版本**: 26.7.31+2230
 
 📎 [产品需求文档 (PRD)](./PRD.md) · [技术规格说明书 (TS)](./TS.md)
 
@@ -11,16 +13,17 @@
 | 特性 | 说明 |
 |------|------|
 | **统一入口** | 客户端通过单一 Anthropic API 端点访问所有 LLM Provider |
-| **协议转换** | Anthropic Messages API ↔ OpenAI Chat Completions API（含流式） |
+| **协议转换** | Anthropic Messages API ↔ OpenAI Chat Completions API（流式） |
 | **模型别名** | `real_model<-alias` 语法，客户端使用别名、后端自动映射 |
-| **密钥池** | 红绿灯三色健康状态 + 轮询调度，自动跳过失效密钥 |
+| **密钥池** | 红绿灯三色健康状态 + 轮询调度 + **指针持久化**，自动跳过失效密钥且重启后从上次位置继续 |
+| **缓存追踪** | 自动提取并持久化上游 API 的缓存命中信息（cache_read_input_tokens） |
+| **超时保护** | 请求头和响应体的独立超时机制，防止死锁和挂起 |
 | **AES-256-GCM 加密** | Provider API Key 使用 AES-256-GCM 加密存储，主密钥独立于数据库 |
 | **Argon2 哈希** | Service Key 使用 Argon2 哈希存储，防彩虹表 |
 | **WebSearch 劫持** | 可选的本地 Bing 搜索劫持，当请求包含 `web_search` tool 时自动拦截 |
 | **WebSocket 实时推送** | 密钥状态变更和用量统计变更通过 WebSocket 实时推送到前端 |
 | **系统托盘** | 关闭窗口时最小化到托盘继续运行，网关服务不中断 |
 | **Dashboard API** | 概览和用量统计端点，支持时间粒度和时区偏移 |
-| **模型同步** | 从上游 Provider 自动同步可用模型列表，避免手动维护 |
 | **桌面应用** | Tauri 2 封装，MD3 风格管理面板，开箱即用 |
 | **本地优先** | 所有数据存储在本地 SQLite，零数据外泄 |
 
@@ -29,8 +32,8 @@
 | 层 | 技术 |
 |---|---|
 | 后端 | Rust (edition 2021) + Tauri 2 + axum 0.7 + tokio |
-| 数据库 | SQLite 3 (rusqlite 0.32 bundled) |
-| HTTP 客户端 | reqwest 0.12 (流式 SSE) |
+| 数据库 | SQLite 3 (rusqlite 0.32 bundled, WAL 模式) |
+| HTTP 客户端 | reqwest 0.12 (流式 SSE, 超时保护) |
 | 前端 | Vue 3 + Pinia + Vue Router 4 |
 | UI | Material Web Components (MD3) + MDI 图标 |
 | 图表 | Chart.js + vue-chartjs |
@@ -70,7 +73,7 @@ pnpm build
 | `API_KEY` | *(无)* | 可选的全局访问密钥 |
 | `CORS_ORIGINS` | `localhost:5173/19068` + `tauri://localhost` | 允许的跨域来源（逗号分隔） |
 
-首次启动自动在系统应用数据目录（macOS: `~/Library/Application Support/im.xrl.router/`）创建数据库并执行 6 版迁移。
+首次启动自动在系统应用数据目录（macOS: `~/Library/Application Support/im.xrl.router/`）创建数据库并执行 10 版迁移。
 
 ## 架构
 
@@ -108,7 +111,7 @@ Claude Code (Anthropic Messages API 客户端)
 │  Anthropic      OpenAI   WebSearch 劫持            │                            │
 │  (内置透传)     (内置转换) (Bing 搜索拦截)          │                            │
 │                  │                                  │                            │
-│                  │  SniffStream                     │                            │
+│                  │  SniffStream + 超时保护          │                            │
 │                  └──────────▶ token 用量统计 ◀──────┘                            │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -168,17 +171,17 @@ xrl-router/
 │   │   │   └── server.rs       # AppState、axum 服务器、CORS
 │   │   ├── api/                # HTTP API 处理器
 │   │   │   ├── mod.rs          # 路由构建 + CRUD + WebSocket + Settings
-│   │   │   ├── proxy.rs        # LLM 代理核心（双协议入口 + WebSearch 劫持）
+│   │   │   ├── proxy.rs        # LLM 代理核心（双协议入口 + WebSearch 劫持 + 超时保护）
 │   │   │   └── proxy/
 │   │   │       ├── translate.rs # Anthropic ↔ OpenAI 协议转换
-│   │   │       └── sniff.rs    # 透传流嗅探（SniffStream 提取 token 用量）
-│   │   ├── db/                 # SQLite 封装 + 6 版迁移
+│   │   │       └── sniff.rs    # 透传流嗅探（SniffStream 提取 token 用量 + 缓存追踪）
+│   │   ├── db/                 # SQLite 封装 + 10 版迁移
 │   │   │   ├── mod.rs
 │   │   │   ├── schema.rs
 │   │   │   └── queries.rs
 │   │   ├── types/              # 数据结构定义
 │   │   ├── providers/          # Provider 适配器（Anthropic / OpenAI）
-│   │   ├── keys/               # 密钥池管理（红绿灯轮询，状态纯内存）
+│   │   ├── keys/               # 密钥池管理（红绿灯轮询 + 指针持久化，状态纯内存）
 │   │   ├── models/             # 模型注册
 │   │   ├── middleware/         # 令牌桶限流
 │   │   ├── search/             # Bing 搜索（WebSearch 劫持用）
@@ -216,7 +219,7 @@ xrl-router/
 | 低配额 | 黄 | 402 / 429 / 5xx | 暂时跳过 |
 | 失效 | 红 | 401 | 永久跳过，需人工处理 |
 
-密钥可用性为纯内存状态（启动时全部为绿色），DB 不持久化运行时状态。状态变更通过 WebSocket 实时推送到前端。
+密钥可用性为纯内存状态（启动时全部为绿色），但**轮询指针持久化到 settings 表**——重启后从上次成功使用的 key 位置继续，而非每次都从 0 开始重试。DB 不持久化运行时健康状态。状态变更通过 WebSocket 实时推送到前端。
 
 ### Service Key
 
@@ -234,3 +237,4 @@ Provider API Key 使用 **AES-256-GCM** 加密后存储到数据库。主密钥�
 | Opus | 高性能 | Claude Opus 4.x, GPT-4o |
 | Sonnet | 均衡 | Claude Sonnet, GPT-4o-mini |
 | Haiku | 轻量快速 | Claude Haiku, GPT-4o-nano |
+

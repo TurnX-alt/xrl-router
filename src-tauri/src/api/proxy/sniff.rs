@@ -18,8 +18,12 @@ use std::task::{Context, Poll};
 /// Token usage accumulated while sniffing a passthrough SSE stream.
 #[derive(Debug, Clone, Default)]
 pub struct SniffedUsage {
+    /// 全部「新输入」token：未缓存输入 + 首次写缓存的输入。
+    /// 写缓存只是首次处理输入，本质属于输入，不单列。
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Anthropic prompt caching: tokens read from cache（命中复用，真正的「缓存」）。
+    pub cache_read_input_tokens: u64,
     /// Emitted text/thinking char count, used as a fallback (chars / 4) when
     /// the upstream reports no token counts.
     pub output_chars: u64,
@@ -75,13 +79,24 @@ where
         match self.provider_kind.as_str() {
             "anthropic" => match json["type"].as_str().unwrap_or("") {
                 "message_start" => {
-                    if let Some(it) = json["message"]["usage"]["input_tokens"].as_u64() {
-                        self.usage.input_tokens = it;
+                    let usage = &json["message"]["usage"];
+                    // input_tokens（未缓存）+ cache_creation（首次写缓存）= 全部新输入。
+                    // 写缓存只是首次处理输入，并入 input，不单列。
+                    let it = usage["input_tokens"].as_u64().unwrap_or(0);
+                    let cw = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                    self.usage.input_tokens = it + cw;
+                    if let Some(cr) = usage["cache_read_input_tokens"].as_u64() {
+                        self.usage.cache_read_input_tokens = cr;
                     }
                 }
                 "message_delta" => {
-                    if let Some(ot) = json["usage"]["output_tokens"].as_u64() {
+                    let usage = &json["usage"];
+                    if let Some(ot) = usage["output_tokens"].as_u64() {
                         self.usage.output_tokens = ot;
+                    }
+                    // cache_read 在 message_delta 给出（命中读取）
+                    if let Some(cr) = usage["cache_read_input_tokens"].as_u64() {
+                        self.usage.cache_read_input_tokens = cr;
                     }
                 }
                 "content_block_delta" => {

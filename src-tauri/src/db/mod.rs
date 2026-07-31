@@ -31,6 +31,19 @@ impl Database {
         })
     }
 
+    /// Open an in-memory database (for tests).
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
     /// Run all pending migrations.
     pub fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -108,9 +121,16 @@ impl Database {
     // Provider CRUD methods
     pub fn save_provider(&self, provider: &Provider) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // 注意：不能用 INSERT OR REPLACE —— REPLACE = DELETE + INSERT，
+        // DELETE 会触发 models/api_keys 的 ON DELETE CASCADE，把子表数据全清掉。
+        // UPSERT 只更新本行，不碰子表。
         conn.execute(
-            "INSERT OR REPLACE INTO providers (id, name, kind, base_url, api_path, config_json, enabled, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO providers (id, name, kind, base_url, api_path, config_json, enabled, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, kind=excluded.kind, base_url=excluded.base_url,
+                api_path=excluded.api_path, config_json=excluded.config_json,
+                enabled=excluded.enabled, updated_at=excluded.updated_at",
             rusqlite::params![
                 provider.id,
                 provider.name,
@@ -170,9 +190,17 @@ impl Database {
     // API Key CRUD methods
     pub fn save_api_key(&self, key: &ApiKey) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // UPSERT 而非 INSERT OR REPLACE：REPLACE 会触发 usage_log 的 FK 删除/报错，
+        // 且会丢失 total_requests/total_tokens 等统计字段。
         conn.execute(
-            "INSERT OR REPLACE INTO api_keys (id, provider_id, name, key_hash, key_masked, status, last_error, last_error_code, last_error_time, last_used_at, balance, balance_updated_at, total_requests, total_tokens, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO api_keys (id, provider_id, name, key_hash, key_masked, status, last_error, last_error_code, last_error_time, last_used_at, balance, balance_updated_at, total_requests, total_tokens, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(id) DO UPDATE SET
+                provider_id=excluded.provider_id, name=excluded.name, key_hash=excluded.key_hash,
+                key_masked=excluded.key_masked, status=excluded.status, last_error=excluded.last_error,
+                last_error_code=excluded.last_error_code, last_error_time=excluded.last_error_time,
+                last_used_at=excluded.last_used_at, balance=excluded.balance,
+                balance_updated_at=excluded.balance_updated_at, updated_at=excluded.updated_at",
             rusqlite::params![
                 key.id,
                 key.provider_id,
@@ -280,9 +308,13 @@ impl Database {
     pub fn save_service_key(&self, id: &str, name: &str, key_hash: &str, key_masked: &str) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().unwrap();
+        // UPSERT 而非 INSERT OR REPLACE：REPLACE 会触发 usage_log.service_key_id 的 FK 清理。
         conn.execute(
-            "INSERT OR REPLACE INTO service_keys (id, name, key_hash, key_masked, total_requests, total_tokens, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, ?6)",
+            "INSERT INTO service_keys (id, name, key_hash, key_masked, total_requests, total_tokens, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, key_hash=excluded.key_hash,
+                key_masked=excluded.key_masked, updated_at=excluded.updated_at",
             rusqlite::params![id, name, key_hash, key_masked, now, now],
         )?;
         Ok(())
@@ -355,9 +387,16 @@ impl Database {
     // Model CRUD methods
     pub fn save_model(&self, model: &Model) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // UPSERT 而非 INSERT OR REPLACE：REPLACE 会触发 usage_log 的 FK 删除/报错。
         conn.execute(
-            "INSERT OR REPLACE INTO models (id, provider_id, model_id, display_name, tier, context_window, max_output_tokens, cost_per_1k_input, cost_per_1k_output, capabilities, enabled, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO models (id, provider_id, model_id, display_name, tier, context_window, max_output_tokens, capabilities, enabled, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET
+                provider_id=excluded.provider_id, model_id=excluded.model_id,
+                display_name=excluded.display_name, tier=excluded.tier,
+                context_window=excluded.context_window, max_output_tokens=excluded.max_output_tokens,
+                capabilities=excluded.capabilities, enabled=excluded.enabled,
+                updated_at=excluded.updated_at",
             rusqlite::params![
                 model.id,
                 model.provider_id,
@@ -366,8 +405,6 @@ impl Database {
                 model.tier,
                 model.context_window,
                 model.max_output_tokens,
-                model.cost_per_1k_input,
-                model.cost_per_1k_output,
                 model.capabilities,
                 model.enabled,
                 model.created_at,
@@ -380,7 +417,7 @@ impl Database {
     pub fn get_model(&self, id: &str) -> anyhow::Result<Option<Model>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, provider_id, model_id, display_name, tier, context_window, max_output_tokens, cost_per_1k_input, cost_per_1k_output, capabilities, enabled, created_at, updated_at FROM models WHERE id = ?1"
+            "SELECT id, provider_id, model_id, display_name, tier, context_window, max_output_tokens, capabilities, enabled, created_at, updated_at FROM models WHERE id = ?1"
         )?;
 
         let model = stmt.query_row(rusqlite::params![id], |row| {
@@ -392,12 +429,10 @@ impl Database {
                 tier: row.get(4)?,
                 context_window: row.get(5)?,
                 max_output_tokens: row.get(6)?,
-                cost_per_1k_input: row.get(7)?,
-                cost_per_1k_output: row.get(8)?,
-                capabilities: row.get(9)?,
-                enabled: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
+                capabilities: row.get(7)?,
+                enabled: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         });
 
@@ -422,7 +457,7 @@ impl Database {
     pub fn list_all_models(&self) -> anyhow::Result<Vec<Model>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, provider_id, model_id, display_name, tier, context_window, max_output_tokens, cost_per_1k_input, cost_per_1k_output, capabilities, enabled, created_at, updated_at FROM models"
+            "SELECT id, provider_id, model_id, display_name, tier, context_window, max_output_tokens, capabilities, enabled, created_at, updated_at FROM models"
         )?;
 
         let models = stmt.query_map([], |row| {
@@ -434,12 +469,10 @@ impl Database {
                 tier: row.get(4)?,
                 context_window: row.get(5)?,
                 max_output_tokens: row.get(6)?,
-                cost_per_1k_input: row.get(7)?,
-                cost_per_1k_output: row.get(8)?,
-                capabilities: row.get(9)?,
-                enabled: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
+                capabilities: row.get(7)?,
+                enabled: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         })?;
 
@@ -451,13 +484,12 @@ impl Database {
     }
 
     // Statistics methods
-    pub fn get_stats(&self) -> anyhow::Result<(i64, i64, f64)> {
+    pub fn get_stats(&self) -> anyhow::Result<(i64, i64)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT
-                COALESCE(SUM(prompt_tokens), 0) as total_tokens,
-                COUNT(*) as total_requests,
-                COALESCE(SUM(cost_estimate), 0.0) as total_cost
+                COALESCE(SUM(prompt_tokens + completion_tokens + cache_read_input_tokens), 0) as total_tokens,
+                COUNT(*) as total_requests
              FROM usage_log"
         )?;
 
@@ -465,7 +497,6 @@ impl Database {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, f64>(2)?,
             ))
         })?;
 
@@ -478,8 +509,7 @@ impl Database {
             "SELECT
                 p.name as provider_name,
                 COUNT(*) as requests,
-                COALESCE(SUM(u.prompt_tokens), 0) as tokens,
-                COALESCE(SUM(u.cost_estimate), 0.0) as cost
+                COALESCE(SUM(u.prompt_tokens + u.completion_tokens + u.cache_read_input_tokens), 0) as tokens
              FROM usage_log u
              JOIN providers p ON u.provider_id = p.id
              GROUP BY p.id, p.name"
@@ -490,7 +520,6 @@ impl Database {
                 "provider_name": row.get::<_, String>(0)?,
                 "requests": row.get::<_, i64>(1)?,
                 "tokens": row.get::<_, i64>(2)?,
-                "cost": row.get::<_, f64>(3)?,
             }))
         })?;
 
@@ -540,11 +569,11 @@ impl Database {
         latency_ms: i64,
         success: bool,
         error_message: Option<&str>,
-        cost_estimate: Option<f64>,
+        cache_read_input_tokens: i64,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO usage_log (timestamp, provider_id, model_id, key_id, service_key_id, request_type, prompt_tokens, completion_tokens, latency_ms, success, error_message, cost_estimate)
+            "INSERT INTO usage_log (timestamp, provider_id, model_id, key_id, service_key_id, request_type, prompt_tokens, completion_tokens, latency_ms, success, error_message, cache_read_input_tokens)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 timestamp,
@@ -558,7 +587,7 @@ impl Database {
                 latency_ms,
                 success as i32,
                 error_message,
-                cost_estimate,
+                cache_read_input_tokens,
             ],
         )?;
         Ok(())
@@ -586,6 +615,7 @@ impl Database {
                 CAST((u.timestamp + ?4) / ?3 AS INTEGER) AS bucket,
                 SUM(u.prompt_tokens) AS prompt_tokens,
                 SUM(u.completion_tokens) AS completion_tokens,
+                SUM(u.cache_read_input_tokens) AS cache_read_tokens,
                 COUNT(*) AS requests
              FROM usage_log u
              LEFT JOIN service_keys s ON u.service_key_id = s.id
@@ -597,6 +627,7 @@ impl Database {
         let rows = stmt.query_map(rusqlite::params![from_ts, to_ts, bucket_seconds, tz_offset], |row| {
             let prompt: i64 = row.get(4)?;
             let completion: i64 = row.get(5)?;
+            let cache_read: i64 = row.get(6)?;
             let bucket: i64 = row.get(3)?;
             let key_id: String = row.get(0)?;
             let key_name: String = row.get(1)?;
@@ -619,8 +650,9 @@ impl Database {
                 "day": format!("{}{}", prefix, bucket),
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
-                "total_tokens": prompt + completion,
-                "requests": row.get::<_, i64>(6)?,
+                "cache_read_input_tokens": cache_read,
+                "total_tokens": prompt + completion + cache_read,
+                "requests": row.get::<_, i64>(7)?,
             }))
         })?;
 
@@ -629,5 +661,131 @@ impl Database {
             result.push(row?);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 全新数据库应能从 V1 一路迁移到最新版本；价格相关列在 V9 被移除，
+    /// usage_log 保留 cache token 列用于统计。
+    #[test]
+    fn test_full_migration_drops_cost_columns() {
+        let db = Database::open_in_memory().expect("open in-memory db");
+        db.migrate().expect("migrate from scratch");
+
+        let conn = db.conn();
+        // 价格相关列应全部被移除。
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(models)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            !cols.iter().any(|c| c.starts_with("cost_")),
+            "cost columns must be dropped: {:?}",
+            cols
+        );
+
+        // usage_log 应有 cache 列（V7），不应再有 cost_estimate（V9 移除）。
+        let ucols: Vec<String> = conn
+            .prepare("PRAGMA table_info(usage_log)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(ucols.contains(&"cache_read_input_tokens".to_string()));
+        assert!(!ucols.contains(&"cache_creation_input_tokens".to_string()));
+        assert!(!ucols.contains(&"cost_estimate".to_string()));
+    }
+
+    /// 回归测试：save_provider/save_api_key/save_model 必须用 UPSERT。
+    /// 若用 INSERT OR REPLACE，REPLACE 会触发子表的 ON DELETE CASCADE，
+    /// 更新 provider 时会把 models/api_keys 全部清空。
+    #[test]
+    fn test_save_does_not_cascade_delete_children() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+
+        let provider = Provider {
+            id: "p1".to_string(),
+            name: "P".to_string(),
+            kind: ProviderKind::Openai,
+            base_url: "https://example.com".to_string(),
+            api_path: "/v1/chat/completions".to_string(),
+            config: serde_json::json!({}),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        db.save_provider(&provider).unwrap();
+
+        // 插入一个 model + 一个 key
+        db.save_model(&Model {
+            id: "m1".to_string(),
+            provider_id: "p1".to_string(),
+            model_id: "gpt-x".to_string(),
+            display_name: "gpt-x".to_string(),
+            tier: "custom".to_string(),
+            context_window: 128000,
+            max_output_tokens: 4096,
+            capabilities: "[\"text\"]".to_string(),
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+        db.save_api_key(&ApiKey {
+            id: "k1".to_string(),
+            provider_id: "p1".to_string(),
+            name: "K".to_string(),
+            key_hash: "h".to_string(),
+            key_masked: "m".to_string(),
+            key_plain: None,
+            status: "green".to_string(),
+            last_error: None,
+            last_error_code: None,
+            last_error_time: None,
+            last_used_at: None,
+            balance: None,
+            balance_updated_at: None,
+            total_requests: 0,
+            total_tokens: 0,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+
+        // 更新 provider（模拟维护供应商保存）
+        let mut updated = provider.clone();
+        updated.name = "P2".to_string();
+        updated.updated_at = 2;
+        db.save_provider(&updated).unwrap();
+
+        // 子表必须完好
+        // 子表必须完好（conn 锁必须在块内释放，Mutex 不可重入）
+        let (models, keys): (i64, i64) = {
+            let conn = db.conn();
+            let models: i64 = conn
+                .query_row("SELECT COUNT(*) FROM models WHERE provider_id='p1'", [], |r| r.get(0))
+                .unwrap();
+            let keys: i64 = conn
+                .query_row("SELECT COUNT(*) FROM api_keys WHERE provider_id='p1'", [], |r| r.get(0))
+                .unwrap();
+            (models, keys)
+        };
+        assert_eq!(models, 1, "update must not cascade-delete models");
+        assert_eq!(keys, 1, "update must not cascade-delete api_keys");
+
+        // 更新 model 也不得触发 usage_log 问题（这里至少保证不丢行）
+        let mut mu = db.get_model("m1").unwrap().unwrap();
+        mu.display_name = "gpt-y".to_string();
+        db.save_model(&mu).unwrap();
+        let m2 = db.get_model("m1").unwrap().unwrap();
+        assert_eq!(m2.display_name, "gpt-y");
     }
 }

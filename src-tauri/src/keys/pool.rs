@@ -91,6 +91,28 @@ impl KeyPool {
         }
     }
 
+    /// Persist current rotation index for a provider
+    fn persist_index(&self, provider_id: &str, index: usize) {
+        if let Some(db) = self.database.read().unwrap().as_ref() {
+            let key = format!("keypool_index_{}", provider_id);
+            let _ = db.set_setting(&key, &index.to_string());
+        }
+    }
+
+    /// Load persisted rotation index for a provider, with bounds checking
+    fn load_persisted_index(&self, db: &Database, provider_id: &str, total_keys: usize) -> usize {
+        let key = format!("keypool_index_{}", provider_id);
+        match db.get_setting(&key) {
+            Ok(Some(val)) => {
+                match val.parse::<usize>() {
+                    Ok(idx) if idx < total_keys => idx,
+                    _ => 0,  // Invalid or out of bounds, reset to 0
+                }
+            }
+            _ => 0,  // Not found or error, start from 0
+        }
+    }
+
     /// Load keys from database for a provider
     pub fn load_keys_from_db(&self, provider_id: &str, db: &Database) -> std::result::Result<(), String> {
         let conn = db.conn();
@@ -126,20 +148,22 @@ impl KeyPool {
     /// Load all keys from database into memory, decrypting key_hash with master key.
     /// Called once at startup so the pool holds plaintext keys for upstream requests.
     pub fn load_all_keys_from_db(&self, db: &Database, master_key: &crypto::MasterKey) {
-        let conn = db.conn();
-        let mut stmt = match conn.prepare(
-            "SELECT id, provider_id, name, key_hash, status, last_error_time, total_requests, total_tokens
-             FROM api_keys",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Failed to load keys from db: {}", e);
-                return;
-            }
-        };
+        // 注意：conn 锁必须在块内释放（Mutex 不可重入），否则下方
+        // load_persisted_index → db.get_setting() 会对同一把锁二次加锁而死锁。
+        let rows: Vec<KeyEntry> = {
+            let conn = db.conn();
+            let mut stmt = match conn.prepare(
+                "SELECT id, provider_id, name, key_hash, status, last_error_time, total_requests, total_tokens
+                 FROM api_keys",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to load keys from db: {}", e);
+                    return;
+                }
+            };
 
-        let rows: Vec<KeyEntry> = stmt
-            .query_map([], |row| {
+            stmt.query_map([], |row| {
                 let cipher: String = row.get(3)?;
                 // Decrypt; on failure (e.g. legacy plaintext) fall back to raw value
                 // so old keys still work until rotated.
@@ -158,7 +182,8 @@ impl KeyPool {
             })
             .ok()
             .map(|iter| iter.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
+            .unwrap_or_default()
+        }; // conn 锁在此释放
 
         let mut grouped: HashMap<String, Vec<KeyEntry>> = HashMap::new();
         for k in rows {
@@ -171,9 +196,12 @@ impl KeyPool {
                 keys_map.insert(pid, ks);
             }
         }
+        // Restore rotation indices from persisted settings (falls back to 0).
         let mut index_map = self.current_index.write().unwrap();
         for pid in keys_map.keys() {
-            index_map.entry(pid.clone()).or_insert(0);
+            let total = keys_map.get(pid).map(|v| v.len()).unwrap_or(0);
+            let idx = self.load_persisted_index(db, pid, total);
+            index_map.insert(pid.clone(), idx);
         }
     }
 
@@ -216,7 +244,10 @@ impl KeyPool {
                 KeyStatus::Red => false,
             };
             if usable {
-                index_map.insert(provider_id.to_string(), (idx + 1) % total_keys);
+                let next = (idx + 1) % total_keys;
+                index_map.insert(provider_id.to_string(), next);
+                // 持久化指针：重启后从最近有效的 key 开始，而不是从 0 重试。
+                self.persist_index(provider_id, next);
                 return Ok(provider_keys[idx].clone());
             }
         }
@@ -373,6 +404,53 @@ impl KeyPool {
         let mut index_map = self.current_index.write().unwrap();
         index_map.remove(provider_id);
     }
+
+    /// 删除单个 key（运行时同步内存 + 修正指针）。
+    /// 删除后如果指针越界（指向了被删的位置），自动回退到 0 重新开始轮询。
+    /// 返回 true 表示 key 存在并被移除；false 表示未找到（可能已在内存外）。
+    pub fn remove_key(&self, provider_id: &str, key_id: &str) -> bool {
+        let mut removed = false;
+        {
+            let mut keys_map = self.keys.write().unwrap();
+            if let Some(provider_keys) = keys_map.get_mut(provider_id) {
+                let before = provider_keys.len();
+                provider_keys.retain(|k| k.id != key_id);
+                removed = provider_keys.len() < before;
+            }
+        }
+        if removed {
+            self.fix_index_after_change(provider_id);
+        }
+        removed
+    }
+
+    /// 密钥池变动后修正轮询指针：
+    /// - 指针越界（key 减少导致）→ 回退到 0
+    /// - 持久化的指针同样修正（避免重启后读到越界值）
+    /// 注意锁顺序：先读 keys（释放）再写 index，避免与 get_next_key 的
+    /// keys(write) → index(write) 顺序形成死锁。
+    fn fix_index_after_change(&self, provider_id: &str) {
+        let total = self
+            .keys
+            .read()
+            .unwrap()
+            .get(provider_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let mut index_map = self.current_index.write().unwrap();
+        let current = index_map.get(provider_id).copied().unwrap_or(0);
+        let fixed = if total == 0 || current >= total { 0 } else { current };
+        index_map.insert(provider_id.to_string(), fixed);
+        drop(index_map);
+        self.persist_index(provider_id, fixed);
+    }
+
+    /// 测试专用：直接设置某个 provider 的轮转指针（模拟启动恢复后的状态）。
+    #[cfg(test)]
+    pub fn set_pool_index_for_test(&self, provider_id: &str, index: usize) {
+        let mut index_map = self.current_index.write().unwrap();
+        index_map.insert(provider_id.to_string(), index);
+    }
 }
 
 /// Key pool statistics
@@ -430,6 +508,136 @@ mod tests {
         // Should wrap around
         let k4 = pool.get_next_key("test_provider").unwrap();
         assert_eq!(k4.id, "key1");
+    }
+
+    #[test]
+    fn test_index_persistence_roundtrip() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let pool = KeyPool::new();
+        pool.set_database(db.clone());
+
+        // 指针推进后应持久化到 settings 表
+        pool.persist_index("p1", 2);
+        let saved = db.get_setting("keypool_index_p1").unwrap().unwrap();
+        assert_eq!(saved, "2");
+
+        // 模拟重启：有效值应恢复
+        let idx = pool.load_persisted_index(&db, "p1", 5);
+        assert_eq!(idx, 2);
+
+        // 越界（key 数减少）应回退到 0，而不是 panic
+        let idx = pool.load_persisted_index(&db, "p1", 2);
+        assert_eq!(idx, 0);
+
+        // 无效值（非数字）应回退到 0
+        db.set_setting("keypool_index_p1", "abc").unwrap();
+        let idx = pool.load_persisted_index(&db, "p1", 5);
+        assert_eq!(idx, 0);
+
+        // 不存在的 provider 应回退到 0
+        let idx = pool.load_persisted_index(&db, "p2", 5);
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_resume_from_persisted_index_not_restart() {
+        // 8 个 key，指针持久化为 6（最后用了 key[5]）。
+        // 重启后必须从 6 开始，而不是从头（0）试——即使 key[5] 已失效。
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.set_setting("keypool_index_p", "6").unwrap();
+
+        let pool = KeyPool::new();
+        pool.set_database(db.clone());
+        let keys: Vec<KeyEntry> = (0..8)
+            .map(|i| create_test_key(&format!("key{}", i), KeyStatus::Green))
+            .collect();
+        pool.add_provider_keys("p", keys);
+
+        // 模拟启动：手动恢复持久化指针（load_all_keys_from_db 的逻辑）
+        let idx = pool.load_persisted_index(&db, "p", 8);
+        pool.set_pool_index_for_test("p", idx);
+
+        // key[5] 失效
+        pool.mark_key_invalid("p", "hash_key5").unwrap();
+
+        // 应从 6 开始，而非 0/1
+        let k = pool.get_next_key("p").unwrap();
+        assert_eq!(k.id, "key6", "must resume at key after last used (5), not restart from 0");
+
+        let k = pool.get_next_key("p").unwrap();
+        assert_eq!(k.id, "key7");
+
+        let k = pool.get_next_key("p").unwrap();
+        assert_eq!(k.id, "key0", "wraps around to 0 only after 6,7");
+    }
+
+    #[test]
+    fn test_remove_key_fixes_out_of_bounds_index() {
+        // 场景：指针持久化为 6（最后用了 key[5]），运行中删除了 key[6]。
+        // 指针仍指向 6，但此时 key 数已从 8 减到 7 → 必须自动回退到 0。
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let pool = KeyPool::new();
+        pool.set_database(db.clone());
+
+        let keys: Vec<KeyEntry> = (0..8)
+            .map(|i| create_test_key(&format!("key{}", i), KeyStatus::Green))
+            .collect();
+        pool.add_provider_keys("p", keys);
+        pool.set_pool_index_for_test("p", 6); // 模拟指针=6（最后用了 key[5]）
+
+        // 删除 key[6]（指针指向的位置）
+        assert!(pool.remove_key("p", "key6"));
+
+        // 指针应已修正（6 >= 7？不对——删掉后 total=7，指针 6 < 7 仍有效，
+        // 但 key[6] 没了，实际应指向下一个可用的，即回退检查后仍是 6，
+        // 而 get_next_key 的 % total 会让它从 6 开始 = key0）。
+        // 关键断言：get_next_key 不 panic、不返回已删的 key。
+        for _ in 0..7 {
+            let k = pool.get_next_key("p").unwrap();
+            assert_ne!(k.id, "key6", "deleted key must never be returned");
+        }
+    }
+
+    #[test]
+    fn test_remove_key_resets_index_when_out_of_bounds() {
+        // 场景：只有 3 个 key，指针=2（最后用了 key[1]），删除 key[2] 后 total=2，
+        // 指针 2 >= 2 → 必须回退到 0。
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let pool = KeyPool::new();
+        pool.set_database(db.clone());
+
+        let keys: Vec<KeyEntry> = (0..3)
+            .map(|i| create_test_key(&format!("key{}", i), KeyStatus::Green))
+            .collect();
+        pool.add_provider_keys("p", keys);
+        pool.set_pool_index_for_test("p", 2);
+
+        assert!(pool.remove_key("p", "key2"));
+        // 指针应已修正为 0（2 >= 2 越界）
+        let k = pool.get_next_key("p").unwrap();
+        assert_eq!(k.id, "key0", "index must reset to 0 when out of bounds");
+    }
+
+    #[test]
+    fn test_remove_provider_clears_index() {
+        let pool = KeyPool::new();
+        let keys = vec![
+            create_test_key("key1", KeyStatus::Green),
+            create_test_key("key2", KeyStatus::Green),
+        ];
+        pool.add_provider_keys("p", keys);
+        pool.set_pool_index_for_test("p", 1);
+
+        pool.remove_provider("p");
+        // 移除后 get_next_key 应返回 KeyNotFound（而非残留内存）
+        assert!(matches!(
+            pool.get_next_key("p"),
+            Err(KeyPoolError::KeyNotFound(_))
+        ));
     }
 
     #[test]

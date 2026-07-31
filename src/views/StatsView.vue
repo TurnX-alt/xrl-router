@@ -33,7 +33,7 @@ import { wsClient } from '../ws';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
-interface StatRow { key_id: string; key_label?: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; requests: number; day: string; }
+interface StatRow { key_id: string; key_label?: string; prompt_tokens: number; completion_tokens: number; cache_read_input_tokens?: number; total_tokens: number; requests: number; day: string; }
 const data = ref<StatRow[]>([]);
 const rangeFrom = ref(0);
 const rangeTo = ref(0);
@@ -130,7 +130,15 @@ const chartOptions = computed(() => ({
           if (dayData.length === 0) return [];
           const lines: string[] = ['Token分布:'];
           for (const d of dayData) {
-            lines.push(`  合计: ${(d.total_tokens / 10000).toFixed(1)}万 (输入 ${(d.prompt_tokens / 10000).toFixed(1)}万 + 输出 ${(d.completion_tokens / 10000).toFixed(1)}万)`);
+            const cacheR = (d.cache_read_input_tokens || 0) / 10000;
+            const input = (d.prompt_tokens / 10000).toFixed(1);
+            const output = (d.completion_tokens / 10000).toFixed(1);
+            let line = `  合计: ${(d.total_tokens / 10000).toFixed(1)}万 (输入 ${input}万 + 输出 ${output}万`;
+            if (cacheR > 0.05) {
+              line += ` | 缓存读 ${cacheR.toFixed(1)}万`;
+            }
+            line += ')';
+            lines.push(line);
           }
           return lines;
         }

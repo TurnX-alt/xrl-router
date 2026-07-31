@@ -89,27 +89,8 @@ pub struct Model {
     pub tier: String,
     pub context_window: i64,
     pub max_output_tokens: i64,
-    pub cost_per_1k_input: f64,
-    pub cost_per_1k_output: f64,
     pub capabilities: String,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-/// Usage statistics
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UsageStats {
-    pub total_requests: i64,
-    pub total_tokens: i64,
-    pub total_cost: f64,
-}
-
-/// Provider-specific usage statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderStats {
-    pub provider_name: String,
-    pub requests: i64,
-    pub tokens: i64,
-    pub cost: f64,
 }

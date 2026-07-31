@@ -1,4 +1,4 @@
-name: build
+name: auto-release
 
 # Builds macOS arm64 (.dmg) and Windows amd64 (.msi) installers on every push
 # to main, and on manual dispatch. After all platform builds complete,
@@ -10,6 +10,8 @@ on:
   workflow_dispatch:
 
 env:
+  # Project display name — change this ONE value to reuse the workflow.
+  PROJECT_NAME: XRL Router
   # Safety net: force any remaining Node 20 actions (e.g. rust-cache,
   # rust-toolchain) onto the Node 24 runtime.  All actions/* are already
   # on Node-24-native major versions.
@@ -76,7 +78,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: XRL Router-${{ matrix.label }}
+          name: ${{ env.PROJECT_NAME }}-${{ matrix.label }}
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
@@ -114,7 +116,7 @@ jobs:
 
           VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
           TAG="${VER}"
-          TITLE="XRL Router v${VER}"
+          TITLE="${{ env.PROJECT_NAME }} v${VER}"
           # Use the triggering commit's message as the release body.
           BODY="$(git log -1 --pretty=%B)"
 
@@ -131,8 +133,8 @@ jobs:
           # Collect files into an array so paths with spaces survive word-splitting.
           shopt -s globstar
           FILES=(
-            "artifacts/XRL Router-macos-arm64"/**/*.dmg
-            "artifacts/XRL Router-windows-amd64"/**/*.msi
+            "artifacts/${{ env.PROJECT_NAME }}-macos-arm64"/**/*.dmg
+            "artifacts/${{ env.PROJECT_NAME }}-windows-amd64"/**/*.msi
           )
 
           gh release create "${TAG}" \
