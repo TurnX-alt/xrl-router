@@ -3,6 +3,7 @@ use crate::db::Database;
 use crate::keys::KeyPool;
 use crate::middleware::RateLimiter;
 use crate::models::ModelRegistry;
+use crate::plugin::PluginManager;
 use crate::providers::ProviderRegistry;
 use anyhow::Result;
 use axum::http::HeaderValue;
@@ -23,6 +24,8 @@ pub struct AppState {
     pub key_stats_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// WebSearch 劫持开关（运行时可改、无锁读）。
     pub websearch_hijack: Arc<std::sync::atomic::AtomicBool>,
+    /// Plugin manager: tracks connected plugins and their delegated providers.
+    pub plugins: PluginManager,
 }
 
 impl AppState {
@@ -49,6 +52,8 @@ impl AppState {
                 .unwrap_or(false),
         ));
 
+        let plugins = PluginManager::new(database.clone(), providers.providers_map());
+
         Self {
             config,
             database,
@@ -59,6 +64,7 @@ impl AppState {
             master_key,
             key_stats_tx,
             websearch_hijack,
+            plugins,
         }
     }
 }
@@ -86,6 +92,18 @@ pub async fn start_gateway(state: Arc<AppState>) -> Result<()> {
                     "type": "usage_stats_changed",
                     "timestamp": chrono::Utc::now().timestamp(),
                 }));
+            }
+        });
+    }
+
+    // Spawn plugin heartbeat checker: every 30s, disconnect stale plugins (>90s no heartbeat).
+    {
+        let plugins = state.plugins.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                plugins.check_heartbeats(90);
             }
         });
     }

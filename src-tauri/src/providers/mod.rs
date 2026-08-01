@@ -7,21 +7,28 @@ use crate::types::{Provider, ProviderKind};
 use anyhow::Result;
 use dashmap::DashMap;
 use rusqlite::params;
+use std::sync::Arc;
 use tracing::info;
 
 /// Provider registry with in-memory cache backed by database.
 #[derive(Clone)]
 pub struct ProviderRegistry {
     database: Database,
-    providers: DashMap<String, Provider>,
+    providers: Arc<DashMap<String, Provider>>,
 }
 
 impl ProviderRegistry {
     pub fn new(database: Database) -> Self {
         Self {
             database,
-            providers: DashMap::new(),
+            providers: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Expose the underlying DashMap (shared Arc) for PluginManager
+    /// to sync in-memory provider state (register/confirm/disconnect).
+    pub fn providers_map(&self) -> Arc<DashMap<String, Provider>> {
+        self.providers.clone()
     }
 
     /// Load all providers from database into memory cache.

@@ -21,6 +21,7 @@ mod api;
 mod keys;
 mod middleware;
 mod models;
+mod plugin;
 mod protocol;
 mod providers;
 mod search;
@@ -41,7 +42,7 @@ pub fn run() {
 
     // Load configuration (env vars only — actual paths resolved in setup())
     let config = Config::from_env();
-    info!("xrl-router v0.2.0 starting...");
+    info!("xrl-router starting...");
     info!("Server port: {}", config.port);
 
     tauri::Builder::default()
@@ -83,6 +84,9 @@ pub fn run() {
 
             // Create shared application state with all registries
             let app_state = Arc::new(AppState::new(config.clone(), database.clone(), master_key));
+
+            // Pass Tauri AppHandle to PluginManager so it can emit events to frontend
+            app_state.plugins.set_app_handle(app.handle().clone());
 
             // System tray: keep the gateway alive when the window is closed.
             let show_item =

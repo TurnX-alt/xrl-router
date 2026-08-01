@@ -22,6 +22,7 @@
 | **Argon2 哈希** | Service Key 使用 Argon2 哈希存储，防彩虹表 |
 | **WebSearch 劫持** | 可选的本地 Bing 搜索劫持，当请求包含 `web_search` tool 时自动拦截 |
 | **WebSocket 实时推送** | 密钥状态变更和用量统计变更通过 WebSocket 实时推送到前端 |
+| **插件系统** | 外部服务可通过 WebSocket 注册为"委托供应商"，将非标 API 桥接为标准 OpenAI 接口 |
 | **系统托盘** | 关闭窗口时最小化到托盘继续运行，网关服务不中断 |
 | **Dashboard API** | 概览和用量统计端点，支持时间粒度和时区偏移 |
 | **桌面应用** | Tauri 2 封装，MD3 风格管理面板，开箱即用 |
@@ -124,8 +125,71 @@ Claude Code (Anthropic Messages API 客户端)
 |------|---------|------|
 | **Anthropic** | 直接透传 | 零转换，含流式 SSE |
 | **OpenAI** | Anthropic ↔ OpenAI 转换 | 支持 text、tools、thinking、tool_choice 等 |
+| **插件 (委托供应商)** | 插件将非标 API 桥接为标准 API | 插件负责协议转换 + 业务头注入，Router 只管密钥轮换 |
 
 > 仅支持流式响应（`stream: true`）。Claude Code 等主流客户端始终使用流式，非流式无实际场景。
+
+### 插件系统 (Plugin System)
+
+xrl-router 支持通过 WebSocket 注册外部服务作为**委托供应商 (Delegated Provider)**。插件的职责是**将非标 API 转化为标准 API**（如 OpenAI Chat Completions 或 Anthropic Messages），Router 负责密钥轮换、健康监控和用量统计。
+
+**架构**：
+
+```
+xrl-router (Router)                    xrl-router-plugin-wukong (Plugin)
+    │                                        │
+    │  WS /ws/plugin                         │
+    │◀═══════════════════════════════════════│  注册 + 心跳 + 密钥同步
+    │                                        │
+    │  POST /v1/chat/completions             │
+    │  Authorization: Bearer <deap_key>      │
+    │═══════════════════════════════════════▶│  Router 带密钥发请求
+    │                                        │
+    │                                        │  注入 DEAP 业务头
+    │                                        │  透传密钥
+    │                                        │  POST https://api-deap.dingtalk.com/...
+    │  ◀═════════════════════════════════════│  返回结果
+    │                                        │
+```
+
+**关键设计**：
+
+| 职责 | Router | Plugin |
+|------|--------|--------|
+| 密钥池管理 | ✅ 轮询 + 红绿灯 + 持久化 | ❌ 不管密钥 |
+| 协议转换 | ✅ Anthropic ↔ OpenAI | ✅ 非标 → 标准 (OpenAI/Anthropic) |
+| 业务头注入 | ❌ | ✅ 注入上游 API 所需的业务头 |
+| 健康监控 | ✅ 基于请求响应 | ❌ |
+| 用量统计 | ✅ usage_log | ❌ |
+
+**插件注册流程**：
+
+1. 插件启动 → WS 连接 `ws://localhost:19068/ws/plugin`
+2. 发送 `register` 消息（plugin_id, provider 配置, 模型列表, 密钥列表）
+3. Router 弹出对话框 → 用户确认 → 创建委托供应商（`enabled=true`）
+4. 插件定期检测密钥变化 → 通过 `keys_update` 同步到 Router
+5. 插件每 30s 发送心跳 → 超时 90s 未收到则标记离线（`enabled=false`）
+6. 用户「忽略」插件 → 彻底删除插件 + 关联 provider + 模型 → WS 断开 → 插件重连后重新注册
+
+**委托供应商 vs 普通供应商**：
+
+| 维度 | 普通供应商 | 委托供应商（插件） |
+|------|-----------|------------------|
+| API 格式 | 用户选择 (OpenAI/Anthropic) | 插件提供（可转为 OpenAI 或 Anthropic） |
+| Base URL | 用户填写 | 插件通过 WS 推送 |
+| API Key | 用户手动填入 | 插件自动同步 |
+| 密钥轮换 | Router KeyPool | Router KeyPool（完全一致） |
+| 连接状态 | N/A | 必须 WS 在线才能消费 |
+
+**插件 API 端点**：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/ws/plugin` | WebSocket 插件注册端点 |
+| `GET` | `/api/plugins` | 列出已注册插件 |
+| `GET` | `/api/plugins/:id` | 获取插件详情（供 ProviderNewView 预填） |
+| `POST` | `/api/plugins/:id/confirm` | 确认激活插件供应商 |
+| `DELETE` | `/api/plugins/:id` | 删除插件（彻底清理 provider + 模型） |
 
 ## API 端点
 
