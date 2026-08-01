@@ -254,4 +254,11 @@ CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_log(provider_id);
 CREATE INDEX IF NOT EXISTS idx_usage_service_key ON usage_log(service_key_id);
 "#,
+    // V13: providers.sort_order — 供应商手动排序（拖拽）。数值越小优先级越高；
+    // 模型撞名时 resolve_route 优先取 sort_order 更小的供应商。历史行默认 0，
+    // 新创建行由 handler 分配 max+1。CREATE TABLE IF NOT EXISTS 不会补列，
+    // 必须用 ALTER TABLE。
+    r#"
+ALTER TABLE providers ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+"#,
 ];

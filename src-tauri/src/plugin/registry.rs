@@ -81,6 +81,7 @@ impl super::PluginManager {
             enabled: false, // disabled until user confirms in dialog
             created_at: now,
             updated_at: now,
+            sort_order: 0, // 插件注册的供应商默认排最前（V13 前无此列，历史行也是 0）
         };
         self.database.save_provider(&provider)?;
         // 同步内存 registry（register 时 ProviderRegistry 尚未加载，需手动插入）

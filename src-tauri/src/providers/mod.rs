@@ -35,8 +35,8 @@ impl ProviderRegistry {
     pub fn load_from_db(&self) -> Result<()> {
         let conn = self.database.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, base_url, api_path, enabled, config_json, created_at, updated_at
-             FROM providers ORDER BY created_at"
+            "SELECT id, name, kind, base_url, api_path, enabled, config_json, created_at, updated_at, sort_order
+             FROM providers ORDER BY sort_order, created_at"
         )?;
 
         let providers: Vec<Provider> = stmt
@@ -50,6 +50,7 @@ impl ProviderRegistry {
                 let config_json: String = row.get(6)?;
                 let created_at: i64 = row.get(7)?;
                 let updated_at: i64 = row.get(8)?;
+                let sort_order: i64 = row.get(9)?;
 
                 let kind = match kind_str.as_str() {
                     "openai" => ProviderKind::Openai,
@@ -70,6 +71,7 @@ impl ProviderRegistry {
                     config,
                     created_at,
                     updated_at,
+                    sort_order,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -83,13 +85,16 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Get all enabled providers.
+    /// Get all enabled providers, ordered by sort_order (drag priority).
     pub fn get_enabled(&self) -> Vec<Provider> {
-        self.providers
+        let mut all: Vec<Provider> = self
+            .providers
             .iter()
             .filter(|p| p.value().enabled)
             .map(|p| p.value().clone())
-            .collect()
+            .collect();
+        all.sort_by_key(|p| p.sort_order);
+        all
     }
 
     /// Find a provider by ID.
@@ -102,8 +107,8 @@ impl ProviderRegistry {
         let conn = self.database.conn();
         let config_json = serde_json::to_string(&provider.config)?;
         conn.execute(
-            "INSERT INTO providers (id, name, kind, base_url, api_path, enabled, config_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO providers (id, name, kind, base_url, api_path, enabled, config_json, created_at, updated_at, sort_order)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 provider.id,
                 provider.name,
@@ -114,6 +119,7 @@ impl ProviderRegistry {
                 config_json,
                 provider.created_at,
                 provider.updated_at,
+                provider.sort_order,
             ],
         )?;
         self.providers.insert(provider.id.clone(), provider.clone());
@@ -130,6 +136,18 @@ impl ProviderRegistry {
         Ok(())
     }
 
+    /// 批量重排（拖拽保存）：内存与 DB 同步写入 0..n 的 sort_order。
+    pub fn reorder(&self, ids: &[String]) -> Result<()> {
+        self.database.reorder_providers(ids)?;
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(mut p) = self.providers.get_mut(id) {
+                p.sort_order = i as i64;
+                p.updated_at = chrono::Utc::now().timestamp();
+            }
+        }
+        Ok(())
+    }
+
     /// Get provider count.
     pub fn len(&self) -> usize {
         self.providers.len()
@@ -140,9 +158,12 @@ impl ProviderRegistry {
         self.providers.is_empty()
     }
 
-    /// Get all providers (not just enabled).
+    /// Get all providers (not just enabled), ordered by sort_order (drag priority).
+    /// DashMap 迭代无序，必须显式排序，否则拖拽后的顺序无法在列表/路由中体现。
     pub fn list_all(&self) -> Vec<Provider> {
-        self.providers.iter().map(|p| p.value().clone()).collect()
+        let mut all: Vec<Provider> = self.providers.iter().map(|p| p.value().clone()).collect();
+        all.sort_by_key(|p| p.sort_order);
+        all
     }
 
     /// Get a provider by ID.

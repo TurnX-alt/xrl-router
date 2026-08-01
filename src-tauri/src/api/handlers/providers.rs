@@ -29,6 +29,17 @@ pub(crate) async fn create_provider(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateProviderRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // 新供应商排在队尾：取当前最大 sort_order + 1，历史数据（V13 前全为 0）
+    // 不会挤到已拖拽排序的供应商前面。
+    let sort_order = match state.database.next_sort_order() {
+        Ok(v) => v,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ))
+        }
+    };
     let provider = Provider {
         id: uuid::Uuid::new_v4().to_string(),
         name: req.name,
@@ -39,6 +50,7 @@ pub(crate) async fn create_provider(
         enabled: true,
         created_at: Utc::now().timestamp(),
         updated_at: Utc::now().timestamp(),
+        sort_order,
     };
 
     state.providers.insert(provider.clone());
@@ -147,4 +159,46 @@ pub(crate) async fn delete_provider(
     }
 
     Ok(Json(serde_json::json!({"status": "deleted"})))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ReorderProvidersRequest {
+    ids: Vec<String>,
+}
+
+/// PUT /api/providers/reorder — 拖拽后的全量顺序（靠前的供应商优先级更高）。
+pub(crate) async fn reorder_providers(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ReorderProvidersRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if req.ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "ids must not be empty"})),
+        ));
+    }
+    // 校验：传入 id 必须都存在，且无重复，避免把不存在的行写进 sort_order。
+    let mut seen = std::collections::HashSet::new();
+    for id in &req.ids {
+        if !seen.insert(id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("duplicate id: {}", id)})),
+            ));
+        }
+        if !state.providers.contains(id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("unknown provider id: {}", id)})),
+            ));
+        }
+    }
+
+    if let Err(e) = state.providers.reorder(&req.ids) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
+    }
+    Ok(Json(serde_json::json!({"status": "ok"})))
 }

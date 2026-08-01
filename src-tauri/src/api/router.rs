@@ -36,6 +36,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/providers/:id",
             get(handlers::get_provider).put(handlers::update_provider).delete(handlers::delete_provider),
         )
+        // 供应商拖拽排序（顺序即优先级，撞名时靠前的优先）
+        .route("/api/providers/reorder", put(handlers::reorder_providers))
         // API Key management
         .route("/api/keys", get(handlers::list_keys).post(handlers::create_key))
         .route(

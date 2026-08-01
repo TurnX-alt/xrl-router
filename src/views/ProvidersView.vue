@@ -17,12 +17,15 @@
       <p class="md-typescale-body-large">空空如也</p>
     </div>
 
-    <div v-else class="card-grid">
-      <article
+    <div v-else>
+      <div class="card-grid" ref="gridEl">
+        <article
         v-for="p in providers"
         :key="p.id"
         class="card"
+        :data-id="p.id"
       >
+        <span class="card__drag mdi mdi-drag-horizontal-variant" title="拖动排序"></span>
         <span class="card__avatar mdi" :class="p.kind === 'anthropic' ? 'avatar--anthropic' : 'avatar--openai'">
             <!-- Official Anthropic logo from simple-icons -->
             <svg v-if="p.kind === 'anthropic'" viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
@@ -57,6 +60,7 @@
           </md-icon-button>
         </div>
       </article>
+      </div>
     </div>
 
     <!-- Shared action menu (single instance, re-anchors per card) -->
@@ -88,15 +92,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
+import Sortable from 'sortablejs';
 import { providersApi, keysApi, type Provider } from '../api';
 import { wsClient } from '../ws';
+import { useProviderStore } from '../stores/providers';
 
 const router = useRouter();
+const providerStore = useProviderStore();
 
 const providers = ref<Provider[]>([]);
 const loading = ref(true);
+const gridEl = ref<HTMLElement | null>(null);
+let sortable: Sortable | null = null;
 const deleteOpen = ref(false);
 const deleteTarget = ref<Provider | null>(null);
 const menuOpen = ref<string | null>(null);
@@ -176,7 +185,52 @@ async function confirmDelete() {
 
 async function fetchProviders() {
   loading.value = true;
-  try { providers.value = await providersApi.list(); } finally { loading.value = false; }
+  try {
+    providers.value = await providersApi.list();
+  } finally {
+    loading.value = false;
+  }
+  // 必须等 loading=false 触发 v-else 分支渲染后，gridEl 才有值，才能初始化 Sortable。
+  await initSortable();
+}
+
+// 拖拽排序：Sortable 仅操作 DOM，onEnd 时把 DOM 顺序同步进 store 并持久化。
+// 必须先 nextTick 等 v-else 分支渲染完成，gridEl 才有值；再检查 sortable 防重复初始化。
+async function initSortable() {
+  await nextTick();
+  if (!gridEl.value) return;
+  if (sortable) return;
+  const opts: any = {
+    animation: 150,
+    handle: '.card__drag',
+    // Tauri WebView(WebKit) 坑位三连：
+    // 1. 原生 HTML5 dnd 不可靠 → forceFallback 用鼠标事件模拟；
+    // 2. WebKit 的 PointerEvent 合成有缺陷（mousedown 生效但 move 被吞）→ 强制 mouse 事件；
+    // 3. ghost 挂容器内可能被 overflow 裁剪 → fallbackOnBody 挂 body。
+    forceFallback: true,
+    supportPointer: false,
+    fallbackOnBody: true,
+    ghostClass: 'card--ghost',
+    chosenClass: 'card--chosen',
+    dragClass: 'card--dragging',
+    onEnd: async (evt: { oldIndex: number | null; newIndex: number | null }) => {
+      const { oldIndex, newIndex } = evt;
+      if (oldIndex == null || newIndex == null || oldIndex === newIndex) return;
+      // 按 Sortable 索引原地移动数组，保持 DOM 与 store 顺序一致
+      const arr = [...providers.value];
+      const [moved] = arr.splice(oldIndex, 1);
+      arr.splice(newIndex, 0, moved);
+      providers.value = arr;
+      const ids = arr.map((p) => p.id);
+      try {
+        await providerStore.reorderProviders(ids);
+      } catch {
+        // 保存失败：store 已回滚到服务端顺序，重拉一遍保证视图一致
+        await providerStore.fetchProviders();
+      }
+    },
+  };
+  sortable = new Sortable(gridEl.value, opts);
 }
 
 onMounted(() => {
@@ -188,6 +242,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   wsClient.off('key_stats', onKeyStats);
+  sortable?.destroy();
 });
 </script>
 
@@ -199,9 +254,20 @@ onUnmounted(() => {
 .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
 .card {
   background: var(--md-sys-color-surface-container-low); border-radius: var(--md-sys-shape-corner-medium);
-  padding: 20px; display: grid; grid-template-columns: 44px 1fr auto; gap: 12px; align-items: start;
+  padding: 20px; display: grid; grid-template-columns: 24px 44px 1fr auto; gap: 12px; align-items: start;
   cursor: default;
 }
+.card__drag {
+  display: flex; align-items: center; justify-content: center;
+  color: var(--md-sys-color-on-surface-variant);
+  cursor: grab; font-size: 20px; line-height: 1;
+  padding-top: 12px;
+  touch-action: none;
+}
+.card__drag:active { cursor: grabbing; }
+.card--ghost { opacity: 0.35; outline: 2px dashed var(--md-sys-color-primary); outline-offset: -2px; }
+.card--chosen { background: var(--md-sys-color-surface-container-high); }
+.card--dragging { opacity: 0.8; transform: scale(1.02); }
 .card__avatar { width: 44px; height: 44px; border-radius: var(--md-sys-shape-corner-full); display: flex; align-items: center; justify-content: center; }
 .card__avatar svg { width: 22px; height: 22px; }
 .avatar--openai { background: var(--md-sys-color-openai-brand); color: #fff; }

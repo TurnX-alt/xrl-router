@@ -186,6 +186,7 @@ mod tests {
             enabled: true,
             created_at: 1,
             updated_at: 1,
+            sort_order: 0,
         };
         db.save_provider(&provider).unwrap();
 
