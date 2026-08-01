@@ -50,6 +50,19 @@ export const useProviderStore = defineStore('providers', () => {
     providers.value = providers.value.filter((p) => p.id !== id);
   }
 
+  // 拖拽排序：重新赋值数组（保持响应式），并持久化新顺序
+  async function reorderProviders(ids: string[]) {
+    const map = new Map(providers.value.map((p) => [p.id, p]));
+    providers.value = ids.map((id) => map.get(id)).filter((p): p is Provider => !!p);
+    try {
+      await providersApi.reorder(ids);
+    } catch (e: any) {
+      // 保存失败时回滚到服务端顺序
+      await fetchProviders();
+      throw e;
+    }
+  }
+
   return {
     providers,
     loading,
@@ -60,5 +73,6 @@ export const useProviderStore = defineStore('providers', () => {
     createProvider,
     updateProvider,
     deleteProvider,
+    reorderProviders,
   };
 });

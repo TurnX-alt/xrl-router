@@ -28,6 +28,8 @@ pub struct Provider {
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 手动排序权重：数值越小优先级越高（拖拽排序），撞名时优先。
+    pub sort_order: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

@@ -70,6 +70,7 @@ export const providersApi = {
   create: (data: Partial<Provider>) => request<Provider>('/api/providers', { method: 'POST', body: data }),
   update: (id: string, data: Partial<Provider>) => request<Provider>(`/api/providers/${id}`, { method: 'PUT', body: data }),
   delete: (id: string) => request<{ status: string }>(`/api/providers/${id}`, { method: 'DELETE' }),
+  reorder: (ids: string[]) => request<{ status: string }>('/api/providers/reorder', { method: 'PUT', body: { ids } }),
 };
 
 // --- Service Keys ---

@@ -43,6 +43,7 @@ pub(super) async fn resolve_route(state: &AppState, model_name: &str) -> Option<
              WHERE m.display_name = ?1
                AND m.enabled = 1
                AND p.enabled = 1
+             ORDER BY p.sort_order ASC, p.created_at ASC
              LIMIT 1",
         )
         .ok()?;
