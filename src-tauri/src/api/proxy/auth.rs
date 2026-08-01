@@ -1,0 +1,45 @@
+//! Service key 认证：查 service_keys 表 + argon2 校验（哈希函数见 `crypto`）。
+
+use crate::gateway::server::AppState;
+
+/// 已通过认证的 service key 快照（含 allowed_models 白名单）。
+pub(super) struct ServiceKeyInfo {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) key_masked: String,
+    pub(super) allowed_models: Vec<String>,
+}
+
+/// Verify a service key against the service_keys table (argon2 hash).
+/// Returns the service_key info on success, None on failure.
+pub(super) async fn verify_service_key(state: &AppState, api_key: &str) -> Option<ServiceKeyInfo> {
+    if api_key.is_empty() {
+        return None;
+    }
+
+    // argon2 hashes are salted and not directly comparable, so enumerate and verify each.
+    let conn = state.database.conn();
+    let mut stmt = conn.prepare("SELECT id, name, key_masked, key_hash, allowed_models FROM service_keys").ok()?;
+
+    let rows: Vec<(String, String, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (id, name, key_masked, stored, allowed_str) in rows {
+        if crate::crypto::verify_service_key(api_key, &stored) {
+            let allowed_models: Vec<String> = serde_json::from_str(&allowed_str).unwrap_or_default();
+            return Some(ServiceKeyInfo { id, name, key_masked, allowed_models });
+        }
+    }
+    None
+}
