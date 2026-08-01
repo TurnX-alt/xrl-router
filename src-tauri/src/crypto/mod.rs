@@ -47,7 +47,7 @@ pub fn load_or_create_master_key(path: &Path) -> Result<MasterKey> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
         tracing::info!("Generated new master key at {}", path.display());
         Ok(key)

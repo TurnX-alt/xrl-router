@@ -135,3 +135,68 @@ fn build_cors_layer(config: &Config) -> CorsLayer {
     }
     layer
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// 端到端冒烟测试：真实 TCP 起网关，实测四条路径。
+    /// 覆盖 build_router → handlers/* → proxy 认证 → AppState（DB 迁移、
+    /// providers/models 注册表、密钥池、插件管理器）的完整拆分后链路。
+    #[tokio::test]
+    async fn test_gateway_smoke_end_to_end() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let config = Config {
+            port: 0,
+            host: "127.0.0.1".to_string(),
+            ..Default::default()
+        };
+        let state = Arc::new(AppState::new(config, db, [7u8; 32]));
+        let router = crate::api::build_router(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        // 等服务器就绪
+        for _ in 0..50 {
+            if client.get(format!("http://{}/health", addr)).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // /health：完整链路（DB 连接、providers/models 注册表、key pool）
+        let resp = client.get(format!("http://{}/health", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["service"], "xrl-router");
+        assert_eq!(body["database"], "ok");
+
+        // /api/providers：CRUD handler 路径（空库返回空数组）
+        let resp = client.get(format!("http://{}/api/providers", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let providers: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(providers.as_array().map(|a| a.len()), Some(0));
+
+        // /v1/models：proxy 认证路径（无 service key 应 401）
+        let resp = client.get(format!("http://{}/v1/models", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // /v1/chat/completions：proxy 认证 + 路由解析路径（无 service key 应 401）
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("Content-Type", "application/json")
+            .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+}
