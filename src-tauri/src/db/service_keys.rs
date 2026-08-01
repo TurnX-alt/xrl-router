@@ -19,7 +19,7 @@ impl super::Database {
     pub fn list_service_keys(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, key_masked, allowed_models, total_requests, total_tokens, last_used_at, created_at FROM service_keys"
+            "SELECT id, name, key_masked, allowed_models, total_requests, total_tokens, last_used_at, created_at, updated_at FROM service_keys"
         )?;
 
         let keys = stmt.query_map([], |row| {
@@ -35,6 +35,7 @@ impl super::Database {
                 "total_tokens": row.get::<_, i64>(5)?,
                 "last_used_at": row.get::<_, Option<i64>>(6)?,
                 "created_at": row.get::<_, i64>(7)?,
+                "updated_at": row.get::<_, i64>(8)?,
             }))
         })?;
 

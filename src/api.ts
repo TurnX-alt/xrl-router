@@ -82,6 +82,7 @@ export interface ServiceKey {
   total_tokens: number;
   last_used_at: number | null;
   created_at: number;
+  updated_at: number;
 }
 
 export const serviceKeysApi = {
