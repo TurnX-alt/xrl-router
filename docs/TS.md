@@ -34,6 +34,9 @@ xrl-router 是一个**多 Provider AI LLM API 路由网关**，以 Tauri 2 桌�
 - **Anthropic**：直接透传，零转换
 - **OpenAI**：Anthropic → OpenAI 协议转换
 
+**插件系统**（动态注册，运行时扩展）：
+- **委托供应商**：通过 WebSocket 注册外部服务，将非标 API 桥接为标准 API（OpenAI 或 Anthropic）
+
 ### 1.2 核心价值
 
 | 价值 | 说明 |
@@ -166,6 +169,69 @@ Claude Code (Anthropic 格式)
 流式请求: 逐 chunk 解析 SSE → 转换 → 重新封装为 Anthropic SSE 转发
 ```
 
+### 2.4 插件系统架构
+
+插件系统允许外部服务通过 WebSocket 动态注册为委托供应商（Delegated Provider）。插件负责将非标 API 转化为标准 API（OpenAI 或 Anthropic），Router 负责密钥轮换和请求路由。
+
+```
+外部插件服务 (如 xrl-router-plugin-wukong)
+    │
+    │  WebSocket 连接
+    │  POST ws://localhost:19068/ws/plugin
+    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                          xrl-router  :19068                          │
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  PluginManager (plugin.rs)                                  │    │
+│  │  - 管理插件连接和生命周期                                     │    │
+│  │  - 处理 register/heartbeat/keys_update 消息                 │    │
+│  │  - 自动创建/更新 provider + api_keys + models               │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│         │                                                            │
+│         ▼                                                            │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  ProviderRegistry (providers/mod.rs)                        │    │
+│  │  - 存储插件创建的委托供应商                                   │    │
+│  │  - config_json 包含 plugin_id 和 delegated: true            │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│         │                                                            │
+│         ▼                                                            │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  KeyPool (keys/pool.rs)                                     │    │
+│  │  - 插件密钥通过 keys_update 自动同步                         │    │
+│  │  - 与常规供应商共享密钥池管理                                 │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  路由解析 (api/proxy.rs)                                    │    │
+│  │  - resolve_route() 检测 config_json.plugin_id               │    │
+│  │  - 委托供应商的 base_url 从 PluginManager 实时获取          │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**插件生命周期**：
+
+1. **注册**：插件启动 → WebSocket 连接 `/ws/plugin` → 发送 `register` 消息
+2. **确认**：Router 弹出对话框 → 用户确认 → 创建委托供应商（`enabled=true`）
+3. **密钥同步**：插件定期检测密钥变化 → 通过 `keys_update` 同步到 Router
+4. **心跳**：插件每 30s 发送心跳 → 超时 90s 未收到则标记离线（`enabled=false`）
+5. **忽略**：用户点击「忽略」→ 彻底删除插件 + 关联 provider + 模型 → WS 断开 → 插件重连后重新注册
+
+**委托供应商 vs 常规供应商**：
+
+| 维度 | 常规供应商 | 委托供应商（插件） |
+|------|-----------|------------------|
+| 创建方式 | 用户手动创建 | 插件自动注册 + 用户确认 |
+| API 格式 | 用户选择 (OpenAI/Anthropic) | 插件提供（可转为 OpenAI 或 Anthropic） |
+| Base URL | 用户填写 | 插件通过 WS 推送 |
+| API Key | 用户手动填入 | 插件自动同步 |
+| 密钥轮换 | KeyPool 统一管理 | KeyPool 统一管理（完全一致） |
+| 连接状态 | 始终可用 | 必须 WS 在线才能消费 |
+| 配置存储 | `providers` 表 | `providers` + `plugins` 表 |
+
 ---
 
 ## 3. 目录结构
@@ -173,7 +239,7 @@ Claude Code (Anthropic 格式)
 ```
 xrl-router/
 ├── src-tauri/                   # ═══ 后端 (Rust + Tauri) ═══
-│   ├── Cargo.toml               # version 0.2.0
+│   ├── Cargo.toml
 │   ├── tauri.conf.json          # identifier: im.xrl.router
 │   ├── build.rs                 # Tauri 构建脚本
 │   ├── src/
@@ -194,7 +260,7 @@ xrl-router/
 │   │   │       └── sniff.rs     # 透传流嗅探（SniffStream 提取 token 用量 + 缓存追踪）
 │   │   ├── db/                  # 数据库层
 │   │   │   ├── mod.rs           # SQLite (rusqlite) 封装 + CRUD（WAL 模式）
-│   │   │   ├── schema.rs        # 10 版迁移 SQL（V1-V10）
+│   │   │   ├── schema.rs        # 11 版迁移 SQL（V1-V11）
 │   │   │   └── queries.rs       # 预定义 SQL 查询
 │   │   ├── types/               # 数据结构定义
 │   │   │   ├── mod.rs           # 统一导出
@@ -209,6 +275,8 @@ xrl-router/
 │   │   │   ├── adapter.rs       # Adapter trait
 │   │   │   ├── openai.rs        # OpenAI 适配器（内置）
 │   │   │   └── anthropic.rs     # Anthropic 适配器（内置）
+│   │   ├── plugin/              # 插件系统（V11 新增）
+│   │   │   └── mod.rs           # PluginManager — 管理插件连接、注册、密钥同步、心跳
 │   │   ├── keys/                # 密钥管理
 │   │   │   ├── mod.rs
 │   │   │   └── pool.rs          # KeyPool — 红绿灯轮询（状态纯内存 + 指针持久化）
@@ -239,7 +307,8 @@ xrl-router/
 │   │   └── SettingsView.vue     # 应用设置（含 websearch_hijack 开关）
 │   ├── components/
 │   │   ├── AppShell.vue         # MD3 导航抽屉 + 主内容区
-│   │   └── ConnectionStatus.vue # 离线状态横幅 + 重试按钮
+│   │   ├── ConnectionStatus.vue # 离线状态横幅 + 重试按钮
+│   │   └── PluginRegisterDialog.vue  # 插件注册对话框（V11 新增）
 │   └── stores/
 │       ├── providers.ts         # Provider 列表状态
 │       ├── keys.ts              # API Key 列表状态（按 provider_id 分组）
@@ -277,7 +346,7 @@ run()
   │       create_dir_all(data_dir)              → 确保数据目录存在
   │       crypto::load_or_create_master_key()   → 加载/生成 AES-256-GCM 主密钥
   │       Database::new(db_path)                → 打开 SQLite 数据库（WAL 模式）
-  │       database.migrate()                    → 执行所有待应用的迁移（V1-V10）
+  │       database.migrate()                    → 执行所有待应用的迁移（V1-V11）
   │       AppState::new(config, database, master_key) → 创建共享状态
   │         ├── ProviderRegistry::load_from_db()
   │         ├── ModelRegistry::load_from_db()
@@ -344,6 +413,10 @@ start_gateway(state)
 | `/api/service-keys/{id}` | PUT/DELETE | `update_service_key` / `delete_service_key` | 否 | Service Key 更新/删除 |
 | `/api/stats` | GET | `get_stats` | 否 | 用量统计（支持 `from/to/granularity/tz_offset`） |
 | `/api/settings` | GET/PUT | `get_settings` / `update_settings` | 否 | 应用设置（websearch_hijack 开关） |
+| `/ws/plugin` | GET (WS upgrade) | `plugin_ws_handler` | 否 | 插件 WebSocket 注册端点（V11 新增） |
+| `/api/plugins` | GET | `list_plugins` | 否 | 列出已注册插件（V11 新增） |
+| `/api/plugins/{id}` | GET/DELETE | `get_plugin` / `delete_plugin` | 否 | 获取插件详情 / 删除插件（V11 新增） |
+| `/api/plugins/{id}/confirm` | POST | `confirm_plugin` | 否 | 确认激活插件供应商（V11 新增） |
 
 ### 4.5 LLM 代理核心 — `api/proxy.rs`
 
@@ -585,6 +658,70 @@ load_all_keys_from_db()
 | `AnthropicAdapter` | `anthropic.rs` | `x-api-key: {key}` + `anthropic-version` | `/v1/messages` | Anthropic 官方 |
 
 所有 HTTP 请求通过 `reqwest` 异步发送，支持流式 SSE 响应喵～
+
+### 4.9 插件管理器 — `plugin/mod.rs`
+
+PluginManager 负责管理通过 WebSocket 动态注册的插件（委托供应商）。
+
+**核心职责**：
+
+```
+PluginManager
+  ├── 连接管理
+  │   ├── 接受插件 WebSocket 连接
+  │   ├── 处理 register/heartbeat/keys_update 消息
+  │   └── 检测连接状态（超时 90s 无心跳标记离线）
+  │
+  ├── 供应商管理
+  │   ├── 创建委托供应商（enabled=false 等待用户确认）
+  │   ├── 更新供应商配置（base_url/api_path）
+  │   └── 激活供应商（用户确认后 enabled=true）
+  │
+  ├── 密钥同步
+  │   ├── 接收插件推送的密钥列表
+  │   ├── 加密存储到 api_keys 表
+  │   └── 更新 KeyPool 内存状态
+  │
+  └── 模型管理
+      ├── 接收插件推送的模型列表
+      └── 存储到 models 表
+```
+
+**插件注册流程**：
+
+```
+1. 插件启动 → WebSocket 连接 /ws/plugin
+2. 发送 register 消息（plugin_id, provider, models, keys）
+3. PluginManager 创建 provider（enabled=false）+ models + api_keys
+4. 前端弹出 PluginRegisterDialog
+5. 用户确认 → POST /api/plugins/{id}/confirm → enabled=true
+6. 插件定期检测密钥变化 → keys_update → 同步密钥
+7. 插件每 30s 心跳 → 维持连接状态
+```
+
+**数据库表**：
+
+```sql
+-- V11 新增
+CREATE TABLE plugins (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    plugin_id TEXT NOT NULL UNIQUE,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending/active/offline
+    last_heartbeat_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+```
+
+**状态说明**：
+
+| 状态 | 说明 |
+|------|------|
+| `pending` | 已注册，等待用户确认 |
+| `active` | 用户已确认，供应商已启用 |
+| `offline` | 心跳超时，供应商已禁用 |
 
 ---
 
@@ -863,6 +1000,18 @@ CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- V11: 插件系统（动态注册的委托供应商）
+CREATE TABLE plugins (
+    id TEXT PRIMARY KEY,              -- plugin_id（如 "xrl-router-plugin-wukong"）
+    provider_id TEXT REFERENCES providers(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | active | offline
+    last_heartbeat_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plugins_provider ON plugins(provider_id);
+CREATE INDEX IF NOT EXISTS idx_plugins_status ON plugins(status);
 ```
 
 > **设计说明**：
@@ -877,6 +1026,7 @@ CREATE TABLE settings (
 > - `cache_read_input_tokens`（V7）：记录缓存命中的 token 数（真正的缓存读取）
 > - **V9 清理**：删除 models 表的所有 `cost_per_mtok_*` 列和 usage_log.cost_estimate（从未被 UI 使用的死代码）
 > - **V10 概念纠正**：删除 usage_log.cache_creation_input_tokens——写缓存本质上只是首次处理的输入，不应该单独计数，已并入 prompt_tokens
+> - **V11 插件系统**：新增 plugins 表，支持动态注册的委托供应商。插件通过 WebSocket 注册，密钥自动同步到 api_keys 表，与常规供应商共享密钥池管理
 
 ### 6.2 模型层级系统
 
@@ -901,7 +1051,7 @@ CREATE TABLE settings (
 {
   "status": "ok",
   "service": "xrl-router",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "timestamp": 1699000000,
   "database": "ok",
   "providers": {"total": 3, "enabled": 2},
@@ -1056,6 +1206,87 @@ CREATE TABLE settings (
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/api/proxy/models` | 代理获取上游模型列表（`?url=&type=&key=`，避免浏览器 CORS） |
+
+#### 插件系统 API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/ws/plugin` | WebSocket 插件注册端点（插件连接后发送 register 消息） |
+| `GET` | `/api/plugins` | 列出所有已注册插件 |
+| `GET` | `/api/plugins/:id` | 获取插件详情（含 provider、models、key_count） |
+| `POST` | `/api/plugins/:id/confirm` | 确认激活插件供应商（设置 enabled=true） |
+| `DELETE` | `/api/plugins/:id` | 删除插件（彻底清理 provider + models + keys） |
+
+**插件注册 WebSocket 协议**：
+
+插件通过 WebSocket 连接 `/ws/plugin`，发送以下消息类型：
+
+```json
+// 注册消息（插件 → Router）
+{
+  "type": "register",
+  "plugin_id": "xrl-router-plugin-wukong",
+  "provider": {
+    "kind": "openai",
+    "base_url": "http://localhost:19067",
+    "api_path": "/v1/chat/completions"
+  },
+  "models": [
+    {"model_id": "dingtalk-auto", "display_name": "DingTalk Auto", "tier": "custom"},
+    {"model_id": "claude-opus-4-8", "display_name": "Claude Opus 4.8", "tier": "opus"}
+  ],
+  "keys": ["sk-deap-xxx", "sk-deap-yyy"]
+}
+
+// 密钥更新（插件 → Router，检测到密钥变化后发送）
+{
+  "type": "keys_update",
+  "keys": ["sk-deap-new1", "sk-deap-new2"]
+}
+
+// 心跳（插件 → Router，每 30s 发送）
+{
+  "type": "heartbeat",
+  "timestamp": 1699000000
+}
+
+// 配置更新（插件 → Router，可选）
+{
+  "type": "config_update",
+  "base_url": "http://localhost:19067",
+  "api_path": "/v1/chat/completions"
+}
+```
+
+**Router 响应消息**：
+
+```json
+// 注册确认
+{
+  "type": "registered",
+  "provider_id": "uuid-xxx",
+  "status": "pending_confirmation"
+}
+
+// 重连确认
+{
+  "type": "reconnected",
+  "provider_id": "uuid-xxx"
+}
+
+// 密钥更新确认
+{
+  "type": "keys_ack",
+  "count": 2,
+  "added": 1
+}
+
+// 插件被删除（用户忽略后发送，触发插件重连）
+{
+  "type": "deleted",
+  "reason": "plugin_ignored"
+}
+```
 
 ---
 

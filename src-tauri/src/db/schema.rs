@@ -178,4 +178,20 @@ UPDATE usage_log SET prompt_tokens = prompt_tokens + COALESCE(cache_creation_inp
     WHERE cache_creation_input_tokens IS NOT NULL AND cache_creation_input_tokens > 0;
 ALTER TABLE usage_log DROP COLUMN cache_creation_input_tokens;
 "#,
+    // V11: Plugin system — tracks registered plugins and their associated providers.
+    // Each plugin (e.g., xrl-router-plugin-wukong) connects via WebSocket and acts as
+    // a "delegated provider": the plugin handles protocol translation + DEAP header injection,
+    // while Router manages key rotation and request routing.
+    r#"
+CREATE TABLE IF NOT EXISTS plugins (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT REFERENCES providers(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_heartbeat_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plugins_provider ON plugins(provider_id);
+CREATE INDEX IF NOT EXISTS idx_plugins_status ON plugins(status);
+"#,
 ];

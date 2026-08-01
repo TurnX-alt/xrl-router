@@ -1,6 +1,6 @@
 {
   "productName": "XRL Router",
-  "version": "26.7.31+2330",
+  "version": "26.8.1+1320",
   "identifier": "im.xrl.router",
   "build": {
     "beforeDevCommand": "pnpm exec vite",

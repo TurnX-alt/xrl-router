@@ -128,6 +128,8 @@
 | US-04 | 开发者 | 作为开发者，我想查看每个 Key 的健康状态，以便知道哪些还能用 | Key 列表中以红绿灯颜色直观展示状态 |
 | US-05 | 开发者 | 作为开发者，我想查看按日统计的 token 用量图表，以便了解消耗趋势 | StatsView 页面展示折线图/柱状图 |
 | US-06 | 开发者 | 作为开发者，我想在 Key 失效时自动跳过，以便不影响正常使用 | 401 错误自动标红并切换到下一个可用 Key |
+| US-07 | 插件开发者 | 作为插件开发者，我想将非标 API（如 DEAP）桥接为标准 API，以便 xrl-router 用户可以使用 | 插件通过 WebSocket 注册，自动创建委托供应商 |
+| US-08 | 用户 | 作为用户，我想在插件启动时自动发现并添加供应商，以便零配置使用 | 插件启动后弹窗确认，密钥自动同步 |
 
 ### 4.3 核心使用场景
 
@@ -158,6 +160,29 @@
 2. 系统自动切换到下一个可用 Key
 3. 后续请求透明继续，用户无感知
 4. 用户稍后在管理面板查看红灯原因，更新 Key
+```
+
+#### 场景 D：插件自动发现（新增）
+
+```
+1. 用户启动 xrl-router-plugin-wukong（DEAP 桥接插件）
+2. 插件通过 WebSocket 连接到 xrl-router，发送注册信息
+3. xrl-router 弹出对话框：「发现插件：悟空穿透」
+4. 用户点击「添加供应商」，进入 ProviderNewView
+5. 连接信息（API 格式、Base URL、API Key）自动填充且只读
+6. 用户可修改供应商名称和模型别名
+7. 点击保存后，插件供应商自动激活，密钥每 60s 自动同步
+8. 用户可直接在 Claude Code 中使用 DEAP 模型
+```
+
+#### 场景 E：插件忽略与重新注册（新增）
+
+```
+1. 用户收到插件发现对话框，点击「忽略」
+2. 插件记录被删除，关联的 provider 和模型也被清理
+3. 插件 WebSocket 连接断开，触发重连机制
+4. 插件重连后重新发送注册信息
+5. xrl-router 再次弹出对话框，用户可选择添加
 ```
 
 ---
@@ -202,6 +227,12 @@
 | F-20 | **模型同步** | 从上游 Provider 自动拉取可用模型列表 |
 | F-21 | **Dashboard API** | 概览和用量统计端点 |
 | F-22 | **系统托盘** | 关闭窗口时最小化到托盘继续运行 |
+| F-23 | **插件系统** | 支持外部服务通过 WebSocket 注册为委托供应商，将非标 API 桥接为标准 API |
+| F-24 | **委托供应商** | 插件提供的供应商类型，连接信息自动填充且只读，密钥自动同步 |
+| F-25 | **插件自动发现** | 插件启动后自动注册，弹出对话框引导用户添加 |
+| F-26 | **密钥自动同步** | 插件定期检测密钥变化，通过 WebSocket 自动同步到 Router 密钥池 |
+| F-27 | **插件忽略与重注册** | 用户可忽略插件（彻底删除），插件重连后重新注册 |
+| F-28 | **插件健康监控** | 心跳检测（30s 间隔），超时 90s 未收到则标记离线 |
 
 ### 5.2 协议转换规格
 
@@ -211,6 +242,7 @@
 |---------|---------|---------|
 | Anthropic | 直接透传，零转换 | 内置适配器 |
 | OpenAI / Compatible | Anthropic ↔ OpenAI 转换 | 内置适配器 |
+| 插件（委托供应商） | 插件将非标 API 桥接为标准 API（OpenAI 或 Anthropic） | 插件负责协议转换 + 业务头注入，Router 只管密钥轮换 |
 
 **必须支持的转换特性**：
 
@@ -221,6 +253,48 @@
 - ✅ 思考过程 (thinking / reasoning_content)
 - ✅ 工具选择 (tool_choice)
 - ✅ 流式响应 (SSE streaming)
+
+### 5.4 插件系统规格（新增）
+
+xrl-router 支持通过 WebSocket 注册外部服务作为**委托供应商 (Delegated Provider)**。插件的职责是**将非标 API 转化为标准 API**（如 OpenAI Chat Completions 或 Anthropic Messages），Router 负责密钥轮换、健康监控和用量统计。
+
+**插件注册协议**：
+
+```json
+// 插件 → Router: WebSocket 消息
+{
+  "type": "register",
+  "plugin_id": "xrl-router-plugin-wukong",
+  "provider": {
+    "kind": "openai",
+    "base_url": "http://localhost:19067",
+    "api_path": "/v1/chat/completions"
+  },
+  "models": [
+    {"model_id": "dingtalk-auto", "display_name": "DingTalk Auto", "tier": "custom"},
+    {"model_id": "claude-opus-4-8", "display_name": "Claude Opus 4.8", "tier": "opus"}
+  ],
+  "keys": ["sk-deap-xxx", "sk-deap-yyy"]
+}
+```
+
+**插件生命周期**：
+
+1. **注册**：插件启动 → WS 连接 `/ws/plugin` → 发送 `register` 消息
+2. **确认**：Router 弹出对话框 → 用户确认 → 创建委托供应商（`enabled=true`）
+3. **密钥同步**：插件定期检测密钥变化 → 通过 `keys_update` 同步到 Router
+4. **心跳**：插件每 30s 发送心跳 → 超时 90s 未收到则标记离线（`enabled=false`）
+5. **忽略**：用户点击「忽略」→ 彻底删除插件 + 关联 provider + 模型 → WS 断开 → 插件重连后重新注册
+
+**委托供应商 vs 普通供应商**：
+
+| 维度 | 普通供应商 | 委托供应商（插件） |
+|------|-----------|------------------|
+| API 格式 | 用户选择 (OpenAI/Anthropic) | 插件提供（可转为 OpenAI 或 Anthropic） |
+| Base URL | 用户填写 | 插件通过 WS 推送 |
+| API Key | 用户手动填入 | 插件自动同步 |
+| 密钥轮换 | Router KeyPool | Router KeyPool（完全一致） |
+| 连接状态 | N/A | 必须 WS 在线才能消费 |
 
 ### 5.3 密钥池规格
 
