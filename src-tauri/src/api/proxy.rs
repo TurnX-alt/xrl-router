@@ -1063,7 +1063,7 @@ async fn verify_service_key(state: &AppState, api_key: &str) -> Option<ServiceKe
         .collect();
 
     for (id, name, key_masked, stored, allowed_str) in rows {
-        if crate::api::verify_service_key(api_key, &stored) {
+        if crate::crypto::verify_service_key(api_key, &stored) {
             let allowed_models: Vec<String> = serde_json::from_str(&allowed_str).unwrap_or_default();
             return Some(ServiceKeyInfo { id, name, key_masked, allowed_models });
         }

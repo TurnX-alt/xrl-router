@@ -1,4 +1,4 @@
-//! Provider API key 加密（AES-256-GCM）。
+//! 密码学原语：Provider API key 加密（AES-256-GCM）与 Service Key 哈希（argon2）。
 //!
 //! 主密钥首次启动随机生成，存于 `data/master.key`（权限 0600）。
 //! 数据库单独泄露不暴露密钥；丢失 master.key 则已加密的 Provider Key 无法解密。
@@ -8,6 +8,10 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, Context, Result};
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -43,7 +47,7 @@ pub fn load_or_create_master_key(path: &Path) -> Result<MasterKey> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0600));
         }
         tracing::info!("Generated new master key at {}", path.display());
         Ok(key)
@@ -84,4 +88,26 @@ pub fn decrypt(blob: &str, key: &MasterKey) -> Result<String> {
         .decrypt(nonce, ciphertext)
         .map_err(|e| anyhow!("decrypt: {e:?}"))?;
     String::from_utf8(plain).context("plaintext utf8")
+}
+
+/// Service Key 的 argon2 哈希（随机盐，盐嵌入返回串）。
+pub fn hash_service_key(raw_key: &str) -> Result<String> {
+    // 限定在函数内的 OsRng，避免与上方 rand::rngs::OsRng 重名。
+    use argon2::password_hash::rand_core::OsRng;
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(raw_key.as_bytes(), &salt)
+        .map_err(|e| anyhow!("argon2 hash: {e:?}"))?;
+    Ok(hash.to_string())
+}
+
+/// 校验 Service Key 明文与已存的 argon2 哈希串。
+pub fn verify_service_key(raw_key: &str, stored_hash: &str) -> bool {
+    let parsed = match PasswordHash::new(stored_hash) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    Argon2::default()
+        .verify_password(raw_key.as_bytes(), &parsed)
+        .is_ok()
 }

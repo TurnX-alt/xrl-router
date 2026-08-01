@@ -21,12 +21,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use argon2::{
-    password_hash::{
-        rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-    },
-    Argon2,
-};
+use crate::crypto::hash_service_key;
 use std::sync::Arc;
 
 /// Build the router with all routes
@@ -885,25 +880,8 @@ async fn update_service_key(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
-/// Hash a service key using argon2 (random salt; the stored string embeds the salt).
-pub fn hash_service_key(raw_key: &str) -> anyhow::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(raw_key.as_bytes(), &salt)
-        .map_err(|e| anyhow::anyhow!("argon2 hash: {e:?}"))?;
-    Ok(hash.to_string())
-}
-
-/// Verify a raw service key against a stored argon2 hash string.
-pub fn verify_service_key(raw_key: &str, stored_hash: &str) -> bool {
-    let parsed = match PasswordHash::new(stored_hash) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    Argon2::default()
-        .verify_password(raw_key.as_bytes(), &parsed)
-        .is_ok()
-}
+/// Service Key 的 argon2 哈希/校验已下沉到 `crypto` 模块（见 `crate::crypto`），
+/// 以消除 `api::proxy` 对 `api::mod` 的反向依赖。
 
 // ============================================================================
 // WebSocket
