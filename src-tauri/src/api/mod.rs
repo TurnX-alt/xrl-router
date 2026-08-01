@@ -723,8 +723,13 @@ async fn get_stats(
         .database
         .get_usage_by_day_and_key(from, to, bucket_seconds, tz_offset)
         .unwrap_or_default();
+    let model_usage = state
+        .database
+        .get_usage_by_model(from, to)
+        .unwrap_or_default();
+    let top_model = model_usage.first().cloned();
 
-    Json(serde_json::json!({ "data": data }))
+    Json(serde_json::json!({ "data": data, "top_model": top_model }))
 }
 
 // ============================================================================
@@ -960,7 +965,7 @@ async fn handle_plugin_ws(mut socket: WebSocket, state: Arc<AppState>) {
                 msg.get("keys").cloned().unwrap_or(serde_json::json!([]))
             ).unwrap_or_default();
 
-            match state.plugins.register(reg_msg, keys, &state.master_key, &state.keys) {
+            match state.plugins.register(reg_msg.clone(), keys, &state.master_key, &state.keys) {
                 Ok((provider_id, needs_confirmation)) => {
                     let resp = if needs_confirmation {
                         serde_json::json!({
@@ -976,7 +981,10 @@ async fn handle_plugin_ws(mut socket: WebSocket, state: Arc<AppState>) {
                     };
                     let _ = socket.send(Message::Text(resp.to_string().into())).await;
                     info!("Plugin WS: registered, provider={}", provider_id);
-                    provider_id
+                    // 注意：循环里的 plugin_id 必须是插件名（plugins 表主键），
+                    // 不能是 provider_id（UUID）——否则 is_registered() 永远查不到，
+                    // 会把每次心跳误判为「插件已被删除」而踢掉连接。
+                    reg_msg.plugin_id
                 }
                 Err(e) => {
                     error!("Plugin WS: register failed: {}", e);

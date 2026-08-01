@@ -160,6 +160,7 @@ export const dashboardApi = {
 // --- Stats ---
 export interface StatsRow {
   key_id: string;
+  key_label?: string;
   prompt_tokens: number;
   completion_tokens: number;
   cache_read_input_tokens: number;
@@ -167,9 +168,18 @@ export interface StatsRow {
   requests: number;
   day: string;
 }
+export interface TopModel {
+  model_id: string;
+  model_name: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_read_input_tokens: number;
+  total_tokens: number;
+  requests: number;
+}
 export const statsApi = {
   query: (params: { from: number; to: number; granularity?: 'hour' | 'day'; tz_offset: number }) =>
-    request<any>(`/api/stats?from=${params.from}&to=${params.to}&tz_offset=${params.tz_offset}${params.granularity ? `&granularity=${params.granularity}` : ''}`),
+    request<{ data: StatsRow[]; top_model: TopModel | null }>(`/api/stats?from=${params.from}&to=${params.to}&tz_offset=${params.tz_offset}${params.granularity ? `&granularity=${params.granularity}` : ''}`),
 };
 
 // --- Public API ---

@@ -411,7 +411,7 @@ start_gateway(state)
 | `/api/proxy/models` | GET | `proxy_fetch_models` | 否 | 代理获取上游模型列表（避免 CORS，注入 API key） |
 | `/api/service-keys` | GET/POST | `list_service_keys` / `create_service_key` | 否 | Service Key 列表/创建 |
 | `/api/service-keys/{id}` | PUT/DELETE | `update_service_key` / `delete_service_key` | 否 | Service Key 更新/删除 |
-| `/api/stats` | GET | `get_stats` | 否 | 用量统计（支持 `from/to/granularity/tz_offset`） |
+| `/api/stats` | GET | `get_stats` | 否 | 用量统计（支持 `from/to/granularity/tz_offset`）+ `top_model` |
 | `/api/settings` | GET/PUT | `get_settings` / `update_settings` | 否 | 应用设置（websearch_hijack 开关） |
 | `/ws/plugin` | GET (WS upgrade) | `plugin_ws_handler` | 否 | 插件 WebSocket 注册端点（V11 新增） |
 | `/api/plugins` | GET | `list_plugins` | 否 | 列出已注册插件（V11 新增） |
@@ -836,10 +836,12 @@ API 模块: `providersApi`, `serviceKeysApi`, `keysApi`, `modelsApi`, `statsApi`
 - 权限管理对话框（按供应商分组选择可用模型 `allowed_models`）
 
 #### `StatsView.vue`
+- 数据磁贴区（4 列网格，响应式换行）：总消耗 Tokens（独占 2 列，大数字 + 小号万/亿换算）、使用最多模型、总请求次、输入/输出/命中 Tokens（自动万/亿后缀）、缓存命中率（`命中 / (未缓存输入 + 命中)`，1 位小数百分比）
 - Chart.js 折线图（使用 vue-chartjs）
-- 时间范围选择器（一天内/一周内/一月内）
+- 时间范围选择器（当天 / 一天内 / 一周内 / 一月内），默认「当天」（今日 0 点至当前时刻，按小时分桶）
 - 按密钥分组显示 token 用量
 - 支持 hour/day 粒度 + 时区偏移
+- 后端返回 `top_model` 字段（按请求次数降序取 Top 1 的模型名称），用于「使用最多模型」磁贴
 - WebSocket 监听 `usage_stats_changed` 自动刷新
 
 #### `SettingsView.vue`
@@ -1192,7 +1194,7 @@ CREATE INDEX IF NOT EXISTS idx_plugins_status ON plugins(status);
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/api/stats` | 用量统计（支持 `from/to/granularity(hour|day)/tz_offset`，按 service_key_id 分组） |
+| `GET` | `/api/stats` | 用量统计（支持 `from/to/granularity(hour|day)/tz_offset`，按 service_key_id 分组）+ `top_model`（按请求次数降序取 Top 1 的模型） |
 
 #### 应用设置
 
