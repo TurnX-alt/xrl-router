@@ -16,6 +16,7 @@ pub struct KeyEntry {
     pub provider_id: String,
     pub name: String,
     pub key_hash: String,
+    pub key_masked: String,
     pub status: KeyStatus,
     pub last_error_time: Option<i64>,
     pub total_requests: u64,
@@ -127,7 +128,7 @@ impl KeyPool {
         let keys: Vec<KeyEntry> = {
             let conn = db.conn();
             let mut stmt = conn.prepare(
-                "SELECT id, provider_id, name, key_hash, status, last_error_time, total_requests, total_tokens
+                "SELECT id, provider_id, name, key_hash, key_masked, status, last_error_time, total_requests, total_tokens
                  FROM api_keys WHERE provider_id = ?1"
             ).map_err(|e| e.to_string())?;
 
@@ -142,10 +143,11 @@ impl KeyPool {
                         provider_id: row.get(1)?,
                         name: row.get(2)?,
                         key_hash: plain,
+                        key_masked: row.get(4)?,
                         status: KeyStatus::Green,
                         last_error_time: None,
-                        total_requests: row.get::<_, i64>(6)? as u64,
-                        total_tokens: row.get::<_, i64>(7)? as u64,
+                        total_requests: row.get::<_, i64>(7)? as u64,
+                        total_tokens: row.get::<_, i64>(8)? as u64,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -169,7 +171,7 @@ impl KeyPool {
         let rows: Vec<KeyEntry> = {
             let conn = db.conn();
             let mut stmt = match conn.prepare(
-                "SELECT id, provider_id, name, key_hash, status, last_error_time, total_requests, total_tokens
+                "SELECT id, provider_id, name, key_hash, key_masked, status, last_error_time, total_requests, total_tokens
                  FROM api_keys",
             ) {
                 Ok(s) => s,
@@ -189,11 +191,12 @@ impl KeyPool {
                     provider_id: row.get(1)?,
                     name: row.get(2)?,
                     key_hash: plain,
+                    key_masked: row.get(4)?,
                     // 可用性纯内存：启动一律视为可用，运行时按请求结果探测。
                     status: KeyStatus::Green,
                     last_error_time: None,
-                    total_requests: row.get::<_, i64>(6)? as u64,
-                    total_tokens: row.get::<_, i64>(7)? as u64,
+                    total_requests: row.get::<_, i64>(7)? as u64,
+                    total_tokens: row.get::<_, i64>(8)? as u64,
                 })
             })
             .ok()
@@ -508,6 +511,7 @@ mod tests {
             provider_id: "test_provider".to_string(),
             name: format!("Test Key {}", id),
             key_hash: format!("hash_{}", id),
+            key_masked: format!("****{}", id),
             status,
             last_error_time: None,
             total_requests: 0,

@@ -54,10 +54,10 @@ pub async fn proxy_anthropic_messages(
         "Proxy request received"
     );
 
-    let (service_key_id, allowed_models) = match verify_service_key(&state, api_key).await {
-        Some((id, allowed)) => {
-            info!(trace_id = %trace_id, service_key_id = %id, "Service key verified");
-            (id, allowed)
+    let service_key = match verify_service_key(&state, api_key).await {
+        Some(info) => {
+            info!(trace_id = %trace_id, service_key_id = %info.id, "Service key verified");
+            info
         }
         None => {
             warn!(trace_id = %trace_id, "Authentication failed: invalid API key");
@@ -68,7 +68,7 @@ pub async fn proxy_anthropic_messages(
         }
     };
     // Enforce allowed_models whitelist (empty = allow all). Clients must use the alias.
-    if !allowed_models.is_empty() && !allowed_models.iter().any(|m| m == &model_name) {
+    if !service_key.allowed_models.is_empty() && !service_key.allowed_models.iter().any(|m| m == &model_name) {
         warn!(trace_id = %trace_id, model = %model_name, "Model not allowed for this service key");
         return Err((
             StatusCode::FORBIDDEN,
@@ -103,7 +103,7 @@ pub async fn proxy_anthropic_messages(
         && has_websearch_tool(&body)
     {
         info!(trace_id = %trace_id, anthropic_upstream = provider_is_anthropic, "web_search hijacked → local Bing loop");
-        return run_websearch_loop(&state, &body, &resolved, provider_is_anthropic, &trace_id, &service_key_id).await;
+        return run_websearch_loop(&state, &body, &resolved, provider_is_anthropic, &trace_id, &service_key).await;
     }
 
     let mut request_body = if needs_translation {
@@ -140,6 +140,8 @@ pub async fn proxy_anthropic_messages(
     // Retry loop: 401/402/403/429 → mark current key, rotate to next, replay.
     let mut last_resp: Option<reqwest::Response> = None;
     let mut last_key_id: Option<String> = None;
+    let mut last_key_name: Option<String> = None;
+    let mut last_key_masked: Option<String> = None;
     // 兜底：最多重试 key 总数次，防止任何意外死循环。
     let max_attempts = state.keys.get_stats(&provider_id).map(|s| s.total as u32).unwrap_or(1);
     let mut attempts: u32 = 0;
@@ -156,8 +158,8 @@ pub async fn proxy_anthropic_messages(
                 }
             }
         }
-        let (api_key, key_id) = match pick_key_for(&state, &provider_id) {
-            Some(k) => k,
+        let picked = match pick_key_for(&state, &provider_id) {
+            Some(p) => p,
             None => match last_resp {
                 // All keys exhausted: forward the last failed upstream response.
                 Some(r) => break r,
@@ -169,15 +171,19 @@ pub async fn proxy_anthropic_messages(
                 }
             },
         };
-        last_key_id = Some(key_id.clone());
+        last_key_id = Some(picked.id.clone());
+        last_key_name = Some(picked.name.clone());
+        last_key_masked = Some(picked.key_masked.clone());
+        let key_name = picked.name.clone();
+        let key_masked = picked.key_masked.clone();
 
         let mut req_builder = client.post(&upstream_url);
         if provider_is_anthropic {
             req_builder = req_builder
-                .header("x-api-key", &api_key)
+                .header("x-api-key", &picked.key_hash)
                 .header("anthropic-version", "2023-06-01");
         } else {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", picked.key_hash));
         }
 
         let resp = match tokio::time::timeout(
@@ -196,8 +202,9 @@ pub async fn proxy_anthropic_messages(
                 error!(trace_id = %trace_id, duration_ms, error = %e, "Upstream call failed");
                 let _ = state.database.insert_usage_log(
                     chrono::Utc::now().timestamp(),
-                    &provider_id, &model_row_id,
-                    Some(&key_id), Some(service_key_id.as_str()),
+                    &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
+                    Some(&picked.id), key_name.as_str(), key_masked.as_str(),
+                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
                     "/v1/messages",
                     0, 0, duration_ms, false, Some(&e.to_string()), 0,
                 );
@@ -207,17 +214,18 @@ pub async fn proxy_anthropic_messages(
                 ));
             }
             Err(_) => {
-                // 上游建连成功但迟迟不返回响应头 → 视为该 key 不可用，跳出重试。
+                // 上游建连后挂起不响应时，send() 会卡死；这里用超时兜底，避免整个重试循环被拖住。
                 let duration_ms = start_time.elapsed().as_millis() as i64;
                 let msg = format!(
                     "upstream timed out after {}s waiting for response headers",
                     UPSTREAM_HEADER_TIMEOUT_SECS
                 );
-                warn!(trace_id = %trace_id, duration_ms, key_id = %key_id, "{}", msg);
+                warn!(trace_id = %trace_id, duration_ms, key_id = %picked.id, "{}", msg);
                 let _ = state.database.insert_usage_log(
                     chrono::Utc::now().timestamp(),
-                    &provider_id, &model_row_id,
-                    Some(&key_id), Some(service_key_id.as_str()),
+                    &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
+                    Some(&picked.id), key_name.as_str(), key_masked.as_str(),
+                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
                     "/v1/messages",
                     0, 0, duration_ms, false, Some(&msg), 0,
                 );
@@ -229,10 +237,10 @@ pub async fn proxy_anthropic_messages(
         };
 
         let status = resp.status().as_u16();
-        update_key_health(&state.keys, &provider_id, &api_key, status);
+        update_key_health(&state.keys, &provider_id, &picked.key_hash, status);
 
         if matches!(status, 401 | 402 | 403 | 429) {
-            warn!(trace_id = %trace_id, status, key_id = %key_id, "upstream rejected key, rotating");
+            warn!(trace_id = %trace_id, status, key_id = %picked.id, "upstream rejected key, rotating");
             last_resp = Some(resp);
             continue;
         }
@@ -243,8 +251,10 @@ pub async fn proxy_anthropic_messages(
 
     if upstream_status >= 400 {
         return Ok(forward_upstream_error(
-            &state.database, &provider_id, &model_row_id,
-            last_key_id.as_deref(), Some(service_key_id.as_str()), "/v1/messages",
+            &state.database, &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
+            last_key_id.as_deref(), last_key_name.as_deref(), last_key_masked.as_deref(),
+            Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+            "/v1/messages",
             response, upstream_status, &trace_id, &start_time,
         )
         .await);
@@ -265,9 +275,15 @@ pub async fn proxy_anthropic_messages(
         let trace_id_clone = trace_id.clone();
         let db = state.database.clone();
         let provider_id_log = provider_id.clone();
+        let provider_name_log = resolved.provider_name.clone();
         let model_id_log = resolved.model_row_id.clone();
+        let model_name_log = model_name.clone();
         let key_id_log = last_key_id.clone();
-        let service_key_id_log = service_key_id.clone();
+        let key_name_log = last_key_name.clone();
+        let key_masked_log = last_key_masked.clone();
+        let service_key_id_log = service_key.id.clone();
+        let service_key_name_log = service_key.name.clone();
+        let service_key_masked_log = service_key.key_masked.clone();
         let state_clone = state.clone();
         // message_start 阶段上游尚未返回 usage，先给一个非零估算占位，
         // 避免客户端（CCSwitch 等）把 input 记成 0。真实值在流末尾覆盖。
@@ -372,9 +388,15 @@ pub async fn proxy_anthropic_messages(
             let _ = db.insert_usage_log(
                 chrono::Utc::now().timestamp(),
                 &provider_id_log,
+                provider_name_log.as_str(),
                 &model_id_log,
+                model_name_log.as_str(),
                 key_id_log.as_deref(),
+                key_name_log.as_deref().unwrap_or(""),
+                key_masked_log.as_deref().unwrap_or(""),
                 Some(service_key_id_log.as_str()),
+                service_key_name_log.as_str(),
+                service_key_masked_log.as_str(),
                 "/v1/messages",
                 input_t,
                 output_tokens,
@@ -392,9 +414,15 @@ pub async fn proxy_anthropic_messages(
         // Upstream is Anthropic: sniff usage while forwarding bytes verbatim.
         let provider_kind = resolved.provider_kind.clone();
         let provider_id_log = provider_id.clone();
+        let provider_name_log = resolved.provider_name.clone();
         let model_id_log = resolved.model_row_id.clone();
+        let model_name_log = model_name.clone();
         let key_id_log = last_key_id.clone();
-        let service_key_id_log = service_key_id.clone();
+        let key_name_log = last_key_name.clone();
+        let key_masked_log = last_key_masked.clone();
+        let service_key_id_log = service_key.id.clone();
+        let service_key_name_log = service_key.name.clone();
+        let service_key_masked_log = service_key.key_masked.clone();
         let db = state.database.clone();
         let state_clone = state.clone();
         let mut sniff = sniff::SniffStream::new(response.bytes_stream(), &provider_kind);
@@ -433,9 +461,15 @@ pub async fn proxy_anthropic_messages(
             let _ = db.insert_usage_log(
                 chrono::Utc::now().timestamp(),
                 &provider_id_log,
+                provider_name_log.as_str(),
                 &model_id_log,
+                model_name_log.as_str(),
                 key_id_log.as_deref(),
+                key_name_log.as_deref().unwrap_or(""),
+                key_masked_log.as_deref().unwrap_or(""),
                 Some(service_key_id_log.as_str()),
+                service_key_name_log.as_str(),
+                service_key_masked_log.as_str(),
                 "/v1/messages",
                 input_t,
                 output_tokens,
@@ -481,10 +515,10 @@ pub async fn proxy_openai_chat(
         "Proxy request received"
     );
 
-    let (service_key_id, allowed_models) = match verify_service_key(&state, api_key).await {
-        Some((id, allowed)) => {
-            info!(trace_id = %trace_id, service_key_id = %id, "Service key verified");
-            (id, allowed)
+    let service_key = match verify_service_key(&state, api_key).await {
+        Some(info) => {
+            info!(trace_id = %trace_id, service_key_id = %info.id, "Service key verified");
+            info
         }
         None => {
             warn!(trace_id = %trace_id, "Authentication failed: invalid API key");
@@ -495,7 +529,7 @@ pub async fn proxy_openai_chat(
         }
     };
     // Enforce allowed_models whitelist (empty = allow all). Clients must use the alias.
-    if !allowed_models.is_empty() && !allowed_models.iter().any(|m| m == &model_name) {
+    if !service_key.allowed_models.is_empty() && !service_key.allowed_models.iter().any(|m| m == &model_name) {
         warn!(trace_id = %trace_id, model = %model_name, "Model not allowed for this service key");
         return Err((
             StatusCode::FORBIDDEN,
@@ -559,6 +593,8 @@ pub async fn proxy_openai_chat(
     // Retry loop: 401/402/403/429 → mark current key, rotate to next, replay.
     let mut last_resp: Option<reqwest::Response> = None;
     let mut last_key_id: Option<String> = None;
+    let mut last_key_name: Option<String> = None;
+    let mut last_key_masked: Option<String> = None;
     // 兜底：最多重试 key 总数次，防止任何意外死循环。
     let max_attempts = state.keys.get_stats(&provider_id).map(|s| s.total as u32).unwrap_or(1);
     let mut attempts: u32 = 0;
@@ -575,8 +611,8 @@ pub async fn proxy_openai_chat(
                 }
             }
         }
-        let (api_key, key_id) = match pick_key_for(&state, &provider_id) {
-            Some(k) => k,
+        let picked = match pick_key_for(&state, &provider_id) {
+            Some(p) => p,
             None => match last_resp {
                 Some(r) => break r,
                 None => {
@@ -587,15 +623,19 @@ pub async fn proxy_openai_chat(
                 }
             },
         };
-        last_key_id = Some(key_id.clone());
+        last_key_id = Some(picked.id.clone());
+        last_key_name = Some(picked.name.clone());
+        last_key_masked = Some(picked.key_masked.clone());
+        let key_name = picked.name.clone();
+        let key_masked = picked.key_masked.clone();
 
         let mut req_builder = client.post(&upstream_url);
         if provider_is_anthropic {
             req_builder = req_builder
-                .header("x-api-key", &api_key)
+                .header("x-api-key", &picked.key_hash)
                 .header("anthropic-version", "2023-06-01");
         } else {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", picked.key_hash));
         }
 
         let resp = match tokio::time::timeout(
@@ -613,8 +653,9 @@ pub async fn proxy_openai_chat(
                 error!(trace_id = %trace_id, duration_ms, error = %e, "Upstream call failed");
                 let _ = state.database.insert_usage_log(
                     chrono::Utc::now().timestamp(),
-                    &provider_id, &model_row_id,
-                    Some(&key_id), Some(service_key_id.as_str()),
+                    &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
+                    Some(&picked.id), key_name.as_str(), key_masked.as_str(),
+                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
                     "/v1/chat/completions",
                     0, 0, duration_ms, false, Some(&e.to_string()), 0,
                 );
@@ -629,11 +670,12 @@ pub async fn proxy_openai_chat(
                     "upstream timed out after {}s waiting for response headers",
                     UPSTREAM_HEADER_TIMEOUT_SECS
                 );
-                warn!(trace_id = %trace_id, duration_ms, key_id = %key_id, "{}", msg);
+                warn!(trace_id = %trace_id, duration_ms, key_id = %picked.id, "{}", msg);
                 let _ = state.database.insert_usage_log(
                     chrono::Utc::now().timestamp(),
-                    &provider_id, &model_row_id,
-                    Some(&key_id), Some(service_key_id.as_str()),
+                    &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
+                    Some(&picked.id), key_name.as_str(), key_masked.as_str(),
+                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
                     "/v1/chat/completions",
                     0, 0, duration_ms, false, Some(&msg), 0,
                 );
@@ -645,10 +687,10 @@ pub async fn proxy_openai_chat(
         };
 
         let status = resp.status().as_u16();
-        update_key_health(&state.keys, &provider_id, &api_key, status);
+        update_key_health(&state.keys, &provider_id, &picked.key_hash, status);
 
         if matches!(status, 401 | 402 | 403 | 429) {
-            warn!(trace_id = %trace_id, status, key_id = %key_id, "upstream rejected key, rotating");
+            warn!(trace_id = %trace_id, status, key_id = %picked.id, "upstream rejected key, rotating");
             last_resp = Some(resp);
             continue;
         }
@@ -659,8 +701,10 @@ pub async fn proxy_openai_chat(
 
     if upstream_status >= 400 {
         return Ok(forward_upstream_error(
-            &state.database, &provider_id, &model_row_id,
-            last_key_id.as_deref(), Some(service_key_id.as_str()), "/v1/chat/completions",
+            &state.database, &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
+            last_key_id.as_deref(), last_key_name.as_deref(), last_key_masked.as_deref(),
+            Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+            "/v1/chat/completions",
             response, upstream_status, &trace_id, &start_time,
         )
         .await);
@@ -681,9 +725,15 @@ pub async fn proxy_openai_chat(
         let db = state.database.clone();
         let state_clone = state.clone();
         let provider_id_log = provider_id.clone();
+        let provider_name_log = resolved.provider_name.clone();
         let model_id_log = resolved.model_row_id.clone();
+        let model_name_log = model_name.clone();
         let key_id_log = last_key_id.clone();
-        let service_key_id_log = service_key_id.clone();
+        let key_name_log = last_key_name.clone();
+        let key_masked_log = last_key_masked.clone();
+        let service_key_id_log = service_key.id.clone();
+        let service_key_name_log = service_key.name.clone();
+        let service_key_masked_log = service_key.key_masked.clone();
 
         tokio::spawn(async move {
             let mut buffer = String::new();
@@ -705,9 +755,15 @@ pub async fn proxy_openai_chat(
                 let _ = db.insert_usage_log(
                     chrono::Utc::now().timestamp(),
                     &provider_id_log,
+                    provider_name_log.as_str(),
                     &model_id_log,
+                    model_name_log.as_str(),
                     key_id_log.as_deref(),
+                    key_name_log.as_deref().unwrap_or(""),
+                    key_masked_log.as_deref().unwrap_or(""),
                     Some(service_key_id_log.as_str()),
+                    service_key_name_log.as_str(),
+                    service_key_masked_log.as_str(),
                     "/v1/chat/completions",
                     input_tokens as i64,
                     output_tokens,
@@ -794,9 +850,15 @@ pub async fn proxy_openai_chat(
         // Upstream is OpenAI: sniff usage while forwarding bytes verbatim.
         let provider_kind = resolved.provider_kind.clone();
         let provider_id_log = provider_id.clone();
+        let provider_name_log = resolved.provider_name.clone();
         let model_id_log = resolved.model_row_id.clone();
+        let model_name_log = model_name.clone();
         let key_id_log = last_key_id.clone();
-        let service_key_id_log = service_key_id.clone();
+        let key_name_log = last_key_name.clone();
+        let key_masked_log = last_key_masked.clone();
+        let service_key_id_log = service_key.id.clone();
+        let service_key_name_log = service_key.name.clone();
+        let service_key_masked_log = service_key.key_masked.clone();
         let db = state.database.clone();
         let state_clone = state.clone();
         let mut sniff = sniff::SniffStream::new(response.bytes_stream(), &provider_kind);
@@ -835,9 +897,15 @@ pub async fn proxy_openai_chat(
             let _ = db.insert_usage_log(
                 chrono::Utc::now().timestamp(),
                 &provider_id_log,
+                provider_name_log.as_str(),
                 &model_id_log,
+                model_name_log.as_str(),
                 key_id_log.as_deref(),
+                key_name_log.as_deref().unwrap_or(""),
+                key_masked_log.as_deref().unwrap_or(""),
                 Some(service_key_id_log.as_str()),
+                service_key_name_log.as_str(),
+                service_key_masked_log.as_str(),
                 "/v1/chat/completions",
                 input_t,
                 output_tokens,
@@ -870,8 +938,8 @@ pub async fn proxy_list_models(
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
 
-    let (_service_key_id, allowed_models) = match verify_service_key(&state, api_key).await {
-        Some((id, allowed)) => (id, allowed),
+    let service_key = match verify_service_key(&state, api_key).await {
+        Some(info) => info,
         None => {
             return Err((
                 StatusCode::UNAUTHORIZED,
@@ -919,7 +987,7 @@ pub async fn proxy_list_models(
         .collect();
 
     // Apply allowed_models whitelist (empty = return all)
-    let data: Vec<Value> = if allowed_models.is_empty() {
+    let data: Vec<Value> = if service_key.allowed_models.is_empty() {
         models
     } else {
         models
@@ -927,7 +995,7 @@ pub async fn proxy_list_models(
             .filter(|m| {
                 m["display_name"]
                     .as_str()
-                    .map(|dn| allowed_models.iter().any(|a| a == dn))
+                    .map(|dn| service_key.allowed_models.iter().any(|a| a == dn))
                     .unwrap_or(false)
             })
             .collect()
@@ -947,6 +1015,7 @@ struct ResolvedRoute {
     upstream_url: String,
     provider_kind: String,
     provider_id: String,
+    provider_name: String,
     real_model_id: String,
     /// models.id (UUID primary key) — needed for usage_log.model_id FK.
     model_row_id: String,
@@ -954,33 +1023,49 @@ struct ResolvedRoute {
     plugin_id: Option<String>,
 }
 
+struct ServiceKeyInfo {
+    id: String,
+    name: String,
+    key_masked: String,
+    allowed_models: Vec<String>,
+}
+
+struct PickedKey {
+    key_hash: String,
+    id: String,
+    name: String,
+    key_masked: String,
+}
+
 /// Verify a service key against the service_keys table (argon2 hash).
-/// Returns the service_key id on success, None on failure.
-async fn verify_service_key(state: &AppState, api_key: &str) -> Option<(String, Vec<String>)> {
+/// Returns the service_key info on success, None on failure.
+async fn verify_service_key(state: &AppState, api_key: &str) -> Option<ServiceKeyInfo> {
     if api_key.is_empty() {
         return None;
     }
 
     // argon2 hashes are salted and not directly comparable, so enumerate and verify each.
     let conn = state.database.conn();
-    let mut stmt = conn.prepare("SELECT id, key_hash, allowed_models FROM service_keys").ok()?;
+    let mut stmt = conn.prepare("SELECT id, name, key_masked, key_hash, allowed_models FROM service_keys").ok()?;
 
-    let rows: Vec<(String, String, String)> = stmt
+    let rows: Vec<(String, String, String, String, String)> = stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })
         .ok()?
         .filter_map(|r| r.ok())
         .collect();
 
-    for (id, stored, allowed_str) in rows {
+    for (id, name, key_masked, stored, allowed_str) in rows {
         if crate::api::verify_service_key(api_key, &stored) {
-            let allowed: Vec<String> = serde_json::from_str(&allowed_str).unwrap_or_default();
-            return Some((id, allowed));
+            let allowed_models: Vec<String> = serde_json::from_str(&allowed_str).unwrap_or_default();
+            return Some(ServiceKeyInfo { id, name, key_masked, allowed_models });
         }
     }
     None
@@ -998,7 +1083,7 @@ async fn resolve_route(state: &AppState, model_name: &str) -> Option<ResolvedRou
     // is rejected; clients must use the alias.
     let mut stmt = conn
         .prepare(
-            "SELECT m.id, m.model_id, m.provider_id, p.base_url, p.api_path, p.kind, p.config_json
+            "SELECT m.id, m.model_id, m.provider_id, p.name, p.base_url, p.api_path, p.kind, p.config_json
              FROM models m
              JOIN providers p ON m.provider_id = p.id
              WHERE m.display_name = ?1
@@ -1008,7 +1093,8 @@ async fn resolve_route(state: &AppState, model_name: &str) -> Option<ResolvedRou
         )
         .ok()?;
 
-    let (model_row_id, real_model_id, provider_id, base_url, api_path, kind, config_json_str): (
+    let (model_row_id, real_model_id, provider_id, provider_name, base_url, api_path, kind, config_json_str): (
+        String,
         String,
         String,
         String,
@@ -1026,6 +1112,7 @@ async fn resolve_route(state: &AppState, model_name: &str) -> Option<ResolvedRou
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         })
         .ok()?;
@@ -1057,6 +1144,7 @@ async fn resolve_route(state: &AppState, model_name: &str) -> Option<ResolvedRou
         upstream_url,
         provider_kind: kind,
         provider_id,
+        provider_name,
         real_model_id,
         model_row_id,
         plugin_id,
@@ -1064,11 +1152,16 @@ async fn resolve_route(state: &AppState, model_name: &str) -> Option<ResolvedRou
 }
 
 /// Pick the next available key for a provider from the pool (round-robin,
-/// skips Red/Yellow). Returns (plaintext_key, api_keys.id) or None when no
-/// usable key remains. Called in the retry loop so 401/402/403/429 rotate keys.
-fn pick_key_for(state: &AppState, provider_id: &str) -> Option<(String, String)> {
+/// skips Red/Yellow). Returns PickedKey with plaintext key, id, name, masked.
+/// Called in the retry loop so 401/402/403/429 rotate keys.
+fn pick_key_for(state: &AppState, provider_id: &str) -> Option<PickedKey> {
     match state.keys.get_next_key(provider_id) {
-        Ok(entry) => Some((entry.key_hash, entry.id)),
+        Ok(entry) => Some(PickedKey {
+            key_hash: entry.key_hash,
+            id: entry.id,
+            name: entry.name,
+            key_masked: entry.key_masked,
+        }),
         Err(_) => None,
     }
 }
@@ -1092,9 +1185,15 @@ fn update_key_health(pool: &crate::keys::KeyPool, provider_id: &str, key: &str, 
 async fn forward_upstream_error(
     database: &crate::db::Database,
     provider_id: &str,
+    provider_name: &str,
     model_id: &str,
+    model_display_name: &str,
     key_id: Option<&str>,
+    key_name: Option<&str>,
+    key_masked: Option<&str>,
     service_key_id: Option<&str>,
+    service_key_name: &str,
+    service_key_masked: &str,
     request_type: &str,
     response: reqwest::Response,
     upstream_status: u16,
@@ -1116,9 +1215,15 @@ async fn forward_upstream_error(
     let _ = database.insert_usage_log(
         chrono::Utc::now().timestamp(),
         provider_id,
+        provider_name,
         model_id,
+        model_display_name,
         key_id,
+        key_name.unwrap_or(""),
+        key_masked.unwrap_or(""),
         service_key_id,
+        service_key_name,
+        service_key_masked,
         request_type,
         0,
         0,
@@ -1229,9 +1334,9 @@ async fn run_websearch_loop(
     resolved: &ResolvedRoute,
     provider_is_anthropic: bool,
     _trace_id: &str,
-    service_key_id: &str,
+    service_key: &ServiceKeyInfo,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    let (api_key, key_id) = pick_key_for(state, &resolved.provider_id).ok_or_else(|| {
+    let picked = pick_key_for(state, &resolved.provider_id).ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
@@ -1256,9 +1361,10 @@ async fn run_websearch_loop(
     let mut accum_cache_read: i64 = 0;
 
     // Some(Response) = 上游错误，直接返客户端；None = loop 正常结束
+    let model_display_name = body["model"].as_str().unwrap_or("");
     let early: Option<Response> = if provider_is_anthropic {
         hijack_anthropic(
-            &client, upstream_url, model, &api_key, body, max_tokens,
+            &client, upstream_url, model, &picked.key_hash, body, max_tokens,
             &state.keys, &resolved.provider_id,
             &mut accumulated, &mut final_stop,
             &mut accum_input, &mut accum_output,
@@ -1267,7 +1373,7 @@ async fn run_websearch_loop(
         .await?
     } else {
         hijack_openai(
-            &client, upstream_url, model, &api_key, body, max_tokens,
+            &client, upstream_url, model, &picked.key_hash, body, max_tokens,
             &state.keys, &resolved.provider_id,
             &mut accumulated, &mut final_stop,
             &mut accum_input, &mut accum_output,
@@ -1281,9 +1387,15 @@ async fn run_websearch_loop(
     let _ = state.database.insert_usage_log(
         chrono::Utc::now().timestamp(),
         &resolved.provider_id,
+        resolved.provider_name.as_str(),
         &resolved.model_row_id,
-        Some(&key_id),
-        Some(service_key_id),
+        model_display_name,
+        Some(&picked.id),
+        picked.name.as_str(),
+        picked.key_masked.as_str(),
+        Some(service_key.id.as_str()),
+        service_key.name.as_str(),
+        service_key.key_masked.as_str(),
         "/v1/messages",
         accum_input,
         accum_output,

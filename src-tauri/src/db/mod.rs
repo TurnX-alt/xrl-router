@@ -148,12 +148,7 @@ impl Database {
 
     pub fn delete_provider(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        // 删除该 provider 的 usage_log（含其 key/model 引用），避免 FK RESTRICT；
-        // 随后 CASCADE 自动清理 routes/api_keys。
-        conn.execute(
-            "DELETE FROM usage_log WHERE provider_id = ?1",
-            rusqlite::params![id],
-        )?;
+        // usage_log 已自包含（V12），不再预清理；直接删除 provider 即可。
         conn.execute("DELETE FROM providers WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
@@ -260,11 +255,7 @@ impl Database {
 
     pub fn delete_api_key(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        // 先解除 usage_log 引用（key_id 可空，SET NULL 保留统计），避免 FK RESTRICT
-        conn.execute(
-            "UPDATE usage_log SET key_id = NULL WHERE key_id = ?1",
-            rusqlite::params![id],
-        )?;
+        // usage_log 已自包含（V12），不再预清理；直接删除 key 即可。
         conn.execute("DELETE FROM api_keys WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
@@ -351,11 +342,7 @@ impl Database {
 
     pub fn delete_service_key(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        // 先解除 usage_log 引用（service_key_id 可空，SET NULL 保留统计），避免 FK RESTRICT
-        conn.execute(
-            "UPDATE usage_log SET service_key_id = NULL WHERE service_key_id = ?1",
-            rusqlite::params![id],
-        )?;
+        // usage_log 已自包含（V12），不再预清理；直接删除 service_key 即可。
         conn.execute("DELETE FROM service_keys WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
@@ -445,11 +432,7 @@ impl Database {
 
     pub fn delete_model(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        // model_id NOT NULL：删除其历史 usage_log，避免 FK RESTRICT
-        conn.execute(
-            "DELETE FROM usage_log WHERE model_id = ?1",
-            rusqlite::params![id],
-        )?;
+        // usage_log 已自包含（V12），不再预清理；直接删除 model 即可。
         conn.execute("DELETE FROM models WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
@@ -507,12 +490,11 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT
-                p.name as provider_name,
+                u.provider_name,
                 COUNT(*) as requests,
                 COALESCE(SUM(u.prompt_tokens + u.completion_tokens + u.cache_read_input_tokens), 0) as tokens
              FROM usage_log u
-             JOIN providers p ON u.provider_id = p.id
-             GROUP BY p.id, p.name"
+             GROUP BY u.provider_id, u.provider_name"
         )?;
 
         let stats = stmt.query_map([], |row| {
@@ -556,13 +538,21 @@ impl Database {
     // Usage logging + stats aggregation ---------------------------------
 
     /// Append one row to usage_log. Called once per proxied request (success or failure).
+    /// 统计信息自包含：写入时快照 provider_name / model_display_name / key_name / key_masked /
+    /// service_key_name / service_key_masked，确保删除父表行后统计不受影响。
     pub fn insert_usage_log(
         &self,
         timestamp: i64,
         provider_id: &str,
+        provider_name: &str,
         model_id: &str,
+        model_display_name: &str,
         key_id: Option<&str>,
+        key_name: &str,
+        key_masked: &str,
         service_key_id: Option<&str>,
+        service_key_name: &str,
+        service_key_masked: &str,
         request_type: &str,
         prompt_tokens: i64,
         completion_tokens: i64,
@@ -573,14 +563,20 @@ impl Database {
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO usage_log (timestamp, provider_id, model_id, key_id, service_key_id, request_type, prompt_tokens, completion_tokens, latency_ms, success, error_message, cache_read_input_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO usage_log (timestamp, provider_id, provider_name, model_id, model_display_name, key_id, key_name, key_masked, service_key_id, service_key_name, service_key_masked, request_type, prompt_tokens, completion_tokens, latency_ms, success, error_message, cache_read_input_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             rusqlite::params![
                 timestamp,
                 provider_id,
+                provider_name,
                 model_id,
+                model_display_name,
                 key_id,
+                key_name,
+                key_masked,
                 service_key_id,
+                service_key_name,
+                service_key_masked,
                 request_type,
                 prompt_tokens,
                 completion_tokens,
@@ -610,15 +606,14 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT
                 COALESCE(u.service_key_id, '') AS skid,
-                COALESCE(s.name, '') AS key_name,
-                COALESCE(s.key_masked, '') AS key_masked,
+                u.service_key_name AS key_name,
+                u.service_key_masked AS key_masked,
                 CAST((u.timestamp + ?4) / ?3 AS INTEGER) AS bucket,
                 SUM(u.prompt_tokens) AS prompt_tokens,
                 SUM(u.completion_tokens) AS completion_tokens,
                 SUM(u.cache_read_input_tokens) AS cache_read_tokens,
                 COUNT(*) AS requests
              FROM usage_log u
-             LEFT JOIN service_keys s ON u.service_key_id = s.id
              WHERE u.timestamp >= ?1 AND u.timestamp <= ?2
              GROUP BY COALESCE(u.service_key_id, ''), bucket
              ORDER BY bucket, skid",
@@ -674,13 +669,12 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT
                 u.model_id,
-                COALESCE(m.display_name, u.model_id) AS model_name,
+                u.model_display_name,
                 SUM(u.prompt_tokens) AS prompt_tokens,
                 SUM(u.completion_tokens) AS completion_tokens,
                 SUM(u.cache_read_input_tokens) AS cache_read_tokens,
                 COUNT(*) AS requests
              FROM usage_log u
-             LEFT JOIN models m ON u.model_id = m.id
              WHERE u.timestamp >= ?1 AND u.timestamp <= ?2
              GROUP BY u.model_id
              ORDER BY requests DESC
@@ -689,7 +683,7 @@ impl Database {
 
         let rows = stmt.query_map(rusqlite::params![from_ts, to_ts], |row| {
             let model_id: String = row.get(0)?;
-            let model_name: String = row.get(1)?;
+            let model_name: String = row.get(1)?;  // model_display_name
             let prompt: i64 = row.get(2)?;
             let completion: i64 = row.get(3)?;
             let cache_read: i64 = row.get(4)?;

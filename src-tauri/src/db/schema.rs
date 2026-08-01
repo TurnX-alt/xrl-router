@@ -194,4 +194,64 @@ CREATE TABLE IF NOT EXISTS plugins (
 CREATE INDEX IF NOT EXISTS idx_plugins_provider ON plugins(provider_id);
 CREATE INDEX IF NOT EXISTS idx_plugins_status ON plugins(status);
 "#,
+    // V12: usage_log 自包含 — 统计不再依赖外键。
+    // 写入时快照 provider_name / model_display_name / key_name / key_masked /
+    // service_key_name / service_key_masked，统计查询不再 JOIN 父表。
+    // 同时重建表以去除 FK 约束，确保删除模型/密钥/provider 不影响历史统计。
+    r#"
+ALTER TABLE usage_log ADD COLUMN provider_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_log ADD COLUMN model_display_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_log ADD COLUMN key_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_log ADD COLUMN key_masked TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_log ADD COLUMN service_key_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE usage_log ADD COLUMN service_key_masked TEXT NOT NULL DEFAULT '';
+
+UPDATE usage_log SET provider_name = COALESCE((SELECT p.name FROM providers p WHERE p.id = usage_log.provider_id), '');
+UPDATE usage_log SET model_display_name = COALESCE((SELECT m.display_name FROM models m WHERE m.id = usage_log.model_id), '');
+UPDATE usage_log SET key_name = COALESCE((SELECT k.name FROM api_keys k WHERE k.id = usage_log.key_id), '');
+UPDATE usage_log SET key_masked = COALESCE((SELECT k.key_masked FROM api_keys k WHERE k.id = usage_log.key_id), '');
+UPDATE usage_log SET service_key_name = COALESCE((SELECT s.name FROM service_keys s WHERE s.id = usage_log.service_key_id), '');
+UPDATE usage_log SET service_key_masked = COALESCE((SELECT s.key_masked FROM service_keys s WHERE s.id = usage_log.service_key_id), '');
+
+-- 重建 usage_log：去掉所有 FK 约束，保留索引。
+CREATE TABLE usage_log_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    provider_id TEXT NOT NULL,
+    provider_name TEXT NOT NULL DEFAULT '',
+    model_id TEXT NOT NULL,
+    model_display_name TEXT NOT NULL DEFAULT '',
+    key_id TEXT,
+    key_name TEXT NOT NULL DEFAULT '',
+    key_masked TEXT NOT NULL DEFAULT '',
+    service_key_id TEXT,
+    service_key_name TEXT NOT NULL DEFAULT '',
+    service_key_masked TEXT NOT NULL DEFAULT '',
+    request_type TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    success INTEGER NOT NULL,
+    error_message TEXT,
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT INTO usage_log_new
+    (id, timestamp, provider_id, provider_name, model_id, model_display_name,
+     key_id, key_name, key_masked, service_key_id, service_key_name, service_key_masked,
+     request_type, prompt_tokens, completion_tokens, latency_ms, success, error_message,
+     cache_read_input_tokens)
+SELECT id, timestamp, provider_id, provider_name, model_id, model_display_name,
+       key_id, key_name, key_masked, service_key_id, service_key_name, service_key_masked,
+       request_type, prompt_tokens, completion_tokens, latency_ms, success, error_message,
+       cache_read_input_tokens
+FROM usage_log;
+
+DROP TABLE usage_log;
+ALTER TABLE usage_log_new RENAME TO usage_log;
+
+CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_log(provider_id);
+CREATE INDEX IF NOT EXISTS idx_usage_service_key ON usage_log(service_key_id);
+"#,
 ];
