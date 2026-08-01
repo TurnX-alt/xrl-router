@@ -210,7 +210,7 @@ xrl-router (Router)                    xrl-router-plugin-wukong (Plugin)
 | `GET/POST/PUT/DELETE` | `/api/keys[/:id]` | API Key CRUD（含 AES-256-GCM 加解密） |
 | `GET/POST/PUT/DELETE` | `/api/models[/:id]` | Model CRUD |
 | `GET/POST/PUT/DELETE` | `/api/service-keys[/:id]` | Service Key CRUD（Argon2 哈希） |
-| `GET` | `/api/stats` | 用量统计（支持 from/to/granularity/tz_offset） |
+| `GET` | `/api/stats` | 用量统计（支持 from/to/granularity/tz_offset）+ `top_model` |
 | `GET` | `/api/proxy/models` | 代理获取上游 Provider 模型列表 |
 | `GET/PUT` | `/api/settings` | 应用设置（websearch_hijack 开关） |
 | `GET` | `/ws` | WebSocket 实时推送（密钥状态 + 用量变更） |

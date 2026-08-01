@@ -662,6 +662,55 @@ impl Database {
         }
         Ok(result)
     }
+
+    /// 在 [from_ts, to_ts] 内按模型聚合用量，用于前端「最爱用的模型」磁贴。
+    /// 返回 (model_id, display_name, total_tokens, requests)，按请求次数降序，仅取 Top 1。
+    pub fn get_usage_by_model(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+                u.model_id,
+                COALESCE(m.display_name, u.model_id) AS model_name,
+                SUM(u.prompt_tokens) AS prompt_tokens,
+                SUM(u.completion_tokens) AS completion_tokens,
+                SUM(u.cache_read_input_tokens) AS cache_read_tokens,
+                COUNT(*) AS requests
+             FROM usage_log u
+             LEFT JOIN models m ON u.model_id = m.id
+             WHERE u.timestamp >= ?1 AND u.timestamp <= ?2
+             GROUP BY u.model_id
+             ORDER BY requests DESC
+             LIMIT 1",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![from_ts, to_ts], |row| {
+            let model_id: String = row.get(0)?;
+            let model_name: String = row.get(1)?;
+            let prompt: i64 = row.get(2)?;
+            let completion: i64 = row.get(3)?;
+            let cache_read: i64 = row.get(4)?;
+            let requests: i64 = row.get(5)?;
+            Ok(serde_json::json!({
+                "model_id": model_id,
+                "model_name": model_name,
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "cache_read_input_tokens": cache_read,
+                "total_tokens": prompt + completion + cache_read,
+                "requests": requests,
+            }))
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
