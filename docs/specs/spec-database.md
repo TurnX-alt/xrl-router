@@ -6,7 +6,7 @@
 
 ## 迁移架构
 
-所有 DDL 以 Rust 字符串内联在 `schema.rs` 的 `MIGRATIONS` 数组中，**没有**独立的 `.sql` 文件。版本由 `MIGRATIONS.len()` 动态得出，当前为 **13**。
+所有 DDL 以 Rust 字符串内联在 `schema.rs` 的 `MIGRATIONS` 数组中，**没有**独立的 `.sql` 文件。版本由 `MIGRATIONS.len()` 动态得出，当前为 **14**。
 
 ```rust
 // db/schema.rs
@@ -54,8 +54,9 @@ pub fn migrate(db: &Database) -> Result<()> {
 | V11 | 新增 plugins 表 + 索引 |
 | V12 | usage_log 自包含：添加快照字段（provider_name/model_display_name/key_name/service_key_name/key_masked/service_key_masked），移除所有外键约束（重建表） |
 | V13 | providers 新增 sort_order 列 |
+| V14 | service_keys 新增 quota_5h / quota_7d 列（滚动窗口 token 配额，0 = 不设限） |
 
-## 当前表结构（V13 最终状态）
+## 当前表结构（V14 最终状态）
 
 ### providers
 
@@ -127,6 +128,8 @@ CREATE TABLE service_keys (
     key_hash TEXT NOT NULL,           -- Argon2 哈希
     key_masked TEXT NOT NULL,         -- 脱敏显示
     allowed_models TEXT NOT NULL DEFAULT '[]',  -- JSON 数组
+    quota_5h INTEGER NOT NULL DEFAULT 0,  -- V14: 5h 滚动窗口 token 上限（0 = 不设限）
+    quota_7d INTEGER NOT NULL DEFAULT 0,  -- V14: 7d 滚动窗口 token 上限（0 = 不设限）
     total_requests INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
     last_used_at INTEGER,
@@ -247,8 +250,8 @@ CREATE INDEX idx_plugins_status ON plugins(status);
 ```rust
 // db/schema.rs — 追加到 MIGRATIONS 数组末尾
 pub const MIGRATIONS: &[&str] = &[
-    // ... V1-V13 已有迁移 ...
-    // V14 (新迁移)
+    // ... V1-V14 已有迁移 ...
+    // V15 (新迁移)
     r#"ALTER TABLE providers ADD COLUMN ..."#,
 ];
 ```
@@ -303,7 +306,7 @@ db.execute(
 
 ## 完成标准
 
-- [x] 13 版增量迁移（V1→V13）
+- [x] 14 版增量迁移（V1→V14）
 - [x] 迁移按序执行，跳过已应用的版本
 - [x] UPSERT 使用 `ON CONFLICT DO UPDATE`
 - [x] `usage_log` 自包含快照（无外键）

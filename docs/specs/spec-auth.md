@@ -19,6 +19,8 @@ CREATE TABLE service_keys (
     key_hash TEXT NOT NULL,        -- Argon2 哈希
     key_masked TEXT NOT NULL,      -- 脱敏显示
     allowed_models TEXT NOT NULL DEFAULT '[]', -- JSON 数组
+    quota_5h INTEGER NOT NULL DEFAULT 0,  -- 5h 滚动窗口 token 上限（0 = 不设限）
+    quota_7d INTEGER NOT NULL DEFAULT 0,  -- 7d 滚动窗口 token 上限（0 = 不设限）
     total_requests INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
     last_used_at INTEGER,
@@ -143,6 +145,8 @@ pub struct ServiceKeyInfo {
     pub name: String,
     pub key_masked: String,
     pub allowed_models: Vec<String>,
+    pub quota_5h: i64,  // 5h 滚动窗口 token 上限，0 = 不设限
+    pub quota_7d: i64,  // 7d 滚动窗口 token 上限，0 = 不设限
 }
 ```
 
@@ -152,7 +156,8 @@ pub struct ServiceKeyInfo {
 2. 遍历所有 Service Key
 3. 逐条调用 `verify_service_key`
 4. 匹配成功返回 `ServiceKeyInfo`
-5. 检查 `allowed_models` 白名单
+5. 检查 5h/7d 滚动窗口配额（`quota.rs::check_quota`），超限返回 429
+6. 检查 `allowed_models` 白名单
 
 ## 关键约束
 
@@ -169,6 +174,7 @@ pub struct ServiceKeyInfo {
 | 无 `x-api-key` 头 | 返回 401 |
 | Service Key 无效 | 返回 401 |
 | 模型不在白名单 | 返回 403 |
+| 滚动窗口配额超限 | 返回 429（`quota_error` + `retry-after`） |
 | 主密钥文件丢失 | 启动失败 |
 | Provider Key 解密失败 | 跳过该 key，记录 error 日志 |
 
@@ -190,6 +196,7 @@ pub struct ServiceKeyInfo {
 - [x] Provider API Key 使用 AES-256-GCM 加密
 - [x] 主密钥文件保护（权限 0600）
 - [x] 白名单检查（`allowed_models`）
+- [x] 5h/7d 滚动窗口配额检查（`quota_5h`/`quota_7d`，超限 429）
 - [x] 认证失败返回 401
 - [x] 白名单拒绝返回 403
 - [x] 通过所有单元测试

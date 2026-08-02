@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod handler;
 pub mod key_rotation;
+pub mod quota;
 pub mod route;
 pub mod sniff;
 pub mod translate;
@@ -14,6 +15,7 @@ pub mod upstream;
 pub mod websearch;
 
 pub use handler::{proxy_anthropic_messages, proxy_list_models, proxy_openai_chat};
+pub use quota::user_balance;
 
 /// 等待上游返回响应头的最大时长。上游建连后挂起不响应时，send() 会卡死，
 /// 这里用超时兜底，避免整个重试循环被一次挂起的请求拖住。

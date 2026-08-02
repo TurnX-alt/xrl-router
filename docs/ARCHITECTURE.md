@@ -52,7 +52,7 @@ main.rs
        ├─ crypto/mod.rs      AES-256-GCM + Argon2 + master key
        ├─ db/                SQLite 封装
        │    ├─ mod.rs         Database 结构体 + WAL + migrate()
-       │    ├─ schema.rs      MIGRATIONS 数组 (V1→V13)
+       │    ├─ schema.rs      MIGRATIONS 数组 (V1→V14)
        │    ├─ providers.rs   Provider CRUD
        │    ├─ models.rs      Model CRUD
        │    ├─ api_keys.rs    API Key CRUD
@@ -127,7 +127,11 @@ main.rs
   ▼
 [3] verify_service_key (auth.rs) ──── Argon2 逐条校验
   │  失败 → 401
-  │  成功 → ServiceKeyInfo { id, name, allowed_models }
+  │  成功 → ServiceKeyInfo { id, name, allowed_models, quota_5h, quota_7d }
+  │
+  ▼
+[3a] check_quota (quota.rs) ──── 5h/7d 滚动窗口用量聚合 (usage_log)
+  │  limit>0 且 used>=limit → 429 (quota_error + retry-after)
   │
   ▼
 [4] allowed_models 白名单 ──── 非空时必须在名单内
@@ -217,7 +221,7 @@ src/
 │  providers        供应商注册表 (含 sort_order)     │
 │  models           模型定义 (含别名 display_name)   │
 │  api_keys         Provider Key (AES-256-GCM 加密) │
-│  service_keys     客户端 Key (Argon2 哈希)         │
+│  service_keys     客户端 Key (Argon2 哈希, 含 quota)│
 │  usage_log        请求日志 (自包含快照, 无 FK)      │
 │  settings         key-value 设置 + 轮询指针        │
 │  plugins          插件注册记录                     │
@@ -253,8 +257,8 @@ src/
             │     (Argon2 哈希验证)     │
             └───────────┼───────────────┘
                         │
-              /v1/messages, /v1/chat/completions, /v1/models
-              (令牌桶限流 60 req/min)
+              /v1/messages, /v1/chat/completions, /v1/models, /v1/user/balance
+              (令牌桶限流 60 req/min + 5h/7d token 配额)
                         │
                         ▼
                     xrl-router

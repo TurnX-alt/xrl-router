@@ -47,6 +47,26 @@ impl super::Database {
         Ok(result)
     }
 
+    /// 指定 service key 在 5h / 7d 滚动窗口内已用的 tokens。
+    /// 只累计 5 分钟前的用量，保证流式请求尚未写库的尾巴不被漏计（窗口是近似的）。
+    /// 返回 `(used_5h, used_7d)`；无记录时为 0。
+    pub fn get_service_key_usage(&self, service_key_id: &str, now: i64) -> anyhow::Result<(i64, i64)> {
+        const FIVE_HOURS: i64 = 5 * 3600;
+        const SEVEN_DAYS: i64 = 7 * 86400;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+                COALESCE(SUM(CASE WHEN timestamp >= ?2 THEN prompt_tokens + completion_tokens + cache_read_input_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN timestamp >= ?3 THEN prompt_tokens + completion_tokens + cache_read_input_tokens ELSE 0 END), 0)
+             FROM usage_log
+             WHERE service_key_id = ?1"
+        )?;
+        let row = stmt.query_row(rusqlite::params![service_key_id, now - FIVE_HOURS, now - SEVEN_DAYS], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(row)
+    }
+
     /// Append one row to usage_log. Called once per proxied request (success or failure).
     /// 统计信息自包含：写入时快照 provider_name / model_display_name / key_name / key_masked /
     /// service_key_name / service_key_masked，确保删除父表行后统计不受影响。
@@ -214,5 +234,45 @@ impl super::Database {
             result.push(row?);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 5h / 7d 滚动窗口聚合：只有窗口内的行被计入，且两个窗口互不影响。
+    #[test]
+    fn test_get_service_key_usage_windows() {
+        let db = super::super::Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+
+        let now = 1_000_000_000i64; // 固定 now，便于控制时间
+        let insert = |ts: i64, tokens: i64| {
+            db.insert_usage_log(
+                ts,
+                "p1", "P1", "m1", "M1",
+                Some("pk1"), "PK", "pk-masked",
+                Some("sk1"), "SK", "sk-masked",
+                "/v1/messages",
+                tokens, 0, 10, true, None, 0,
+            )
+            .unwrap();
+        };
+
+        // 5h 内（计入 5h + 7d）
+        insert(now - 3600, 100);
+        // 5h~7d 之间（只计入 7d）
+        insert(now - 6 * 3600, 200);
+        // 7d 外（两个窗口都不计入）
+        insert(now - 8 * 86400, 400);
+
+        let (used_5h, used_7d) = db.get_service_key_usage("sk1", now).unwrap();
+        assert_eq!(used_5h, 100);
+        assert_eq!(used_7d, 300);
+
+        // 无记录 key 返回 0
+        let (a, b) = db.get_service_key_usage("nobody", now).unwrap();
+        assert_eq!((a, b), (0, 0));
     }
 }

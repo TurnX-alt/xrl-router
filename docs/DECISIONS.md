@@ -624,3 +624,35 @@ pub fn resolve_route(state: &AppState, display_name: &str) -> Option<ResolvedRou
 ### 未来改进
 
 如需负载均衡，可以新增 `routes` 表（已预留），支持 `weight` 字段。
+
+---
+
+## ADR-015: Token 配额用滚动窗口 + 按需聚合（V14）
+
+**日期**: 2026-08-02  
+**状态**: 已接受
+
+### 背景
+
+需求：每个 Service Key 可配置 5 小时 / 7 天内的 token 上限，触顶返回 429。需要决定窗口口径与用量来源。
+
+### 决策
+
+1. **滚动窗口而非固定时段**：窗口按 Unix 时间对齐（`now % window_secs`），不是自然日/自然小时。与上游计费（Anthropic 5h、OpenAI 类似滚动周期）语义一致，实现只依赖 `usage_log.timestamp` 单列。
+2. **上限持久化、用量按需聚合**：`service_keys` 只存 `quota_5h/quota_7d`（0 = 不设限）；已用量每次从 `usage_log` 条件聚合（`SUM(prompt + completion + cache_read)`）。不维护额外计数器，避免写路径多一次同步、且重启后天然一致。
+3. **429 采用 quota_error 类型**：模拟 Anthropic 错误体风格，携带 `retry-after` 头（剩余秒数）；`message` 内含可读的重置时间（`Resets in 2h31m.`）。
+
+### 原因
+
+1. **正确性**：固定时段在窗口边界会瞬时放行大量请求（月初/日初全额重置），滚动窗口平滑且与上游配额对齐
+2. **简单**：单条 SQL 即得两窗口用量，无新增状态
+3. **一致**：`/v1/user/balance` 与表格「限额」列共用同一聚合函数，展示与判定永不分叉
+
+### 代价
+
+- 每个代理请求多一次 SQLite 条件聚合查询（有 `idx_usage_service_key` + `idx_usage_timestamp` 索引，单用户本地规模无感）
+- 聚合统计的是「已写库」的用量，正在流式传输的请求有 ≤ 5 分钟延迟才计入（可接受：流式请求的 token 是渐进消耗的）
+
+### 未来改进
+
+如未来需要更细粒度（按模型、按分钟），可在同一聚合函数上加条件扩展。

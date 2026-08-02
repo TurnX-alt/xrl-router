@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -113,10 +113,11 @@ pub(super) async fn run_websearch_loop(
     provider_is_anthropic: bool,
     _trace_id: &str,
     service_key: &ServiceKeyInfo,
-) -> Result<Response, (StatusCode, Json<Value>)> {
+) -> Result<Response, (StatusCode, HeaderMap, Json<Value>)> {
     let picked = pick_key_for(state, &resolved.provider_id).ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
             Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
         )
     })?;
@@ -208,7 +209,7 @@ async fn hijack_anthropic(
     accum_input: &mut i64,
     accum_output: &mut i64,
     accum_cache_read: &mut i64,
-) -> Result<Option<Response>, (StatusCode, Json<Value>)> {
+) -> Result<Option<Response>, (StatusCode, HeaderMap, Json<Value>)> {
     let custom_tool = json!({
         "name": "web_search",
         "description": "Search the web (Bing) for up-to-date information.",
@@ -241,10 +242,10 @@ async fn hijack_anthropic(
             .json(&Value::Object(req))
             .send()
             .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "api_error", "message": e.to_string()}}))))?;
+            .map_err(|e| (StatusCode::BAD_GATEWAY, HeaderMap::new(), Json(json!({"error": {"type": "api_error", "message": e.to_string()}}))))?;
         let status = resp.status().as_u16();
         let msg_val: Value = resp.json().await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "api_error", "message": e.to_string()}}))))?;
+            .map_err(|e| (StatusCode::BAD_GATEWAY, HeaderMap::new(), Json(json!({"error": {"type": "api_error", "message": e.to_string()}}))))?;
         if status >= 400 {
             update_key_health(pool, provider_id, api_key, status);
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -301,7 +302,7 @@ async fn hijack_openai(
     final_stop: &mut String,
     accum_input: &mut i64,
     accum_output: &mut i64,
-) -> Result<Option<Response>, (StatusCode, Json<Value>)> {
+) -> Result<Option<Response>, (StatusCode, HeaderMap, Json<Value>)> {
     let custom_fn = json!({
         "type": "function",
         "function": {
@@ -330,10 +331,10 @@ async fn hijack_openai(
             .json(&req)
             .send()
             .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "api_error", "message": e.to_string()}}))))?;
+            .map_err(|e| (StatusCode::BAD_GATEWAY, HeaderMap::new(), Json(json!({"error": {"type": "api_error", "message": e.to_string()}}))))?;
         let status = resp.status().as_u16();
         let msg_val: Value = resp.json().await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "api_error", "message": e.to_string()}}))))?;
+            .map_err(|e| (StatusCode::BAD_GATEWAY, HeaderMap::new(), Json(json!({"error": {"type": "api_error", "message": e.to_string()}}))))?;
         if status >= 400 {
             update_key_health(pool, provider_id, api_key, status);
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
