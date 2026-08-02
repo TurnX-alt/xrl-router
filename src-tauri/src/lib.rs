@@ -22,7 +22,6 @@ mod keys;
 mod middleware;
 mod models;
 mod plugin;
-mod protocol;
 mod providers;
 mod search;
 mod types;
