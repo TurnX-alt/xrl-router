@@ -104,21 +104,28 @@ pub(crate) async fn delete_service_key(
 pub(crate) struct UpdateServiceKeyRequest {
     name: Option<String>,
     allowed_models: Option<Vec<String>>,
+    /// 5h 滚动窗口 token 上限（0 = 不设限）。
+    quota_5h: Option<i64>,
+    /// 7d 滚动窗口 token 上限（0 = 不设限）。
+    quota_7d: Option<i64>,
 }
 
-/// Update a service key (name and/or allowed_models)
+/// Update a service key (name / allowed_models / token quotas)
 pub(crate) async fn update_service_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<UpdateServiceKeyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // 负值视为未设置，避免非法配置进入 DB。
+    let q5 = req.quota_5h.filter(|v| *v >= 0);
+    let q7 = req.quota_7d.filter(|v| *v >= 0);
     let allowed_json = req
         .allowed_models
         .as_ref()
         .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".to_string()));
     if let Err(e) = state
         .database
-        .update_service_key(&id, req.name.as_deref(), allowed_json.as_deref())
+        .update_service_key(&id, req.name.as_deref(), allowed_json.as_deref(), q5, q7)
     {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,

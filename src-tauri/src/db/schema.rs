@@ -261,4 +261,11 @@ CREATE INDEX IF NOT EXISTS idx_usage_service_key ON usage_log(service_key_id);
     r#"
 ALTER TABLE providers ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
 "#,
+    // V14: service_keys 滚动窗口 token 配额（5h / 7d）。0 表示不设限。
+    // 用量从 usage_log 条件聚合得出（见 usage::get_service_key_usage），
+    // 不在本表持久化，避免写路径额外同步计数。
+    r#"
+ALTER TABLE service_keys ADD COLUMN quota_5h INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE service_keys ADD COLUMN quota_7d INTEGER NOT NULL DEFAULT 0;
+"#,
 ];

@@ -79,6 +79,10 @@ export interface ServiceKey {
   name: string;
   key_masked: string;
   allowed_models: string[];
+  /** 5h 滚动窗口 token 上限，0 = 不设限 */
+  quota_5h: number;
+  /** 7d 滚动窗口 token 上限，0 = 不设限 */
+  quota_7d: number;
   total_requests: number;
   total_tokens: number;
   last_used_at: number | null;
@@ -86,11 +90,19 @@ export interface ServiceKey {
   updated_at: number;
 }
 
+/** list 响应附带的滚动窗口已用量 */
+export interface ServiceKeyUsage {
+  /** 5h 滚动窗口已用 tokens */
+  used_5h: number;
+  /** 7d 滚动窗口已用 tokens */
+  used_7d: number;
+}
+
 export const serviceKeysApi = {
-  list: () => request<ServiceKey[]>('/api/service-keys'),
+  list: () => request<(ServiceKey & ServiceKeyUsage)[]>('/api/service-keys'),
   create: (data: { name: string }) =>
     request<{ ok: boolean; id: string; key: string }>('/api/service-keys', { method: 'POST', body: data }),
-  update: (id: string, data: { name?: string; allowed_models?: string[] }) =>
+  update: (id: string, data: { name?: string; allowed_models?: string[]; quota_5h?: number; quota_7d?: number }) =>
     request<{ ok: boolean }>(`/api/service-keys/${id}`, { method: 'PUT', body: data }),
   delete: (id: string) => request<{ ok: boolean }>(`/api/service-keys/${id}`, { method: 'DELETE' }),
 };

@@ -19,7 +19,7 @@ src-tauri/src/                 后端 Rust
 ├── api/
 │   ├── router.rs              axum 路由表（唯一）
 │   ├── handlers/*             管理 API 处理器（按实体分文件）
-│   └── proxy/*                LLM 代理核心（handler/auth/route/key_rotation/upstream/websearch/sniff/translate）
+│   └── proxy/*                LLM 代理核心（handler/auth/quota/route/key_rotation/upstream/websearch/sniff/translate）
 ├── db/*                       SQLite 封装（mod.rs + schema.rs + 按实体分文件）
 ├── types/*                    数据结构定义（Provider/Model/ApiKey/Chat/Route/...）
 ├── providers/                 Provider 适配器（proxy 不经过它）
@@ -54,7 +54,7 @@ docs/                          文档（本目录）
 
 - 迁移定义在 `src-tauri/src/db/schema.rs` 的 `MIGRATIONS` 数组
 - 每个元素是一条完整 SQL，启动时按序执行
-- 当前版本：**V13**（`providers.sort_order`）
+- 当前版本：**V14**（`service_keys` 增加 `quota_5h` / `quota_7d`）
 - 新增迁移：追加到数组末尾，**不要**修改已有迁移
 - 用 `ON CONFLICT DO UPDATE`（UPSERT），**不要用** `INSERT OR REPLACE`（会触发 `ON DELETE CASCADE` 清空子表，`db/mod.rs` 有回归测试）
 
@@ -133,7 +133,7 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 ### 数据层面
 
 - ❌ **不做价格追踪**。V9 已经把 `cost_per_mtok_*` 列全删了，历史证明 UI 从不使用
-- ❌ **不做 token 配额 / 计费 / 充值**。本地自用不需要
+- ❌ **不做计费 / 充值**。Token 配额（5h/7d 滚动窗口）已实现且足够本地自用，无需金额计费
 - ❌ **不做数据导出 / 报表**。StatsView 的图表足够
 - ❌ **不做跨设备同步**。本地优先是核心卖点
 

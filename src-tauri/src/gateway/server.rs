@@ -198,5 +198,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
+
+        // /v1/user/balance：无 service key 应 401
+        let resp = client
+            .get(format!("http://{}/v1/user/balance", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // 配额 429：创建 service key（quota_5h=10）→ 写入 15 tokens 用量 → 请求应 429。
+        let raw_key = "xrl-test-quota-key";
+        let key_hash = crate::crypto::hash_service_key(raw_key).unwrap();
+        state.database.save_service_key("sk-quota", "限额测试", &key_hash, "****uota").unwrap();
+        let now = chrono::Utc::now().timestamp();
+        state.database.insert_usage_log(
+            now,
+            "p1", "P1", "m1", "M1",
+            Some("pk1"), "PK", "pk-masked",
+            Some("sk-quota"), "限额测试", "****uota",
+            "/v1/messages",
+            10, 5, 10, true, None, 0,
+        ).unwrap();
+        state.database.update_service_key("sk-quota", None, None, Some(10), None).unwrap();
+        let resp = client
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("Content-Type", "application/json")
+            .header("x-api-key", raw_key)
+            .body(r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 429);
+        // retry-after 应存在且为正值（在消费 body 之前读取）
+        let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok());
+        assert!(retry_after.is_some(), "429 应携带 retry-after 头");
+        assert!(retry_after.unwrap().parse::<i64>().unwrap() > 0);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "quota_error");
+
+        // /v1/user/balance：CCSwitch TokenPlan（ZenMux 分支）兼容格式
+        // （5h 设限 → quota_5_hour；7d 未设限 → 字段省略）
+        let resp = client
+            .get(format!("http://{}/v1/user/balance", addr))
+            .header("x-api-key", raw_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let zm: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(zm["success"], true);
+        assert_eq!(zm["data"]["quota_5_hour"]["usage_percentage"], 1.5);
+        assert!(
+            zm["data"]["quota_5_hour"]["resets_at"].as_str().unwrap().contains("T"),
+            "resets_at 应为 ISO 字符串（CCSwitch 用 as_str 解析）"
+        );
+        assert!(zm["data"].get("quota_7_day").is_none(), "未设限窗口应省略");
     }
 }

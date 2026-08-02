@@ -20,6 +20,7 @@ use crate::gateway::server::AppState;
 
 use super::auth::verify_service_key;
 use super::key_rotation::{pick_key_for, update_key_health};
+use super::quota::check_quota;
 use super::route::resolve_route;
 use super::upstream::forward_upstream_error;
 use super::websearch::{has_websearch_tool, run_websearch_loop};
@@ -30,7 +31,7 @@ pub async fn proxy_anthropic_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Response, (StatusCode, Json<Value>)> {
+) -> Result<Response, (StatusCode, HeaderMap, Json<Value>)> {
     let trace_id = Uuid::new_v4().to_string();
     let start_time = Instant::now();
 
@@ -63,15 +64,22 @@ pub async fn proxy_anthropic_messages(
             warn!(trace_id = %trace_id, "Authentication failed: invalid API key");
             return Err((
                 StatusCode::UNAUTHORIZED,
+                HeaderMap::new(),
                 Json(json!({"error": {"type": "authentication_error", "message": "Invalid API key"}})),
             ))
         }
     };
+    // 滚动窗口 token 配额（5h / 7d），任一窗口触顶即 429（quota_error + retry-after，message 含重置时间）。
+    if let Err((code, headers, body)) = check_quota(&state, &service_key).await {
+        warn!(trace_id = %trace_id, service_key_id = %service_key.id, "Quota exceeded for service key");
+        return Err((code, headers, body));
+    }
     // Enforce allowed_models whitelist (empty = allow all). Clients must use the alias.
     if !service_key.allowed_models.is_empty() && !service_key.allowed_models.iter().any(|m| m == &model_name) {
         warn!(trace_id = %trace_id, model = %model_name, "Model not allowed for this service key");
         return Err((
             StatusCode::FORBIDDEN,
+            HeaderMap::new(),
             Json(json!({"error": {"type": "forbidden", "message": "Model not allowed for this service key"}})),
         ));
     }
@@ -90,6 +98,7 @@ pub async fn proxy_anthropic_messages(
             warn!(trace_id = %trace_id, model = %model_name, "Model not found or not available");
             return Err((
                 StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
                 Json(json!({"error": {"type": "invalid_request_error", "message": "Model not found or not available"}})),
             ))
         }
@@ -153,6 +162,7 @@ pub async fn proxy_anthropic_messages(
                 None => {
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
+                        HeaderMap::new(),
                         Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
                     ));
                 }
@@ -166,6 +176,7 @@ pub async fn proxy_anthropic_messages(
                 None => {
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
+                        HeaderMap::new(),
                         Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
                     ));
                 }
@@ -210,6 +221,7 @@ pub async fn proxy_anthropic_messages(
                 );
                 return Err((
                     StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
                     Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
                 ));
             }
@@ -231,6 +243,7 @@ pub async fn proxy_anthropic_messages(
                 );
                 return Err((
                     StatusCode::GATEWAY_TIMEOUT,
+                    HeaderMap::new(),
                     Json(json!({"error": {"type": "api_error", "message": msg}})),
                 ));
             }
@@ -495,7 +508,7 @@ pub async fn proxy_openai_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<Response, (StatusCode, Json<Value>)> {
+) -> Result<Response, (StatusCode, HeaderMap, Json<Value>)> {
     let trace_id = Uuid::new_v4().to_string();
     let start_time = Instant::now();
 
@@ -524,15 +537,22 @@ pub async fn proxy_openai_chat(
             warn!(trace_id = %trace_id, "Authentication failed: invalid API key");
             return Err((
                 StatusCode::UNAUTHORIZED,
+                HeaderMap::new(),
                 Json(json!({"error": {"type": "authentication_error", "message": "Invalid API key"}})),
             ))
         }
     };
+    // 滚动窗口 token 配额（5h / 7d），任一窗口触顶即 429（quota_error + retry-after，message 含重置时间）。
+    if let Err((code, headers, body)) = check_quota(&state, &service_key).await {
+        warn!(trace_id = %trace_id, service_key_id = %service_key.id, "Quota exceeded for service key");
+        return Err((code, headers, body));
+    }
     // Enforce allowed_models whitelist (empty = allow all). Clients must use the alias.
     if !service_key.allowed_models.is_empty() && !service_key.allowed_models.iter().any(|m| m == &model_name) {
         warn!(trace_id = %trace_id, model = %model_name, "Model not allowed for this service key");
         return Err((
             StatusCode::FORBIDDEN,
+            HeaderMap::new(),
             Json(json!({"error": {"type": "forbidden", "message": "Model not allowed for this service key"}})),
         ));
     }
@@ -551,6 +571,7 @@ pub async fn proxy_openai_chat(
             warn!(trace_id = %trace_id, model = %model_name, "Model not found");
             return Err((
                 StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
                 Json(json!({"error": {"type": "invalid_request_error", "message": "Model not found"}})),
             ))
         }
@@ -606,6 +627,7 @@ pub async fn proxy_openai_chat(
                 None => {
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
+                        HeaderMap::new(),
                         Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
                     ));
                 }
@@ -618,6 +640,7 @@ pub async fn proxy_openai_chat(
                 None => {
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
+                        HeaderMap::new(),
                         Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
                     ));
                 }
@@ -661,6 +684,7 @@ pub async fn proxy_openai_chat(
                 );
                 return Err((
                     StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
                     Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
                 ));
             }
@@ -681,6 +705,7 @@ pub async fn proxy_openai_chat(
                 );
                 return Err((
                     StatusCode::GATEWAY_TIMEOUT,
+                    HeaderMap::new(),
                     Json(json!({"error": {"type": "api_error", "message": msg}})),
                 ));
             }
@@ -930,7 +955,7 @@ pub async fn proxy_openai_chat(
 pub async fn proxy_list_models(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, HeaderMap, Json<Value>)> {
     let api_key = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -943,10 +968,15 @@ pub async fn proxy_list_models(
         None => {
             return Err((
                 StatusCode::UNAUTHORIZED,
+                HeaderMap::new(),
                 Json(json!({"error": {"type": "authentication_error", "message": "Invalid API key"}})),
             ))
         }
     };
+    // 列表端点同样受配额约束：超限时模型列表不可用。
+    if let Err((code, headers, body)) = check_quota(&state, &service_key).await {
+        return Err((code, headers, body));
+    }
 
     let conn = state.database.conn();
 
@@ -961,6 +991,7 @@ pub async fn proxy_list_models(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
+                HeaderMap::new(),
                 Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
             )
         })?;
@@ -980,6 +1011,7 @@ pub async fn proxy_list_models(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
+                HeaderMap::new(),
                 Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
             )
         })?

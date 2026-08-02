@@ -140,16 +140,18 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-28 | **暗色模式** | `theme.ts` + `global.css` |
 | F-29 | **上游模型代理获取（避 CORS）** | `api/handlers/models.rs` |
 | F-30 | **应用设置（websearch 开关）** | `api/handlers/` + `SettingsView.vue` |
+| F-31 | **Token 配额（5h/7d 滚动窗口）** | `api/proxy/quota.rs` + `KeysView.vue` (V14) |
+| F-32 | **余额端点（/v1/user/balance）** | `api/proxy/quota.rs` |
 
 ### 4.4 未实现（计划中）
 
 | ID | 功能 | 计划版本 |
 |----|------|---------|
-| F-31 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
-| F-32 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
-| F-33 | 指数退避重试 | v0.3 |
-| F-34 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
-| F-35 | 自动更新机制 | v1.0 |
+| F-33 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
+| F-34 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
+| F-35 | 指数退避重试 | v0.3 |
+| F-36 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
+| F-37 | 自动更新机制 | v1.0 |
 
 ### 4.5 已知断裂（待修复）
 
@@ -204,6 +206,23 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 - 健康状态纯内存（启动全 green），DB `status` 列保留但不读写
 - 轮询指针持久化到 `settings` 表（`keypool_index_{provider_id}`）
 - 重启后从上次位置继续，而非从 key[0] 开始
+
+---
+
+## 6.1 Token 配额规格（5h / 7d 滚动窗口）
+
+每个 Service Key 可配置两个滚动窗口的 token 上限：**5 小时** 和 **7 天**，默认都是 0（不设限）。
+
+| 项 | 规则 |
+|----|------|
+| 窗口定义 | 滚动窗口，按 Unix 时间对齐（`now % window_secs`），非自然日 |
+| 用量口径 | `prompt + completion + cache_read_input_tokens`，从 usage_log 按需聚合 |
+| 超限判定 | `used >= limit`（limit > 0）即 429；任一窗口触顶即拒绝 |
+| 恢复方式 | 窗口滚动重置后自动恢复，无需人工干预 |
+| 错误响应 | `429` + `retry-after` 头 + `quota_error` 错误体（message 含重置时间） |
+| 查询端点 | `GET /v1/user/balance`（认证同代理端点）返回设限窗口的用量，格式为 CCSwitch ZenMux 兼容：`{"success": true, "data": {"quota_5_hour": {"usage_percentage": 0.43, "resets_at": "..."}, "quota_7_day": {...}}}`；未设限窗口省略字段 |
+
+用途：把单个密钥的消费上限锁住，防止一个密钥把上游额度耗尽；配额在应用内管理页面配置。
 
 ---
 

@@ -64,11 +64,22 @@ data: [DONE]
 }
 ```
 
+**配额超限**（滚动窗口触顶）：
+
+```json
+{
+  "error": {
+    "type": "quota_error",
+    "message": "Quota exceeded for this key (5h window). Resets in 2h31m."
+  }
+}
+```
+
 **状态码**:
 - `400` 请求格式错误（含模型不存在）
 - `401` API key 无效
 - `403` 模型不在白名单
-- `429` 速率限制
+- `429` 速率限制，或 5h/7d 滚动窗口配额超限（`quota_error`，携带 `retry-after` 头）
 - `500` 内部错误
 - `502` 上游 API 错误
 - `503` 无可用密钥
@@ -77,9 +88,10 @@ data: [DONE]
 
 1. **强制 stream=true**: 即使客户端发送 `stream=false`，也会被静默覆写为 `true` 后继续处理（不返回 400）
 2. **模型替换**: 将 `display_name` 替换为上游的 `model_id`
-3. **密钥轮换**: 401/403 标红，402/429 标黄，自动切换下一个 key
-4. **超时控制**: 连接 10s，响应 60s，流间隔 120s
-5. **重试上限**: 最多重试 `key_count` 次，防止死循环
+3. **配额检查**: 认证后先查 5h/7d 滚动窗口配额（`quota.rs::check_quota`），任一窗口触顶返回 429（`quota_error` + `retry-after`，message 含重置时间）
+4. **密钥轮换**: 401/403 标红，402/429 标黄，自动切换下一个 key
+5. **超时控制**: 连接 10s，响应 60s，流间隔 120s
+6. **重试上限**: 最多重试 `key_count` 次，防止死循环
 
 ## 错误处理
 
@@ -87,6 +99,7 @@ data: [DONE]
 |------|------|
 | API key 无效 | 返回 401，不重试 |
 | 模型不存在 | 返回 400，不重试 |
+| 配额超限 | 返回 429 `quota_error` + `retry-after`，不重试 |
 | 上游 401/403 | 标红当前 key，切换下一个，重试 |
 | 上游 402/429 | 标黄当前 key，切换下一个，重试 |
 | 上游 5xx | 不切换 key，直接返回错误 |
@@ -112,6 +125,7 @@ data: [DONE]
 
 - [x] 支持 `/v1/messages` 和 `/v1/chat/completions`
 - [x] 强制流式响应
+- [x] 5h/7d 滚动窗口配额检查（429 `quota_error` + `retry-after`）
 - [x] 密钥轮换（Red/Yellow/Green）
 - [x] 协议转换（Anthropic ↔ OpenAI）
 - [x] 超时控制
