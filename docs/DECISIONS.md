@@ -656,3 +656,52 @@ pub fn resolve_route(state: &AppState, display_name: &str) -> Option<ResolvedRou
 ### 未来改进
 
 如未来需要更细粒度（按模型、按分钟），可在同一聚合函数上加条件扩展。
+
+---
+
+## ADR-016: 统一 HTTP 客户端工厂 + 系统代理自动继承
+
+**日期**: 2026-08-03  
+**状态**: 已接受
+
+### 背景
+
+项目有 6 处出站 HTTP 请求（代理转发、WebSearch Bing 搜索、Provider 适配器、上游模型拉取），各自用 `reqwest::Client::new()` 或 `Client::builder()` 独立构建。国内网络下钉钉 DEAP 等上游需走 Clash 等代理才能连通，但散落构建无法统一注入代理。
+
+### 决策
+
+新增 `http.rs` 模块作为唯一 HTTP 客户端工厂：
+
+1. `system_proxy()`: 解析系统代理，OnceLock 缓存（代理在运行期间几乎不变）
+   - 优先读环境变量（`HTTPS_PROXY` > `HTTP_PROXY` > `ALL_PROXY`，大小写兼容）
+   - Windows 回退到注册表 `HKCU\...\Internet Settings`（ProxyEnable + ProxyServer）
+   - 跳过 PAC（AutoConfigURL）
+2. `build_http_client() -> ClientBuilder`: 返回带系统代理的 builder，调用方可继续链式覆盖 timeout / cookie_store
+3. `http_client() -> Client`: 便捷方法，默认构建
+4. NO_PROXY 默认豁免 `localhost`、`127.0.0.1`、`[::1]`（插件系统上游在本机），并附加环境变量 `NO_PROXY` 的额外项
+
+所有出站 HTTP 请求必须使用工厂方法，不允许直接 `reqwest::Client::new()`。
+
+### 原因
+
+1. **统一代理**：6 处调用点只需改一行就全部接入代理，未来新增出站请求也不会遗漏
+2. **零配置**：Windows 用户配 Clash 系统代理后，xrl-router 自动继承，无需在应用内手动设置
+3. **性能**：OnceLock 缓存代理解析结果，只读一次注册表（`reg query` 调用 ~50ms）
+4. **可测试**：工厂方法返回 builder 而非 final client，调用方可覆盖 timeout 等参数
+
+### 代价
+
+- 代理在应用运行期间不可变（Clash 端口固定，实际无影响）
+- Windows 注册表解析依赖 `reg query` 子进程（仅首次调用，失败时静默回退到无代理）
+- 非 Windows 系统只支持环境变量（无注册表回退，但跨平台标准做法）
+
+### 迁移
+
+6 处调用点已全部替换：
+- `api/proxy/handler.rs` (2 处): `reqwest::Client::builder()` → `crate::http::build_http_client()`
+- `api/proxy/websearch.rs` (1 处): `reqwest::Client::builder()` → `crate::http::build_http_client()`
+- `api/handlers/models.rs` (1 处): `reqwest::Client::new()` → `crate::http::http_client()`
+- `providers/anthropic.rs` (1 处): `Client::new()` → `crate::http::http_client()`
+- `providers/openai.rs` (1 处): `Client::new()` → `crate::http::http_client()`
+- `search/bing.rs` (1 处): `reqwest::Client::builder()` → `crate::http::build_http_client()`
+

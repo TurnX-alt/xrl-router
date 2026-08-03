@@ -14,6 +14,7 @@ src-tauri/src/                 后端 Rust
 ├── lib.rs                     Tauri setup + 数据目录 + master key + DB + 系统托盘 + 网关启动
 ├── config.rs                  环境变量配置
 ├── error.rs                   AppError 统一错误类型
+├── http.rs                    统一 HTTP 客户端工厂（系统代理自动继承）
 ├── crypto/mod.rs              AES-256-GCM + Argon2 + master key
 ├── gateway/server.rs          AppState + start_gateway + CORS
 ├── api/
@@ -31,6 +32,8 @@ src-tauri/src/                 后端 Rust
 ├── models/mod.rs              ModelRegistry
 ├── middleware/rate_limit.rs   令牌桶限流
 ├── search/bing.rs             Bing 搜索（WebSearch 劫持用）
+
+> **HTTP 客户端**：所有出站 HTTP 请求**必须**使用 `http::build_http_client()` 或 `http::http_client()`，**不要**直接 `reqwest::Client::new()` 或 `reqwest::Client::builder()`。统一工厂自动继承系统代理（环境变量 → Windows 注册表），`localhost`/`127.0.0.1` 自动豁免直连。
 
 src/                           前端 Vue 3
 ├── main.ts / App.vue / router.ts
@@ -149,7 +152,7 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 |---------|---------|
 | 新增 API 端点 | `api/router.rs`、`api/handlers/` 任一文件看模式 |
 | 新增 DB 表/列 | `db/schema.rs`（追加迁移）、`db/mod.rs`（UPSERT 测试） |
-| 修改代理逻辑 | `api/proxy/handler.rs`（整个文件）、`api/proxy/translate/` |
+| 修改代理逻辑 | `api/proxy/handler.rs`（整个文件）、`api/proxy/translate/`、`http.rs`（代理配置） |
 | 修改密钥池 | `keys/pool/mod.rs` 注释的锁序规则 |
 | 修改前端 | `src/main.ts`（MD3 导入模式）、`src/styles/global.css`（design tokens） |
 | 新增插件消息 | `plugin/types.rs`、`plugin/registry.rs` |

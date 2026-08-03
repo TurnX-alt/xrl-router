@@ -50,6 +50,7 @@ main.rs
        ├─ config.rs          环境变量 → Config
        ├─ error.rs           AppError 统一错误类型 (thiserror)
        ├─ crypto/mod.rs      AES-256-GCM + Argon2 + master key
+       ├─ http.rs            统一 HTTP 客户端工厂（系统代理自动继承）
        ├─ db/                SQLite 封装
        │    ├─ mod.rs         Database 结构体 + WAL + migrate()
        │    ├─ schema.rs      MIGRATIONS 数组 (V1→V14)
@@ -81,6 +82,10 @@ main.rs
                       └─ to_anthropic.rs (OpenAI → Anthropic)
 
 独立模块（被 handler/proxy 使用）：
+  ├─ http.rs             统一 HTTP 客户端工厂（系统代理自动继承）
+  │    ├ system_proxy()  解析环境变量 → Windows 注册表，OnceLock 缓存
+  │    ├ build_http_client()  返回带代理的 reqwest ClientBuilder
+  │    └ http_client()   便捷方法：默认构建
   ├─ providers/          Provider 适配器
   │    ├─ adapter.rs     Adapter async trait (chat/chat_stream/health_check)
   │    ├─ anthropic.rs   AnthropicAdapter 实现
@@ -154,6 +159,7 @@ main.rs
   ▼
 [8] 密钥轮询重试循环 (key_rotation.rs)
   │  pick_key_for() → round-robin, 跳过 Red/Yellow
+  │  http::build_http_client() → 自动继承系统代理
   │  发送请求 → 60s 头超时
   │  401/403 → mark_key_invalid(Red) → 换 key 重试
   │  402/429 → mark_key_low_quota(Yellow) → 换 key 重试
@@ -274,7 +280,7 @@ src/
 管理 API (/api/*)
   - 无认证
   - 绑定 127.0.0.1 (仅本机)
-  - CORS origin 白名单（6 个：localhost/127.0.0.1:5173/19068 + tauri://localhost + https://tauri.localhost）
+  - CORS origin 白名单（7 个：localhost/127.0.0.1:5173/19068 + tauri://localhost + https://tauri.localhost + http://tauri.localhost）
   - 由 Tauri WebView 直接访问
 
 **已知问题**: 前端 `api.ts` 定义了 `dashboardApi`（`/api/dashboard/overview`、`/api/dashboard/usage`），`stores/dashboard.ts` 也在使用，但后端 `router.rs` 未注册这两条路由。
@@ -303,12 +309,15 @@ xrl-router
   ├── Tauri 2          桌面框架 (WebView + 系统托盘)
   ├── axum 0.7         HTTP 框架
   ├── tokio            异步运行时
-  ├── reqwest 0.12     HTTP 客户端 (流式 SSE)
   ├── rusqlite 0.32    SQLite (bundled)
   ├── aes-gcm 0.10     Provider Key 加密
   ├── argon2 0.5       Service Key 哈希
   ├── dashmap 6        并发 HashMap
   ├── tracing          结构化日志 (JSON)
+  │
+  │  网络基础设施
+  ├── reqwest 0.12     HTTP 客户端 (流式 SSE, cookie 复用, 系统代理继承)
+  ├── scraper 0.20     HTML 解析 (Bing 搜索结果提取)
   │
   │  前端
   ├── Vue 3            UI 框架
