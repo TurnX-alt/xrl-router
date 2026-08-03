@@ -705,3 +705,43 @@ pub fn resolve_route(state: &AppState, display_name: &str) -> Option<ResolvedRou
 - `providers/openai.rs` (1 处): `Client::new()` → `crate::http::http_client()`
 - `search/bing.rs` (1 处): `reqwest::Client::builder()` → `crate::http::build_http_client()`
 
+---
+
+## ADR-017: 双 listener 分离监听（局域网分发）
+
+**日期**: 2026-08-03  
+**状态**: 已接受
+
+### 背景
+
+需求：让局域网设备通过主机网关使用 Claude Code（install 页面 + 分发链接）。原方案是单 listener 绑 `127.0.0.1:19068`，局域网设备无法访问。
+
+### 决策
+
+拆成两个独立 listener：
+
+| listener | 绑定 | 路由 | CORS |
+|----------|------|------|------|
+| **admin** | `127.0.0.1:19068` (`HOST:PORT`) | `/api/*`、`/health`、`/ws`、`/ws/plugin`、`/api/install/local-ip`、`/v1/*` 代理 | origin 白名单（7 个） |
+| **public** | `0.0.0.0:19069` (`PUBLIC_HOST:PUBLIC_PORT`) | `/install` 静态页、`/v1/*` 代理 | 全开 (Any) |
+
+- `router.rs` 拆出 `build_admin_router` / `build_public_router`，`/v1/*` 由共享 `proxy_routes(state)` 构建（套 `rate_limit_middleware`），两边各自 merge；`build_router` 保留为 admin 别名（`lib.rs` 与冒烟测试沿用）
+- `Config` 新增 `public_host` / `public_port` / `enable_public`，环境变量 `PUBLIC_HOST` / `PUBLIC_PORT` / `ENABLE_PUBLIC` 覆盖
+
+### 原因
+
+1. **admin 必须保留 `/v1/*`（兼容）**：拆双端口前 `/v1/*` 就在 19068 上，本机既有客户端（CC Switch 等直连 19068 取模型列表/余额）拆走会 404 而坏。admin 是「本机既有面」的超集
+2. **单独公共端口而非放开 admin 端口**：0.0.0.0 会同时含 127.0.0.1，若同一端口既做 admin 又做 public 无法用两个 listener 绑；更重要的是管理端点（`/api/*` 无认证）绝不能出现在局域网暴露面上。独立端口 + 独立 router 从结构上保证隔离
+3. **public CORS 全开**：CLI 客户端（Claude Code）无 origin 约束，install 页面同源（19069 自身），白名单没有意义
+4. **install 页面编译进二进制**（`include_str!`）：零运行时文件依赖，不引入静态文件服务器
+
+### 代价
+
+- 两个端口都要维护、都要在防火墙放行（局域网分发需放行 19069）
+- `/v1/*` 同一份路由挂两处，新增代理端点时需记得两处都挂（AGENTS.md 已注明）
+- `0.0.0.0:19069` 向局域网暴露：任何人可调 `/v1/*`（需有效 key）、可看 `/install`（无 key 仅提示页）。密钥明文嵌在分发 URL 里，局域网嗅探可见——接受此风险，分发 key 即普通 service key，撤销即在密钥列表删除
+
+### 未来改进
+
+- 若需公网访问（不在设计内），应做 TLS + 反向代理，而不是放开 public listener 到公网
+

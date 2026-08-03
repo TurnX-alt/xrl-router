@@ -1,6 +1,7 @@
 //! Axum handler 按实体分组。各 handler 为 `pub(crate)`，由 `router` 引用。
 
 pub mod health;
+pub mod install;
 pub mod keys;
 pub mod models;
 pub mod plugin;
@@ -10,6 +11,7 @@ pub mod stats;
 pub mod websocket;
 
 pub(crate) use health::health_check;
+pub(crate) use install::{get_local_ip, serve_install_page};
 pub(crate) use keys::{create_key, delete_key, get_key, list_keys, update_key};
 pub(crate) use models::{create_model, delete_model, get_model, list_models, proxy_fetch_models, update_model};
 pub(crate) use plugin::{confirm_plugin, delete_plugin, get_plugin, list_plugins, plugin_ws_handler};
