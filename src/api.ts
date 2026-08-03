@@ -207,3 +207,8 @@ export const settingsApi = {
   update: (data: { websearch_hijack?: boolean }) =>
     request<{ status: string }>('/api/settings', { method: 'PUT', body: data }),
 };
+
+// --- Install（局域网分发）---
+export const installApi = {
+  localIp: () => request<{ ip: string | null }>('/api/install/local-ip'),
+};

@@ -98,11 +98,17 @@
       <div slot="headline">密钥已创建 — 仅显示一次</div>
       <div slot="content" class="form">
         <p class="warn md-typescale-body-medium"><span class="mdi mdi-alert"></span>请妥善保存，关闭后无法再次查看</p>
+        <p class="md-typescale-body-medium deploy-label">明文密钥</p>
         <div class="key-box mono md-typescale-body-large">{{ newKeyPlain }}</div>
+        <template v-if="deployLink">
+          <p class="md-typescale-body-medium deploy-label">分发链接（含明文密钥，勿公开）</p>
+          <div class="key-box mono md-typescale-body-medium deploy-box">{{ deployLink }}</div>
+        </template>
       </div>
       <div slot="actions">
         <md-text-button @click="copyKey"><span slot="icon" class="mdi mdi-content-copy"></span>复制</md-text-button>
-        <md-filled-button @click="newKeyPlain = ''">完成</md-filled-button>
+        <md-filled-button :disabled="!deployLink" @click="copyDeployLink"><span slot="icon" class="mdi mdi-link-variant"></span>复制分发链接</md-filled-button>
+        <md-text-button @click="newKeyPlain = ''">完成</md-text-button>
       </div>
     </md-dialog>
 
@@ -161,8 +167,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue';
-import { serviceKeysApi, providersApi, modelsApi, type ServiceKey } from '../api';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import { serviceKeysApi, providersApi, modelsApi, installApi, type ServiceKey } from '../api';
 import { wsClient } from '../ws';
 
 type KeyRow = ServiceKey & { used_5h?: number; used_7d?: number };
@@ -172,6 +178,23 @@ const loading = ref(true);
 const createOpen = ref(false);
 const newName = ref('');
 const newKeyPlain = ref('');
+// 分发链接：本机 IP + 公共端口 + 明文 key。newKeyPlain 有值时拉取本机 IP。
+const localIp = ref<string | null>(null);
+const PUBLIC_PORT = 19069;
+const deployLink = computed(() => {
+  if (!newKeyPlain.value || !localIp.value) return '';
+  return `http://${localIp.value}:${PUBLIC_PORT}/install?t=${newKeyPlain.value}`;
+});
+watch(newKeyPlain, async (v) => {
+  if (v && !localIp.value) {
+    try {
+      const r = await installApi.localIp();
+      if (r.ip) localIp.value = r.ip;
+    } catch {
+      // 取不到 IP 时 deployLink 留空，仅显示明文 key
+    }
+  }
+});
 
 const permOpen = ref(false);
 const editingKey = ref<ServiceKey | null>(null);
@@ -313,6 +336,10 @@ async function createKey() {
   }
 }
 async function copyKey() { try { await navigator.clipboard.writeText(newKeyPlain.value); } catch {} }
+async function copyDeployLink() {
+  if (!deployLink.value) return;
+  try { await navigator.clipboard.writeText(deployLink.value); } catch {}
+}
 const deleteOpen = ref(false);
 const deleteTarget = ref<ServiceKey | null>(null);
 function openDeleteMenu(k: ServiceKey) {
@@ -426,6 +453,8 @@ onUnmounted(() => {
 .field { width: 100%; }
 .warn { display: flex; align-items: center; gap: 8px; color: var(--md-sys-color-on-error-container); background: var(--md-sys-color-error-container); padding: 12px; border-radius: var(--md-sys-shape-corner-small); margin: 0; }
 .key-box { background: var(--md-sys-color-surface-container-high); padding: 16px; border-radius: var(--md-sys-shape-corner-medium); word-break: break-all; border: 1px solid var(--md-sys-color-outline-variant); }
+.deploy-label { margin: 4px 0 0; color: var(--md-sys-color-on-surface-variant); }
+.deploy-box { font-size: 0.75rem; }
 .perm-desc { color: var(--md-sys-color-on-surface-variant); margin: 0; }
 .perm-list { max-height: 300px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
 .perm-provider-label { color: var(--md-sys-color-on-surface-variant); padding: 8px 0 4px; border-top: 1px solid var(--md-sys-color-outline-variant); margin-top: 4px; }

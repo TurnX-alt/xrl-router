@@ -4,7 +4,7 @@
 
 ## 项目范围
 
-xrl-router 是一个**单用户本地 LLM API 网关**，以 Tauri 2 桌面应用形式运行。Rust 后端（`src-tauri/src/`）跑 axum HTTP 服务在 `127.0.0.1:19068`，Vue 3 前端（`src/`）跑在 Tauri WebView 里。所有数据存本地 SQLite。
+xrl-router 是一个**单用户本地 LLM API 网关**，以 Tauri 2 桌面应用形式运行。Rust 后端（`src-tauri/src/`）跑 axum HTTP 服务：**admin listener 绑 `127.0.0.1:19068`**（管理 API + 本机 `/v1/*` 兼容入口），**public listener 绑 `0.0.0.0:19069`**（局域网 install 页面 + `/v1/*` 代理，`enable_public` 控制）。Vue 3 前端（`src/`）跑在 Tauri WebView 里。所有数据存本地 SQLite。
 
 ## 代码组织
 
@@ -16,10 +16,10 @@ src-tauri/src/                 后端 Rust
 ├── error.rs                   AppError 统一错误类型
 ├── http.rs                    统一 HTTP 客户端工厂（系统代理自动继承）
 ├── crypto/mod.rs              AES-256-GCM + Argon2 + master key
-├── gateway/server.rs          AppState + start_gateway + CORS
+├── gateway/server.rs          AppState + start_gateway (双 listener) + CORS
 ├── api/
-│   ├── router.rs              axum 路由表（唯一）
-│   ├── handlers/*             管理 API 处理器（按实体分文件）
+│   ├── router.rs              axum 路由表（build_admin_router / build_public_router）
+│   ├── handlers/*             管理 API 处理器（按实体分文件；install.rs 托管 /install 页面）
 │   └── proxy/*                LLM 代理核心（handler/auth/quota/route/key_rotation/upstream/websearch/sniff/translate）
 ├── db/*                       SQLite 封装（mod.rs + schema.rs + 按实体分文件）
 ├── types/*                    数据结构定义（Provider/Model/ApiKey/Chat/Route/...）
@@ -37,12 +37,14 @@ src-tauri/src/                 后端 Rust
 
 src/                           前端 Vue 3
 ├── main.ts / App.vue / router.ts
-├── api.ts                     REST 客户端（BASE_URL 硬编码为 http://localhost:19068）
+├── api.ts                     REST 客户端（BASE_URL 硬编码为 http://localhost:19068，含 installApi）
 ├── ws.ts                      WebSocket 客户端（自动重连 3s）
 ├── theme.ts                   明/暗主题（localStorage 持久化）
 ├── views/*                    5 个页面（Providers/ProviderNew/Keys/Stats/Settings）
 ├── components/*               AppShell / ConnectionStatus / PluginRegisterDialog
 └── stores/*                   4 个 Pinia stores（providers/keys/models/dashboard）
+
+src-tauri/assets/install.html   局域网 install 静态页（include_str! 编译进二进制）
 
 docs/                          文档（本目录）
 ```
@@ -82,6 +84,15 @@ docs/                          文档（本目录）
 - **轮询指针**持久化到 `settings` 表（键名 `keypool_index_{provider_id}`）
 - 锁序生死攸关：`keys/pool/mod.rs` 注释里有详细规则，违反会跟插件的 `keys_update` 形成 ABBA 死锁
 
+### 双 listener 分离监听（双端口架构）
+
+- **admin**（`127.0.0.1:19068`，`Config.host/port`）：全部 `/api/*` 管理 + `/health` + `/ws` + `/ws/plugin` + `/v1/*` 代理。CORS 用 origin 白名单
+- **public**（`0.0.0.0:19069`，`Config.public_host/public_port`）：`/install` 静态页 + `/v1/*` 代理。CORS 全开。`enable_public` 为 false 时不启动
+- `/v1/*` 由 `router.rs` 的共享 `proxy_routes(state)` 构建（套 `rate_limit_middleware`），admin 与 public 各自 merge —— 返回未 with_state 的 `Router<AppState>`，由调用方 `.with_state` 统一收敛
+- **admin 必须保留 `/v1/*`**：拆双端口前 `/v1/*` 就在 19068 上，本机既有客户端（CC Switch 等直连 19068）取模型列表/余额，拆走会 404 而坏。新增 `/v1/*` 端点时两个 router 都要挂
+- **新增公共端点**：只有「局域网设备该访问」的路由才挂 public router；任何管理/密钥读写端点严禁上 public
+- **install 页面**：静态 HTML 放 `src-tauri/assets/install.html`，用 `include_str!` 编译进二进制（零运行时文件依赖），`handlers/install.rs` 的 `serve_install_page` 返回。页面契约（`?t=` 明文 key、生成命令的引号约定等）见 `docs/specs/spec-lan-deploy.md`，改页面必须同步该 spec
+
 ### 前端
 
 - UI 用 Material Design 3（`@material/web`），**不要**引入其他组件库
@@ -106,7 +117,8 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 - ❌ **不做 Docker 容器化**。Tauri 是桌面框架，容器化没意义
 - ❌ **不做 CLI 模式（无 GUI）**。Tauri 的 setup 流程依赖 app handle，拆出来工程量大
 - ❌ **不做横向扩展 / 负载均衡**。单实例足够本地场景
-- ❌ **不做远程管理界面**。绑定 `127.0.0.1` 是设计选择，不是待修复的 bug
+- ❌ **不做远程管理界面**。绑定 `127.0.0.1` 是设计选择，不是待修复的 bug。public listener（`0.0.0.0:19069`）只暴露需 key 的 `/v1/*` 代理与无敏感信息的 `/install` 分发页，**管理端点永不对外开放**
+- ❌ **不做公网部署 / 穿透 / TLS**。局域网分发是边界，暴露到公网（内网穿透、云服务器等）不在设计内
 
 ### 功能层面
 
@@ -150,7 +162,9 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 
 | 改动类型 | 必读文件 |
 |---------|---------|
-| 新增 API 端点 | `api/router.rs`、`api/handlers/` 任一文件看模式 |
+| 新增 API 端点 | `api/router.rs`（admin/public 两个 router 都挂）、`api/handlers/` 任一文件看模式 |
+| 修改 install 页面 | `src-tauri/assets/install.html`（include_str! 编译进二进制）+ `docs/specs/spec-lan-deploy.md` 契约 |
+| 修改网关启动/监听 | `gateway/server.rs`（双 listener）+ `config.rs` |
 | 新增 DB 表/列 | `db/schema.rs`（追加迁移）、`db/mod.rs`（UPSERT 测试） |
 | 修改代理逻辑 | `api/proxy/handler.rs`（整个文件）、`api/proxy/translate/`、`http.rs`（代理配置） |
 | 修改密钥池 | `keys/pool/mod.rs` 注释的锁序规则 |

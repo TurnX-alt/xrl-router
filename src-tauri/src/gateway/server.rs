@@ -9,7 +9,7 @@ use anyhow::Result;
 use axum::http::HeaderValue;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{error, info};
 
 /// Shared application state accessible by all handlers.
 #[derive(Clone)]
@@ -70,18 +70,14 @@ impl AppState {
 }
 
 /// Start the gateway HTTP server as a background service.
+///
+/// 双 listener 分离监听：管理 Router 绑 127.0.0.1:port（仅本机访问 /api/* 管理
+/// 与密钥端点），公共 Router 绑 0.0.0.0:public_port（install 页面 + /v1/* 代理，
+/// 供局域网设备访问）。两端口分离避免 0.0.0.0 含 127.0.0.1 的绑定冲突。
 pub async fn start_gateway(state: Arc<AppState>) -> Result<()> {
     let cors = build_cors_layer(&state.config);
 
-    let addr = state.config.addr();
-
-    // Build the full router with all endpoints
-    let router = crate::api::build_router(state.clone());
-
-    let app = router.layer(cors);
-
-    // Spawn a periodic task that signals the stats page to refetch every 5s.
-    // (Key counts already broadcast on change via pool.rs — no need to repeat here.)
+    // 既有后台 task：每 5s 广播 usage_stats_changed（Key counts 已在 pool.rs 按变更广播）
     {
         let tx = state.key_stats_tx.clone();
         tokio::spawn(async move {
@@ -96,7 +92,7 @@ pub async fn start_gateway(state: Arc<AppState>) -> Result<()> {
         });
     }
 
-    // Spawn plugin heartbeat checker: every 30s, disconnect stale plugins (>90s no heartbeat).
+    // 既有后台 task：每 30s 检查插件心跳，断开 >90s 无心跳的插件
     {
         let plugins = state.plugins.clone();
         tokio::spawn(async move {
@@ -108,10 +104,32 @@ pub async fn start_gateway(state: Arc<AppState>) -> Result<()> {
         });
     }
 
-    info!("Gateway server listening on http://{}", addr);
+    // 管理 listener：127.0.0.1，承载全部 /api/* + /health + /ws（CORS 用白名单）
+    {
+        let admin_router = crate::api::build_admin_router(state.clone()).layer(cors);
+        let admin_addr = state.config.addr();
+        let listener = tokio::net::TcpListener::bind(&admin_addr).await?;
+        info!("Admin listener on http://{}", admin_addr);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, admin_router).await {
+                error!("Admin listener error: {}", e);
+            }
+        });
+    }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    // 公共 listener：0.0.0.0，承载 /install + /v1/*（CORS 全开——CLI 无 origin 约束、install 同源）
+    if state.config.enable_public {
+        let public_router = crate::api::build_public_router(state.clone())
+            .layer(CorsLayer::new().allow_methods(Any).allow_headers(Any).allow_origin(Any));
+        let public_addr = state.config.public_addr();
+        let listener = tokio::net::TcpListener::bind(&public_addr).await?;
+        info!("Public listener on http://{}", public_addr);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, public_router).await {
+                error!("Public listener error: {}", e);
+            }
+        });
+    }
 
     Ok(())
 }
@@ -142,8 +160,10 @@ mod tests {
     use crate::config::Config;
 
     /// 端到端冒烟测试：真实 TCP 起网关，实测四条路径。
-    /// 覆盖 build_router → handlers/* → proxy 认证 → AppState（DB 迁移、
+    /// 覆盖 build_admin_router → handlers/* → proxy 认证 → AppState（DB 迁移、
     /// providers/models 注册表、密钥池、插件管理器）的完整拆分后链路。
+    /// admin router 已含 /v1/*（本机兼容入口），故单用 admin 即可测全链路；
+    /// 另起 public router 验证 /install 静态页。
     #[tokio::test]
     async fn test_gateway_smoke_end_to_end() {
         let db = Database::open_in_memory().unwrap();
@@ -154,7 +174,7 @@ mod tests {
             ..Default::default()
         };
         let state = Arc::new(AppState::new(config, db, [7u8; 32]));
-        let router = crate::api::build_router(state.clone());
+        let router = crate::api::build_admin_router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -254,5 +274,24 @@ mod tests {
             "resets_at 应为 ISO 字符串（CCSwitch 用 as_str 解析）"
         );
         assert!(zm["data"].get("quota_7_day").is_none(), "未设限窗口应省略");
+
+        // /install：public router 静态页（独立 listener 验证，防与 admin merge 冲突）
+        let pub_state = state.clone();
+        let pub_router = crate::api::build_public_router(pub_state);
+        let pub_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pub_addr = pub_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(pub_listener, pub_router).await.unwrap();
+        });
+        for _ in 0..50 {
+            if client.get(format!("http://{}/install", pub_addr)).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let resp = client.get(format!("http://{}/install", pub_addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let html = resp.text().await.unwrap();
+        assert!(html.contains("快速部署"), "/install 应返回 install 页面 HTML");
     }
 }

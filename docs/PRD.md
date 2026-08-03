@@ -92,6 +92,13 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 4. 用户确认 → 委托供应商自动激活
 5. 密钥自动同步，可直接在 Claude Code 中使用 DEAP 模型
 
+**场景 D：局域网设备快速接入**
+1. 主机在「密钥管理」页创建密钥 → 弹窗显示明文密钥 + 分发链接
+2. 把分发链接发给局域网设备（手机/另一台电脑）
+3. 设备浏览器打开链接 → 按平台显示一行命令（装 CLI + 写配置）
+4. 设备复制命令到终端执行一次
+5. 设备上的 Claude Code 直接通过主机网关使用所有模型，主机统计页可见流量
+
 ---
 
 ## 4. 功能需求
@@ -144,16 +151,18 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-32 | **余额端点（/v1/user/balance）** | `api/proxy/quota.rs` |
 | F-33 | **系统代理自动继承（http.rs 统一工厂）** | `http.rs` |
 | F-34 | **ConnectionStatus 绝对路径修复** | `ConnectionStatus.vue` |
+| F-35 | **局域网分发（install 页面 + 分发链接）** | `api/handlers/install.rs` + `assets/install.html` + `KeysView.vue` |
+| F-36 | **双 listener 分离监听（admin/public）** | `gateway/server.rs` + `api/router.rs` + `config.rs` |
 
 ### 4.4 未实现（计划中）
 
 | ID | 功能 | 计划版本 |
 |----|------|---------|
-| F-35 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
-| F-36 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
-| F-37 | 指数退避重试 | v0.3 |
-| F-38 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
-| F-39 | 自动更新机制 | v1.0 |
+| F-37 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
+| F-38 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
+| F-39 | 指数退避重试 | v0.3 |
+| F-40 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
+| F-41 | 自动更新机制 | v1.0 |
 
 ### 4.5 已知断裂（待修复）
 
@@ -244,6 +253,23 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 
 ---
 
+## 7.1 局域网分发规格（install 页面 + 双 listener）
+
+把本机网关能力延伸到局域网设备：浏览器沙箱无法直接装 CLI、写客户端配置，所以 install 页面生成「一行命令」让用户在终端执行一次（装 Claude Code CLI + 写 `~/.claude/settings.json` 指向本机网关）。详见 [specs/spec-lan-deploy.md](specs/spec-lan-deploy.md)。
+
+| 项 | 规则 |
+|----|------|
+| 双 listener | admin `127.0.0.1:19068`（管理 API + 本机 `/v1/*` 兼容入口）；public `0.0.0.0:19069`（`/install` + `/v1/*` 代理） |
+| 分发链接 | 密钥管理页创建密钥后弹窗展示：`http://<本机IP>:19069/install?t=<明文key>`，可一键复制 |
+| 本机 IP 来源 | `GET /api/install/local-ip`（UDP socket 连 8.8.8.8:80 取出口 IP，过滤回环） |
+| 页面行为 | 用 `?t=` 里的 key 调 `/v1/models` 取模型别名下拉；按平台（Windows PowerShell / macOS·Linux Bash）生成命令；勾选「已装 CLI」可省略安装段 |
+| 命令内容 | A 段 `npm i -g @anthropic-ai/claude-code`；B 段写 `settings.json`：`env.ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` + 4 模型槽位（`_MODEL`/`_MODEL_NAME` 统一用网关别名）+ `permissions.defaultMode=bypassPermissions`，**保留客户端既有字段** |
+| 安全边界 | 密钥明文嵌入 URL（局域网嗅探可见），只发给可信设备；撤销即在密钥列表删除，立即失效 |
+
+用途：团队成员/多设备快速接入同一网关，无需逐个手写 base URL、token、模型名——复制一条链接即完成 Claude Code 配置。
+
+---
+
 ## 8. 非功能需求
 
 ### 8.1 性能
@@ -264,9 +290,11 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 |------|------|
 | Service Key 存储 | Argon2 哈希（随机盐 + PHC 格式） |
 | Provider Key 存储 | AES-256-GCM 加密（主密钥 `master.key`，权限 0600） |
-| 管理 API | 绑定 `127.0.0.1`，仅本机可访问 |
-| CORS | origin 白名单（localhost + 127.0.0.1 的 5173/19068 双端口 + tauri://localhost + https://tauri.localhost + http://tauri.localhost，共 7 个） |
+| 管理 API | admin listener 绑定 `127.0.0.1:19068`，仅本机可访问 |
+| 公共暴露面 | public listener 绑定 `0.0.0.0:19069`，只暴露 `/v1/*`（需 key 鉴权）与 `/install`（无 key 仅提示页） |
+| CORS | admin origin 白名单（localhost + 127.0.0.1 的 5173/19068 双端口 + tauri://localhost + https://tauri.localhost + http://tauri.localhost，共 7 个）；public 全开（CLI 无 origin 约束） |
 | 频率限制 | 令牌桶 60 req/min，按 Service Key |
+| 分发密钥 | install URL query 明文嵌入，仅限可信局域网设备，撤销即在密钥列表删除 |
 
 ### 8.3 网络
 

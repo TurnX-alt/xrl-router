@@ -45,14 +45,23 @@ pnpm build
 - **余额查询**：使用 TokenPlan 模板所需的 ZenMux 兼容格式，请求地址 `http://localhost:19068/v1/user/balance?zenmux`，API Key 同上方配置的 API Key
 - **配额**：Service Key 可在「密钥管理」页配置 5h/7d 滚动窗口 token 上限，触顶返回 429（`quota_error` + `retry-after`）
 
+### 局域网分发（install 页面）
+
+把本机变成局域网 API 网关：在「密钥管理」页创建密钥后，弹窗里复制「分发链接」，发给局域网设备打开。页面按平台生成单行命令（装 Claude Code CLI + 写 `~/.claude/settings.json` 指向本机网关），复制到终端运行一次即可。详见 [docs/specs/spec-lan-deploy.md](docs/specs/spec-lan-deploy.md)。
+
+> 网关双端口：管理端口 `19068` 仅本机（`127.0.0.1`），公共端口 `19069` 绑 `0.0.0.0` 供局域网设备访问 `/install` 与 `/v1/*`。局域网分发需放行防火墙 19069 端口。
+
 ### 配置
 
 通过环境变量（均有默认值）：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `PORT` | `19068` | HTTP 监听端口 |
-| `HOST` | `127.0.0.1` | 绑定地址 |
+| `PORT` | `19068` | 管理 HTTP 监听端口 |
+| `HOST` | `127.0.0.1` | 管理绑定地址 |
+| `PUBLIC_HOST` | `0.0.0.0` | 公共监听绑定地址（局域网分发） |
+| `PUBLIC_PORT` | `19069` | 公共监听端口（install 页面 + `/v1/*` 代理） |
+| `ENABLE_PUBLIC` | `true` | 是否启用公共 listener（`1`/`true`） |
 | `DB_PATH` | _(系统数据目录)_ | SQLite 文件路径 |
 | `LOG_LEVEL` | `info` | 日志级别 |
 | `API_KEY` | _(无)_ | 预留 API Key 字段（当前未启用认证） |
@@ -79,7 +88,11 @@ pnpm build
 
 - Provider API Key: **AES-256-GCM** 加密存储，主密钥独立于数据库（`master.key`，权限 0600）
 - Service Key: **Argon2** 哈希存储（随机盐），创建时仅返回一次明文
-- 管理 API 绑定 `127.0.0.1`，CORS origin 白名单
+- 管理 API 绑定 `127.0.0.1`（admin listener），CORS origin 白名单；公共 listener（`0.0.0.0`）只暴露 `/v1/*`（需 key 鉴权）与 `/install` 页面，管理接口局域网不可达
+
+### 局域网分发（install 页面）
+
+密钥管理页创建密钥后可复制「分发链接」（`http://<本机IP>:19069/install?t=<明文key>`），局域网设备打开即得按平台生成的一行命令：装 Claude Code CLI + 写 `~/.claude/settings.json`（`ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` 指向网关，模型别名走下拉选择）。密钥明文嵌入 URL，仅限可信设备，撤销即在密钥列表删除。
 
 ### 插件系统
 

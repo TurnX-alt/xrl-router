@@ -15,11 +15,11 @@ xrl-router 是一个 **Tauri 2 桌面应用**，内部跑着一个 Rust axum HTT
 │  ┌───────────────────┐                  ┌──────────────────────────────┐ │
 │  │ ProvidersView     │  HTTP (无认证)   │ /api/providers,keys,models   │ │
 │  │ KeysView          │────────────────▶│ /api/stats,settings,plugins  │ │
-│  │ StatsView         │                  │ /health                      │ │
+│  │ StatsView         │                  │ /health  /api/install/local-ip│ │
 │  │ SettingsView      │  WebSocket       │ /ws (实时推送)               │ │
 │  │                   │═════════════════▶│ /ws/plugin (插件注册)        │ │
 │  └───────────────────┘                  └──────────────────────────────┘ │
-│                                        (同一进程，:19068)                │
+│                                        (同一进程, admin listener :19068)│
 └───────────────────────────────────────────────────────────────────────────┘
 
 外部 LLM 客户端 (Claude Code / 其他)
@@ -28,7 +28,13 @@ xrl-router 是一个 **Tauri 2 桌面应用**，内部跑着一个 Rust axum HTT
     │  POST /v1/messages 或 /v1/chat/completions
     ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│                          xrl-router :19068                                 │
+│                  双 listener 分离监听 (axum)                               │
+│                                                                           │
+│  admin 127.0.0.1:19068      public 0.0.0.0:19069                          │
+│  ├─ /api/* 管理 CRUD        ├─ /install 静态页 (局域网设备)               │
+│  ├─ /health  /ws  /ws/plugin├─ /v1/* 代理 (service key 鉴权)              │
+│  ├─ /api/install/local-ip   └─ 同一套 proxy_routes (rate_limit)           │
+│  └─ /v1/* 代理 (本机兼容)                                                 │
 │                                                                           │
 │  请求入口 → 认证 → 路由解析 → 密钥选取 → 协议转换 → 上游转发 → 流式回传    │
 │                                                                           │
@@ -60,12 +66,13 @@ main.rs
        │    ├─ service_keys.rs Service Key CRUD
        │    ├─ usage.rs       usage_log 查询 + 统计聚合
        │    └─ settings.rs    key-value 设置表
-       ├─ gateway/server.rs  AppState + start_gateway + CORS
+       ├─ gateway/server.rs  AppState + start_gateway (双 listener) + CORS
        └─ api/
-            ├─ router.rs      axum 路由表（唯一入口）
+            ├─ router.rs      axum 路由表 (build_admin_router / build_public_router)
             ├─ handlers/      管理 API
             │    ├─ health.rs, providers.rs, keys.rs, models.rs
             │    ├─ service_keys.rs, stats.rs
+            │    ├─ install.rs  (/install 静态页 + /api/install/local-ip)
             │    ├─ websocket.rs  (/ws 端点)
             │    └─ plugin.rs     (插件 REST + WS)
             └─ proxy/         LLM 代理核心
@@ -105,6 +112,7 @@ main.rs
   │    └─ types.rs        消息类型定义
   ├─ middleware/rate_limit.rs  令牌桶 (60 req/min)
   ├─ search/bing.rs           Bing 搜索 (cn.bing.com)
+  ├─ assets/install.html      局域网 install 静态页 (include_str! 编译进二进制)
   └─ types/                   数据结构定义
        ├─ provider.rs    ProviderKind / ProviderConfig / DelegateKeyConfig
        ├─ model.rs       Capability / ModelTier
@@ -189,7 +197,7 @@ src/
 ├── main.ts            Vue 入口 + MD3 组件按需导入 + 主题初始化
 ├── App.vue            根组件: AppShell + PluginRegisterDialog + router-view
 ├── router.ts          7 条路由 (6 个 lazy-loaded 组件路由 + 1 个 redirect)
-├── api.ts             REST 客户端 (BASE_URL=http://localhost:19068)
+├── api.ts             REST 客户端 (BASE_URL=http://localhost:19068, 含 installApi)
 ├── ws.ts              WebSocket 客户端 (自动重连 3s, 事件 pub/sub)
 ├── theme.ts           明/暗主题 (localStorage 持久化)
 │
@@ -239,6 +247,7 @@ src/
 ┌─ 文件系统 ────────────────────────────────────────┐
 │  master.key       AES-256-GCM 主密钥 (权限 0600)  │
 │  xrl-router.db    SQLite 数据库                   │
+│  assets/install.html  编译进二进制的 install 页面  │
 └───────────────────────────────────────────────────┘
 
 ┌─ 纯内存 ──────────────────────────────────────────┐
@@ -256,7 +265,7 @@ src/
 ## 6. 安全边界
 
 ```
-                    外部客户端
+                    外部客户端 (本机 + 局域网设备)
                         │
             ┌───────────┼───────────────┐
             │     Service Key 认证      │
@@ -276,14 +285,18 @@ src/
                         │
                         ▼
                     上游 LLM API
+```
 
-管理 API (/api/*)
-  - 无认证
-  - 绑定 127.0.0.1 (仅本机)
-  - CORS origin 白名单（7 个：localhost/127.0.0.1:5173/19068 + tauri://localhost + https://tauri.localhost + http://tauri.localhost）
-  - 由 Tauri WebView 直接访问
+### 6.1 双 listener 分离监听
 
-**已知问题**: 前端 `api.ts` 定义了 `dashboardApi`（`/api/dashboard/overview`、`/api/dashboard/usage`），`stores/dashboard.ts` 也在使用，但后端 `router.rs` 未注册这两条路由。
+| listener | 绑定 | 路由 | 访问方 | CORS |
+|----------|------|------|--------|------|
+| admin | `127.0.0.1:19068` (`HOST:PORT`) | `/api/*`、`/health`、`/ws`、`/ws/plugin`、`/api/install/local-ip`、`/v1/*` 代理 | Tauri WebView、本机既有客户端 (CC Switch 等) | origin 白名单（7 个） |
+| public | `0.0.0.0:19069` (`PUBLIC_HOST:PUBLIC_PORT`) | `/install` 静态页、`/v1/*` 代理 | 局域网设备 | 全开 (Any) |
+
+- `/v1/*` 由共享 `proxy_routes()` 构建（套 `rate_limit_middleware`），admin 与 public 各自 merge —— admin 保留 `/v1/*` 是兼容要求：拆双端口前 `/v1/*` 就在 19068 上，本机既有客户端直连 19068 取模型/余额，拆走会 404 而坏
+- public listener 由 `enable_public` 控制（默认开启），`/install` 无 key 时仅显示提示页
+- **已知问题**: 前端 `api.ts` 定义了 `dashboardApi`（`/api/dashboard/overview`、`/api/dashboard/usage`），`stores/dashboard.ts` 也在使用，但后端 `router.rs` 未注册这两条路由。
 ```
 
 ---
@@ -297,7 +310,7 @@ src/
 | 密钥状态纯内存 | 减少 DB 写入开销，启动全 green 可接受 |
 | 轮询指针持久化 | 重启后跳过已失效的 key |
 | usage_log 无 FK | 删除 Provider/Model/Key 不影响历史统计 |
-| 管理 API 无认证 | 127.0.0.1 绑定是安全模型，本机进程访问是接受的代价 |
+| 管理 API 无认证 | admin listener 绑 127.0.0.1 是安全模型，本机进程访问是接受的代价；public listener 只暴露需 key 的 `/v1/*` 与无敏感信息的 `/install` |
 | 协议转换不丢特性 | 不兼容的要显式转换 + warn 日志，不静默丢弃 |
 
 ---
