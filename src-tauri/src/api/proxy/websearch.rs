@@ -122,7 +122,7 @@ pub(super) async fn run_websearch_loop(
         )
     })?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::build_http_client()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();

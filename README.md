@@ -42,7 +42,7 @@ pnpm build
 - **Base URL**：`http://localhost:19068`
 - **API Key**：在应用内「密钥管理」页创建的 Service Key
 - **模型**：使用应用内配置的模型别名（网关负责路由到真实上游）
-- **余额查询**：使用 TokenPlan 模板所需的 ZenMux 兼容格式，请求地址 `http://zenmux.localhost:19068/v1/user/balance`，API Key 同上方配置的 API Key
+- **余额查询**：使用 TokenPlan 模板所需的 ZenMux 兼容格式，请求地址 `http://localhost:19068/v1/user/balance?zenmux`，API Key 同上方配置的 API Key
 - **配额**：Service Key 可在「密钥管理」页配置 5h/7d 滚动窗口 token 上限，触顶返回 429（`quota_error` + `retry-after`）
 
 ### 配置
@@ -56,7 +56,9 @@ pnpm build
 | `DB_PATH` | _(系统数据目录)_ | SQLite 文件路径 |
 | `LOG_LEVEL` | `info` | 日志级别 |
 | `API_KEY` | _(无)_ | 预留 API Key 字段（当前未启用认证） |
-| `CORS_ORIGINS` | `localhost:5173/19068,127.0.0.1:5173/19068,tauri://localhost,https://tauri.localhost` | 允许的跨域来源（共 6 个） |
+| `CORS_ORIGINS` | `localhost:5173/19068,127.0.0.1:5173/19068,tauri://localhost,https://tauri.localhost,http://tauri.localhost` | 允许的跨域来源（共 7 个） |
+
+**代理**：上游请求自动继承系统代理（环境变量 `HTTPS_PROXY`/`HTTP_PROXY` → Windows 注册表系统代理），`localhost`/`127.0.0.1` 自动豁免直连（插件系统上游在本机）。国内网络下钉钉 DEAP 等上游需走 Clash 等代理才能连通。
 
 首次启动自动在系统应用数据目录创建数据库（14 版迁移）和主密钥文件：
 - macOS: `~/Library/Application Support/im.xrl.router/`

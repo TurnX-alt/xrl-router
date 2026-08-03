@@ -27,6 +27,7 @@ impl Default for Config {
                 "http://127.0.0.1:19068".to_string(),
                 "tauri://localhost".to_string(),
                 "https://tauri.localhost".to_string(),
+                "http://tauri.localhost".to_string(),
             ],
         }
     }

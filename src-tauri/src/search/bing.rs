@@ -19,7 +19,7 @@ pub struct SearchResult {
 // 全局复用的 client：cookie_store 把首页拿到的 cookie 留存，后续搜索请求自动带上，
 // 省掉每次搜索都重新 GET 首页的 ~2s。
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
+    crate::http::build_http_client()
         .user_agent(UA)
         .cookie_store(true)
         .timeout(std::time::Duration::from_secs(10))

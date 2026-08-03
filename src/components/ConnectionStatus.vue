@@ -8,14 +8,14 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue';
-import { connectionState } from '../api.js';
+import { connectionState, BASE_URL } from '../api.js';
 
 const isOnline = ref(connectionState.isOnline);
 let checkInterval: number | null = null;
 
 const retryConnection = async () => {
   try {
-    const response = await fetch('/health');
+    const response = await fetch(`${BASE_URL}/health`);
     if (response.ok) {
       connectionState.isOnline = true;
       isOnline.value = true;

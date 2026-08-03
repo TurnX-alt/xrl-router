@@ -135,7 +135,7 @@ pub async fn proxy_anthropic_messages(
     let upstream_url = resolved.upstream_url.clone();
     let provider_id = resolved.provider_id.clone();
     let model_row_id = resolved.model_row_id.clone();
-    let client = reqwest::Client::builder()
+    let client = crate::http::build_http_client()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();
@@ -600,7 +600,7 @@ pub async fn proxy_openai_chat(
     let upstream_url = resolved.upstream_url.clone();
     let provider_id = resolved.provider_id.clone();
     let model_row_id = resolved.model_row_id.clone();
-    let client = reqwest::Client::builder()
+    let client = crate::http::build_http_client()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();

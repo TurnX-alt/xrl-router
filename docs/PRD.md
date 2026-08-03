@@ -1,6 +1,6 @@
 # xrl-router — 产品需求文档
 
-> 版本: CalVer (tauri 26.8.1) · 更新日期: 2026-08-01
+> 版本: CalVer (tauri 26.8.3) · 更新日期: 2026-08-03
 >
 > 📎 [架构文档](./ARCHITECTURE.md) · [决策记录](./DECISIONS.md) · [规格契约](./specs/)
 
@@ -142,16 +142,18 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-30 | **应用设置（websearch 开关）** | `api/handlers/` + `SettingsView.vue` |
 | F-31 | **Token 配额（5h/7d 滚动窗口）** | `api/proxy/quota.rs` + `KeysView.vue` (V14) |
 | F-32 | **余额端点（/v1/user/balance）** | `api/proxy/quota.rs` |
+| F-33 | **系统代理自动继承（http.rs 统一工厂）** | `http.rs` |
+| F-34 | **ConnectionStatus 绝对路径修复** | `ConnectionStatus.vue` |
 
 ### 4.4 未实现（计划中）
 
 | ID | 功能 | 计划版本 |
 |----|------|---------|
-| F-33 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
-| F-34 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
-| F-35 | 指数退避重试 | v0.3 |
-| F-36 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
-| F-37 | 自动更新机制 | v1.0 |
+| F-35 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
+| F-36 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
+| F-37 | 指数退避重试 | v0.3 |
+| F-38 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
+| F-39 | 自动更新机制 | v1.0 |
 
 ### 4.5 已知断裂（待修复）
 
@@ -263,10 +265,17 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | Service Key 存储 | Argon2 哈希（随机盐 + PHC 格式） |
 | Provider Key 存储 | AES-256-GCM 加密（主密钥 `master.key`，权限 0600） |
 | 管理 API | 绑定 `127.0.0.1`，仅本机可访问 |
-| CORS | origin 白名单（localhost + 127.0.0.1 的 5173/19068 双端口 + tauri://localhost + https://tauri.localhost，共 6 个） |
+| CORS | origin 白名单（localhost + 127.0.0.1 的 5173/19068 双端口 + tauri://localhost + https://tauri.localhost + http://tauri.localhost，共 7 个） |
 | 频率限制 | 令牌桶 60 req/min，按 Service Key |
 
-### 8.3 兼容性
+### 8.3 网络
+
+| 维度 | 要求 |
+|------|------|
+| 系统代理继承 | 出站请求自动继承系统代理（环境变量 → Windows 注册表），`localhost`/`127.0.0.1` 自动豁免直连 |
+| HTTP 客户端 | 统一工厂（`http.rs`），所有出站请求使用 `build_http_client()` / `http_client()` |
+
+### 8.4 兼容性
 
 | 维度 | 要求 |
 |------|------|

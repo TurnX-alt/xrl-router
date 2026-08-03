@@ -13,7 +13,7 @@ pub struct OpenAIAdapter {
 impl OpenAIAdapter {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http::http_client(),
             base_url,
             api_key,
         }

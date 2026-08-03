@@ -16,6 +16,7 @@ mod crypto;
 mod db;
 mod error;
 mod gateway;
+mod http;
 
 mod api;
 mod keys;

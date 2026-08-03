@@ -176,7 +176,7 @@ pub(crate) struct FetchModelsParams {
 /// GET /api/proxy/models?url=&type=&key= — proxy an upstream /models request,
 /// avoiding browser CORS and injecting the API key server-side.
 pub(crate) async fn proxy_fetch_models(Query(params): Query<FetchModelsParams>) -> axum::response::Response {
-    let client = reqwest::Client::new();
+    let client = crate::http::http_client();
     let mut req = client.get(&params.url);
     if let Some(key) = params.key {
         if !key.is_empty() {
