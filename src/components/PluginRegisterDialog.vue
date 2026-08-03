@@ -1,12 +1,12 @@
 <template>
   <md-dialog :open="visible" @closed="onClosed">
-    <div slot="headline">发现插件：{{ providerName }}</div>
+    <div slot="headline">{{ t('plugin.dialog.headline', { name: providerName }) }}</div>
     <form slot="content" method="dialog">
-      <p class="desc">是否将该插件添加为供应商？</p>
+      <p class="desc">{{ t('plugin.dialog.desc') }}</p>
     </form>
     <div slot="actions">
-      <md-text-button @click="cancel">忽略</md-text-button>
-      <md-filled-button @click="confirm">添加供应商</md-filled-button>
+      <md-text-button @click="cancel">{{ t('plugin.dialog.ignore') }}</md-text-button>
+      <md-filled-button @click="confirm">{{ t('plugin.dialog.add') }}</md-filled-button>
     </div>
   </md-dialog>
 </template>
@@ -14,6 +14,7 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useRouter } from 'vue-router';
+import { t } from '../i18n';
 
 const router = useRouter();
 
@@ -48,7 +49,7 @@ async function cancel() {
         method: 'DELETE',
       });
     } catch (e) {
-      console.error('忽略插件失败：', e);
+      console.error(t('plugin.dialog.ignore'), e);
     }
   }
 }

@@ -153,16 +153,22 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-34 | **ConnectionStatus 绝对路径修复** | `ConnectionStatus.vue` |
 | F-35 | **局域网分发（install 页面 + 分发链接）** | `api/handlers/install.rs` + `assets/install.html` + `KeysView.vue` |
 | F-36 | **双 listener 分离监听（admin/public）** | `gateway/server.rs` + `api/router.rs` + `config.rs` |
+| F-37 | **故障转移（Provider Failover）** | `api/proxy/failover.rs` + `api/proxy/handler.rs` + `api/proxy/route.rs` |
+| F-38 | **请求日志分页** | `api/handlers/stats.rs` + `db/usage.rs` + `StatsView.vue` |
+| F-39 | **国际化（zh-CN/en，前端 + 托盘菜单 + install 页）** | `src/i18n/` + `lib.rs` + `assets/install.html` |
+| F-40 | **主题跟随系统（light/dark/system）** | `theme.ts` |
+| F-41 | **开机静默启动（--minimized 驻留托盘）** | `lib.rs` + `tauri-plugin-autostart` |
+| F-42 | **数据导出/导入/重置** | `api/handlers/data.rs` + `db/settings.rs` + `SettingsView.vue` |
 
 ### 4.4 未实现（计划中）
 
 | ID | 功能 | 计划版本 |
 |----|------|---------|
-| F-37 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
-| F-38 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
-| F-39 | 指数退避重试 | v0.3 |
-| F-40 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
-| F-41 | 自动更新机制 | v1.0 |
+| F-43 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
+| F-44 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
+| F-45 | 指数退避重试（failover 已实现 provider 级切换 + 60s 冷却，退避算法未做） | v0.3 |
+| F-46 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
+| F-47 | 自动更新机制 | v1.0 |
 
 ### 4.5 已知断裂（待修复）
 
@@ -237,6 +243,24 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 
 ---
 
+## 6.2 故障转移规格（Provider Failover）
+
+同一模型别名（display_name）配置在多个 Provider 上时，网关按序尝试全部候选，上游故障自动切换，不打断客户端会话。
+
+| 项 | 规则 |
+|----|------|
+| 开关 | 设置页「路由」Tab `failover_enabled`（**默认关闭**，关闭时行为与单 Provider 完全一致） |
+| 候选来源 | `resolve_route_candidates()`：同 display_name 全部 models JOIN providers 行，按 `sort_order ASC, created_at ASC` 排序，按 provider_id 去重，跳过插件离线的委托 provider |
+| 尝试顺序 | 双层循环：外层遍历 provider 候选，内层遍历该 provider 的 key 池；key 级 4xx（401/402/403/429）先耗尽当前 provider 全部 key 才切下一个 |
+| 触发切换 | 上游 5xx / 网络错误 / 响应头超时 → 切下一个候选并标记冷却 |
+| 冷却 | 失败 provider 冷却 60s（纯内存 `provider_cooldowns`，不持久化），2xx 成功立即清除；冷却中直接跳过 |
+| 最终错误码 | 全部候选失败：网络错误 502、响应头超时 504、key 4xx 耗尽透传最后一次上游失败响应、无可用 key 503 |
+| 混合协议 | 候选可混合 Anthropic / OpenAI 类型，请求体骨架循环外预构建，循环内按候选类型选用并覆写 model |
+
+用途：同一模型在多家 Provider 上配置（官方 + 代理镜像）时，一家上游故障自动切换，避免客户端请求失败；60s 冷却防止「每次都先打坏的 provider 再失败一次」。
+
+---
+
 ## 7. 插件系统规格
 
 外部服务通过 WebSocket 注册为「委托供应商」。职责分工：
@@ -295,6 +319,7 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | CORS | admin origin 白名单（localhost + 127.0.0.1 的 5173/19068 双端口 + tauri://localhost + https://tauri.localhost + http://tauri.localhost，共 7 个）；public 全开（CLI 无 origin 约束） |
 | 频率限制 | 令牌桶 60 req/min，按 Service Key |
 | 分发密钥 | install URL query 明文嵌入，仅限可信局域网设备，撤销即在密钥列表删除 |
+| 数据文件访问 | 导出/导入文件对话框 + fs 权限白名单（`$HOME`/`$DOWNLOAD`/`$DOCUMENT`/`$DESKTOP`/`$APPDATA`），白名单外路径不可读写 |
 
 ### 8.3 网络
 

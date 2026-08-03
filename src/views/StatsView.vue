@@ -1,17 +1,17 @@
 <template>
   <div class="page">
     <div class="page__header">
-      <h2 class="md-typescale-headline-medium page__title">统计</h2>
+      <h2 class="md-typescale-headline-medium page__title">{{ t('stats.title') }}</h2>
       <div class="date-picker">
         <button class="date-btn" id="date-btn" @click="showPicker = true">
           <span class="mdi" :class="rangeIcon"></span>
           {{ rangeLabel }}
         </button>
         <md-menu :open="showPicker" anchor="date-btn" positioning="fixed" @closed="showPicker = false">
-          <md-menu-item @click="setRange('today')"><span class="mdi mdi-calendar-today"></span> 当天</md-menu-item>
-          <md-menu-item @click="setRange('1d')"><span class="mdi mdi-calendar-range"></span> 一天内</md-menu-item>
-          <md-menu-item @click="setRange('7d')"><span class="mdi mdi-calendar-week"></span> 一周内</md-menu-item>
-          <md-menu-item @click="setRange('30d')"><span class="mdi mdi-calendar-month"></span> 一月内</md-menu-item>
+          <md-menu-item @click="setRange('today')"><span class="mdi mdi-calendar-today"></span> {{ t('stats.range.today') }}</md-menu-item>
+          <md-menu-item @click="setRange('1d')"><span class="mdi mdi-calendar-range"></span> {{ t('stats.range.1d') }}</md-menu-item>
+          <md-menu-item @click="setRange('7d')"><span class="mdi mdi-calendar-week"></span> {{ t('stats.range.7d') }}</md-menu-item>
+          <md-menu-item @click="setRange('30d')"><span class="mdi mdi-calendar-month"></span> {{ t('stats.range.30d') }}</md-menu-item>
         </md-menu>
       </div>
     </div>
@@ -21,7 +21,7 @@
       <div class="tile tile--wide">
         <div class="tile__icon mdi mdi-counter"></div>
         <div class="tile__content">
-          <div class="tile__label">总消耗 Tokens</div>
+          <div class="tile__label">{{ t('stats.tile.total_tokens') }}</div>
           <div class="tile__value tile__value--big">
             {{ formatTokens(animTotalTokens) }}<span class="tile__value-sub">≈{{ formatTokensAuto(animTotalTokens) }}</span>
           </div>
@@ -30,49 +30,113 @@
       <div class="tile">
         <div class="tile__icon mdi mdi-star"></div>
         <div class="tile__content">
-          <div class="tile__label">调用最多模型</div>
+          <div class="tile__label">{{ t('stats.tile.top_model') }}</div>
           <div class="tile__value">{{ topModelName }}</div>
         </div>
       </div>
       <div class="tile">
         <div class="tile__icon mdi mdi-api"></div>
         <div class="tile__content">
-          <div class="tile__label">总请求次</div>
+          <div class="tile__label">{{ t('stats.tile.total_requests') }}</div>
           <div class="tile__value">{{ formatTokens(animTotalRequests) }}</div>
         </div>
       </div>
       <div class="tile">
         <div class="tile__icon mdi mdi-arrow-down-bold"></div>
         <div class="tile__content">
-          <div class="tile__label">输入 Tokens</div>
+          <div class="tile__label">{{ t('stats.tile.input_tokens') }}</div>
           <div class="tile__value">{{ formatTokensAuto(animTotalInputTokens) }}</div>
         </div>
       </div>
       <div class="tile">
         <div class="tile__icon mdi mdi-arrow-up-bold"></div>
         <div class="tile__content">
-          <div class="tile__label">输出 Tokens</div>
+          <div class="tile__label">{{ t('stats.tile.output_tokens') }}</div>
           <div class="tile__value">{{ formatTokensAuto(animTotalOutputTokens) }}</div>
         </div>
       </div>
       <div class="tile">
         <div class="tile__icon mdi mdi-database-search"></div>
         <div class="tile__content">
-          <div class="tile__label">命中 Tokens</div>
+          <div class="tile__label">{{ t('stats.tile.cache_tokens') }}</div>
           <div class="tile__value">{{ formatTokensAuto(animTotalCacheTokens) }}</div>
         </div>
       </div>
       <div class="tile">
         <div class="tile__icon mdi mdi-percent"></div>
         <div class="tile__content">
-          <div class="tile__label">缓存命中率</div>
+          <div class="tile__label">{{ t('stats.tile.cache_hit_rate') }}</div>
           <div class="tile__value">{{ animCacheHitRate }}%</div>
         </div>
       </div>
     </div>
 
     <div class="chart-container table-card">
-      <Line :data="chartData" :options="chartOptions" />
+      <div class="chart-card__header">
+        <h3 class="md-typescale-title-medium">{{ t('stats.chart.title') }}</h3>
+      </div>
+      <div class="chart-body">
+        <Line :data="chartData" :options="chartOptions" />
+      </div>
+    </div>
+
+    <!-- 请求日志（分页，时间逆序） -->
+    <div class="log-card table-card">
+      <div class="log-card__header">
+        <h3 class="md-typescale-title-medium">{{ t('stats.log.title') }}</h3>
+        <span v-if="total > 0" class="log-card__total muted md-typescale-body-medium">{{ t('stats.log.total', { total }) }}</span>
+      </div>
+
+      <div v-if="!logRows.length" class="empty-state">
+        <span class="mdi mdi-inbox-outline empty-state__icon"></span>
+        <p class="md-typescale-body-large">{{ t('stats.log.empty') }}</p>
+      </div>
+
+      <div v-else>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr class="md-typescale-label-large">
+                <th>{{ t('stats.log.col_time') }}</th>
+                <th>{{ t('stats.log.col_key') }}</th>
+                <th>{{ t('stats.log.col_provider') }}</th>
+                <th>{{ t('stats.log.col_model') }}</th>
+                <th class="num-cell">{{ t('stats.log.col_input') }}</th>
+                <th class="num-cell">{{ t('stats.log.col_output') }}</th>
+                <th>{{ t('stats.log.col_status') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in logRows" :key="row.id" class="md-typescale-body-medium">
+                <td class="time-cell">{{ formatTime(row.timestamp) }}</td>
+                <td class="key-cell" :title="row.service_key_name || ''">
+                  <span class="mono">{{ row.service_key_name || '—' }}</span>
+                  <span class="muted"> ({{ row.service_key_masked }})</span>
+                </td>
+                <td>{{ row.provider_name || '—' }}</td>
+                <td class="model-cell" :title="row.model_display_name || ''">{{ row.model_display_name || '—' }}</td>
+                <td class="num-cell mono">{{ row.prompt_tokens.toLocaleString() }}</td>
+                <td class="num-cell mono">{{ row.completion_tokens.toLocaleString() }}</td>
+                <td>
+                  <span class="status-pill" :class="statusClass(row)" :title="row.error_message || ''">
+                    {{ row.success ? t('stats.log.status_ok') : t('stats.log.status_fail') }}
+                  </span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pagination">
+          <md-outlined-button :disabled="page <= 1" @click="changePage(page - 1)">
+            <span slot="icon" class="mdi mdi-chevron-left"></span>{{ t('stats.log.prev') }}
+          </md-outlined-button>
+          <span class="page-indicator md-typescale-body-medium">{{ t('stats.log.page', { current: page, total: totalPages }) }}</span>
+          <md-outlined-button :disabled="page >= totalPages" @click="changePage(page + 1)">
+            {{ t('stats.log.next') }}<span slot="icon" class="mdi mdi-chevron-right"></span>
+          </md-outlined-button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -84,8 +148,9 @@ import {
   Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement,
   Title, Tooltip, Legend, Filler
 } from 'chart.js';
-import { statsApi } from '../api';
+import { statsApi, requestLogApi, type RequestLogRow } from '../api';
 import { wsClient } from '../ws';
+import { t } from '../i18n';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
@@ -178,7 +243,7 @@ const chartOptions = computed(() => ({
         label: function (ctx: any) {
           const kidLabel = ctx.dataset.label;
           const raw = Number(ctx.raw);
-          return `${kidLabel}: ${(raw / 10000).toFixed(1)}万 Token`;
+          return t('stats.tooltip.unit', { value: (raw / 10000).toFixed(1) });
         },
         afterBody: function (ctx: any) {
           const day = ctx[0]?.label;
@@ -186,14 +251,14 @@ const chartOptions = computed(() => ({
           const kid = keys.value.find(k => (keyLabelMap.value[k] || k) === kidLabel) || '';
           const dayData = data.value.filter(d => d.day === day && d.key_id === kid);
           if (dayData.length === 0) return [];
-          const lines: string[] = ['Token分布:'];
+          const lines: string[] = [t('stats.tooltip.distribution')];
           for (const d of dayData) {
             const cacheR = (d.cache_read_input_tokens || 0) / 10000;
             const input = (d.prompt_tokens / 10000).toFixed(1);
             const output = (d.completion_tokens / 10000).toFixed(1);
-            let line = `  合计: ${(d.total_tokens / 10000).toFixed(1)}万 (输入 ${input}万 + 输出 ${output}万`;
+            let line = t('stats.tooltip.total', { total: (d.total_tokens / 10000).toFixed(1), input, output });
             if (cacheR > 0.05) {
-              line += ` | 缓存读 ${cacheR.toFixed(1)}万`;
+              line += t('stats.tooltip.cache_read', { value: cacheR.toFixed(1) });
             }
             line += ')';
             lines.push(line);
@@ -206,7 +271,7 @@ const chartOptions = computed(() => ({
   scales: {
     x: {
       grid: { display: false },
-      title: { display: true, text: '时间', font: { family: 'Roboto Flex', size: 12 } },
+      title: { display: true, text: t('stats.chart.x_axis'), font: { family: 'Roboto Flex', size: 12 } },
       ticks: {
         font: { family: 'Roboto Flex', size: 10 },
         maxTicksLimit: 7,
@@ -225,7 +290,7 @@ const chartOptions = computed(() => ({
     y: {
       beginAtZero: true,
       min: 0,
-      title: { display: true, text: 'Token (万)', font: { family: 'Roboto Flex', size: 12 } },
+      title: { display: true, text: t('stats.chart.y_axis'), font: { family: 'Roboto Flex', size: 12 } },
       ticks: {
         font: { family: 'Roboto Flex', size: 10 },
         maxTicksLimit: 6,
@@ -247,10 +312,10 @@ const rangeIcon = computed(() => {
 });
 
 const rangeLabel = computed(() => {
-  if (range.value === 'today') return '当天';
-  if (range.value === '1d') return '一天内';
-  if (range.value === '7d') return '一周内';
-  return '一月内';
+  if (range.value === 'today') return t('stats.range.today');
+  if (range.value === '1d') return t('stats.range.1d');
+  if (range.value === '7d') return t('stats.range.7d');
+  return t('stats.range.30d');
 });
 
 function setRange(r: 'today' | '1d' | '7d' | '30d') {
@@ -358,12 +423,12 @@ const animCacheHitRate = computed(() => {
 function formatTokens(n: number): string {
   return Math.round(n).toLocaleString();
 }
-// 输入/输出/命中：自动以万/亿结尾，保留 2 位小数
+// 输入/输出/命中：自动以万/K、亿/B 结尾，保留 2 位小数
 function formatTokensAuto(n: number): string {
   const yi = n / 1e8;
-  if (yi >= 1) return `${yi.toFixed(2)}亿`;
+  if (yi >= 1) return `${yi.toFixed(2)}${t('stats.unit_yi')}`;
   const wan = n / 1e4;
-  return `${wan.toFixed(2)}万`;
+  return `${wan.toFixed(2)}${t('stats.unit_wan')}`;
 }
 
 function formatBucket(label: string): string {
@@ -389,10 +454,51 @@ function formatBucketLong(label: string): string {
 // 后端每 5s 通过 WS 推送 usage_stats_changed；收到后用当前参数重新拉取。
 function onStatsChanged() {
   fetchStats();
+  fetchLogs();
+}
+
+// ── 请求日志（分页，时间逆序） ──
+const logRows = ref<RequestLogRow[]>([]);
+const page = ref(1);
+const pageSize = 10;
+const total = ref(0);
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
+
+async function fetchLogs() {
+  try {
+    const json = await requestLogApi.page({ page: page.value, page_size: pageSize });
+    total.value = json.total;
+    logRows.value = json.data;
+    // 数据收缩（或新行把旧页挤出）导致当前页越界 → 回退最后一页重取，避免空白页
+    const maxPage = Math.max(1, Math.ceil(json.total / pageSize));
+    if (json.data.length === 0 && page.value > 1) {
+      page.value = maxPage;
+      await fetchLogs();
+    }
+  } catch {
+    // 静默失败，保留旧内容
+  }
+}
+
+function changePage(p: number) {
+  page.value = p;
+  fetchLogs();
+}
+
+/** 状态 pill 着色：成功绿 / 失败红 */
+function statusClass(row: RequestLogRow): string {
+  return row.success ? 'status--ok' : 'status--fail';
+}
+
+/** 本地时间 YYYY-MM-DD HH:mm */
+function formatTime(tSec: number): string {
+  const d = new Date(tSec * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 onMounted(() => {
   fetchStats();
+  fetchLogs();
   wsClient.connect();
   wsClient.on('usage_stats_changed', onStatsChanged);
 });
@@ -481,11 +587,47 @@ onUnmounted(() => {
   .tile--wide { grid-column: span 1; }
 }
 
-.chart-container { padding: 24px; background: var(--md-sys-color-surface-container-low); border-radius: var(--md-sys-shape-corner-medium); height: 440px; }
+.chart-container { padding: 24px; background: var(--md-sys-color-surface-container-low); border-radius: var(--md-sys-shape-corner-medium); height: 440px; display: flex; flex-direction: column; }
+.chart-card__header h3 { margin: 0 0 12px; color: var(--md-sys-color-on-surface); }
+.chart-body { flex: 1; min-height: 0; }
 .chart-container canvas { max-height: 100% !important; }
 
 .empty-state { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 64px 24px; text-align: center; }
 .empty-state__icon { font-size: 48px; color: var(--md-sys-color-on-surface-variant); }
 
 .table-card { background: var(--md-sys-color-surface-container-low); border-radius: var(--md-sys-shape-corner-medium); }
+
+/* ── 请求日志 ── */
+.log-card { margin-top: 16px; padding: 24px; }
+.log-card__header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; }
+.log-card__header h3 { margin: 0; color: var(--md-sys-color-on-surface); }
+.log-card__total { margin-left: auto; }
+.table-wrap { overflow-x: auto; }
+.table { border-collapse: collapse; table-layout: auto; width: 100%; min-width: 720px; }
+.table th { text-align: left; padding: 10px 12px; color: var(--md-sys-color-on-surface-variant); vertical-align: middle; white-space: nowrap; }
+.table td { padding: 10px 12px; vertical-align: middle; white-space: nowrap; }
+.table tr { border-bottom: 1px solid var(--md-sys-color-outline-variant); }
+.table tr:last-child { border-bottom: none; }
+.time-cell { color: var(--md-sys-color-on-surface-variant); font-size: 0.8rem; }
+.key-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+.model-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.num-cell { text-align: right; font-variant-numeric: tabular-nums; }
+.muted { color: var(--md-sys-color-on-surface-variant); }
+.mono { font-family: 'Roboto Mono', monospace; font-size: 0.85rem; }
+
+.status-pill {
+  display: inline-block; padding: 2px 10px; border-radius: var(--md-sys-shape-corner-full);
+  font-size: 0.75rem; font-weight: 500;
+}
+.status--ok {
+  color: var(--md-sys-color-openai-brand);
+  background: color-mix(in srgb, var(--md-sys-color-openai-brand) 15%, transparent);
+}
+.status--fail {
+  color: var(--md-sys-color-error);
+  background: var(--md-sys-color-error-container);
+}
+
+.pagination { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 16px; }
+.page-indicator { color: var(--md-sys-color-on-surface-variant); }
 </style>

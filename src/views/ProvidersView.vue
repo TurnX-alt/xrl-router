@@ -1,10 +1,10 @@
 <template>
   <div class="page">
     <div class="page__header">
-      <h2 class="md-typescale-headline-medium page__title">供应商</h2>
+      <h2 class="md-typescale-headline-medium page__title">{{ t('providers.title') }}</h2>
       <md-filled-button @click="$router.push('/providers/new')">
         <span slot="icon" class="mdi mdi-plus"></span>
-        添加供应商
+        {{ t('providers.add') }}
       </md-filled-button>
     </div>
 
@@ -14,7 +14,7 @@
 
     <div v-else-if="!providers.length" class="empty-state">
       <span class="mdi mdi-inbox-outline empty-state__icon"></span>
-      <p class="md-typescale-body-large">空空如也</p>
+      <p class="md-typescale-body-large">{{ t('common.empty') }}</p>
     </div>
 
     <div v-else>
@@ -25,7 +25,7 @@
         class="card"
         :data-id="p.id"
       >
-        <span class="card__drag mdi mdi-drag-horizontal-variant" title="拖动排序"></span>
+        <span class="card__drag mdi mdi-drag-horizontal-variant" :title="t('providers.drag_tip')"></span>
         <span class="card__avatar mdi" :class="avatarClass(p)">
             <!-- Official Anthropic logo from simple-icons -->
             <svg v-if="p.kind === 'anthropic'" viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
@@ -43,12 +43,12 @@
               v-if="keyStatsMap[p.id]"
               class="card__key-stats"
               :class="{ 'key-stats--bad': keyStatsMap[p.id].green === 0 }"
-              :title="`${keyStatsMap[p.id].green}/${keyStatsMap[p.id].total} 可用密钥`"
+              :title="t('providers.keys_available', { green: keyStatsMap[p.id].green, total: keyStatsMap[p.id].total })"
             >
               {{ keyStatsMap[p.id].green }}/{{ keyStatsMap[p.id].total }}
             </span>
           </h3>
-          <span v-if="isPluginProvider(p)" class="card__endpoint md-typescale-body-medium" :class="{ 'endpoint--offline': !pluginOnlineMap[p.id] }" title="由插件委托接入">{{ pluginOnlineMap[p.id] ? '插件（在线）' : '插件（离线）' }}</span>
+          <span v-if="isPluginProvider(p)" class="card__endpoint md-typescale-body-medium" :class="{ 'endpoint--offline': !pluginOnlineMap[p.id] }" :title="t('providers.plugin_delegated')">{{ pluginOnlineMap[p.id] ? t('providers.plugin_online') : t('providers.plugin_offline') }}</span>
           <span v-else-if="p.base_url" class="card__endpoint md-typescale-body-medium mono" :title="p.base_url">{{ p.base_url }}</span>
         </div>
         <div class="card__actions">
@@ -72,21 +72,21 @@
       @closed="menuOpen = null"
     >
       <md-menu-item @click="editFromMenu">
-        <span class="mdi mdi-pencil-outline"></span> 编辑
+        <span class="mdi mdi-pencil-outline"></span> {{ t('common.edit') }}
       </md-menu-item>
       <md-menu-item class="menu-item--danger" @click="deleteFromMenu">
-        <span class="mdi mdi-delete-outline"></span> 删除
+        <span class="mdi mdi-delete-outline"></span> {{ t('common.delete') }}
       </md-menu-item>
     </md-menu>
 
     <md-dialog :open="deleteOpen" @close="deleteOpen = false">
-      <div slot="headline">删除供应商</div>
+      <div slot="headline">{{ t('providers.delete_title') }}</div>
       <div slot="content" class="form">
-        <p class="md-typescale-body-medium">确定要删除「{{ deleteTarget?.name }}」吗？此操作不可撤销。</p>
+        <p class="md-typescale-body-medium">{{ t('providers.delete_confirm', { name: deleteTarget?.name || '' }) }}</p>
       </div>
       <div slot="actions">
-        <md-text-button @click="deleteOpen = false">取消</md-text-button>
-        <md-text-button class="confirm-del" @click="confirmDelete">确定删除</md-text-button>
+        <md-text-button @click="deleteOpen = false">{{ t('common.cancel') }}</md-text-button>
+        <md-text-button class="confirm-del" @click="confirmDelete">{{ t('providers.delete_confirm_btn') }}</md-text-button>
       </div>
     </md-dialog>
   </div>
@@ -100,6 +100,7 @@ import Sortable from 'sortablejs';
 import { providersApi, keysApi, type Provider } from '../api';
 import { wsClient } from '../ws';
 import { useProviderStore } from '../stores/providers';
+import { t } from '../i18n';
 
 const router = useRouter();
 const providerStore = useProviderStore();

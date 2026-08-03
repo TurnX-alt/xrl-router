@@ -67,11 +67,17 @@ pub fn build_admin_router(state: Arc<AppState>) -> Router {
         .route("/api/proxy/models", get(handlers::proxy_fetch_models))
         // Statistics
         .route("/api/stats", get(handlers::get_stats))
+        // 请求日志分页（时间逆序）
+        .route("/api/stats/requests", get(handlers::get_stats_requests))
         // Service Key management (argon2 hashed)
         .route("/api/service-keys", get(handlers::list_service_keys).post(handlers::create_service_key))
         .route("/api/service-keys/:id", put(handlers::update_service_key).delete(handlers::delete_service_key))
         // App settings
         .route("/api/settings", get(handlers::get_settings).put(handlers::update_settings))
+        // Data management (export/import/reset)
+        .route("/api/data/export", get(handlers::export_data))
+        .route("/api/data/import", post(handlers::import_data))
+        .route("/api/data/reset", post(handlers::reset_data))
         // Plugin management
         .route("/ws/plugin", get(handlers::plugin_ws_handler))
         .route("/api/plugins", get(handlers::list_plugins))

@@ -52,7 +52,7 @@ xrl-router 是一个 **Tauri 2 桌面应用**，内部跑着一个 Rust axum HTT
 
 ```
 main.rs
-  └─ lib.rs (Tauri setup + 启动流程)
+  └─ lib.rs (Tauri setup + 启动流程 + 插件注册 + 托盘 i18n)
        ├─ config.rs          环境变量 → Config
        ├─ error.rs           AppError 统一错误类型 (thiserror)
        ├─ crypto/mod.rs      AES-256-GCM + Argon2 + master key
@@ -64,21 +64,23 @@ main.rs
        │    ├─ models.rs      Model CRUD
        │    ├─ api_keys.rs    API Key CRUD
        │    ├─ service_keys.rs Service Key CRUD
-       │    ├─ usage.rs       usage_log 查询 + 统计聚合
-       │    └─ settings.rs    key-value 设置表
+       │    ├─ usage.rs       usage_log 查询 + 统计聚合 + 请求日志分页
+       │    └─ settings.rs    key-value 设置表 + 导出/导入/重置
        ├─ gateway/server.rs  AppState + start_gateway (双 listener) + CORS
        └─ api/
             ├─ router.rs      axum 路由表 (build_admin_router / build_public_router)
             ├─ handlers/      管理 API
             │    ├─ health.rs, providers.rs, keys.rs, models.rs
-            │    ├─ service_keys.rs, stats.rs
+            │    ├─ service_keys.rs, stats.rs (含 /api/stats/requests 分页 + failover 开关)
+            │    ├─ data.rs      (/api/data/export|import|reset)
             │    ├─ install.rs  (/install 静态页 + /api/install/local-ip)
             │    ├─ websocket.rs  (/ws 端点)
             │    └─ plugin.rs     (插件 REST + WS)
             └─ proxy/         LLM 代理核心
-                 ├─ handler.rs     三大入口: anthropic/openai/list_models
+                 ├─ handler.rs     三大入口: anthropic/openai/list_models + failover 双层循环
                  ├─ auth.rs        Service Key 验证
-                 ├─ route.rs       模型别名→上游 URL 解析
+                 ├─ route.rs       模型别名→上游 URL 解析 (resolve_route / resolve_route_candidates)
+                 ├─ failover.rs    provider 级冷却表 (纯内存, 60s)
                  ├─ key_rotation.rs 密钥选取 + 健康反馈
                  ├─ upstream.rs    上游错误转发
                  ├─ websearch.rs   Bing 劫持 loop
@@ -151,7 +153,10 @@ main.rs
   │  不匹配 → 403
   │
   ▼
-[5] resolve_route (route.rs) ──── display_name 查 models JOIN providers
+[5] resolve_route / resolve_route_candidates (route.rs)
+  │  failover_enabled=false → 仅主 provider (resolve_route, 历史行为)
+  │  failover_enabled=true  → 全部候选 (同 display_name, 按 sort_order 排序,
+  │                           按 provider_id 去重, 跳过离线插件 provider)
   │  失败 → 400
   │  成功 → ResolvedRoute { upstream_url, provider_kind, real_model_id, ... }
   │  委托供应商 → 从 PluginManager 取实时 base_url
@@ -165,15 +170,17 @@ main.rs
   │  强制 stream=true, model=real_model_id
   │
   ▼
-[8] 密钥轮询重试循环 (key_rotation.rs)
-  │  pick_key_for() → round-robin, 跳过 Red/Yellow
+[8] failover 双层重试循环 (handler.rs + key_rotation.rs + failover.rs)
+  │  外层: 遍历 provider 候选 (冷却中的直接跳过)
+  │  内层: pick_key_for() → round-robin, 跳过 Red/Yellow
   │  http::build_http_client() → 自动继承系统代理
   │  发送请求 → 60s 头超时
-  │  401/403 → mark_key_invalid(Red) → 换 key 重试
-  │  402/429 → mark_key_low_quota(Yellow) → 换 key 重试
-  │  网络错误 → 502 (不重试)
-  │  超时 → 504 (不重试)
-  │  成功 → break
+  │  401/403 → mark_key_invalid(Red) → 换 key (内层继续)
+  │  402/429 → mark_key_low_quota(Yellow) → 换 key (内层继续)
+  │  5xx / 网络错误 / 头超时 → 有后续候选: mark_provider_failed(60s 冷却) → 切 provider
+  │     无后续候选: 网络错误 → 502, 头超时 → 504, 5xx → 透传上游错误
+  │  2xx → mark_provider_ok(清冷却) + 记 winner → break
+  │  无 winner: key 4xx 耗尽透传最后一次上游失败响应 / 无可用 key → 503
   │
   ▼
 [9] 流式转发
@@ -194,12 +201,13 @@ SSE 流返回客户端
 
 ```
 src/
-├── main.ts            Vue 入口 + MD3 组件按需导入 + 主题初始化
+├── main.ts            Vue 入口 + MD3 组件按需导入 + initI18n + initSystemThemeListener
 ├── App.vue            根组件: AppShell + PluginRegisterDialog + router-view
 ├── router.ts          7 条路由 (6 个 lazy-loaded 组件路由 + 1 个 redirect)
-├── api.ts             REST 客户端 (BASE_URL=http://localhost:19068, 含 installApi)
+├── api.ts             REST 客户端 (BASE_URL=http://localhost:19068, 含 installApi/requestLogApi/dataApi)
 ├── ws.ts              WebSocket 客户端 (自动重连 3s, 事件 pub/sub)
-├── theme.ts           明/暗主题 (localStorage 持久化)
+├── theme.ts           主题 light/dark/system (localStorage 持久化, prefers-color-scheme 监听)
+├── i18n/              自研 i18n: index.ts (t/setLocale/initI18n, localStorage + 后端托盘同步) + zh-CN.ts / en.ts
 │
 ├── styles/
 │    global.css                全局样式 (MD3 design tokens + [data-theme="dark"])
@@ -207,9 +215,9 @@ src/
 ├── views/
 │    ProvidersView.vue    供应商列表 (网格卡片 + 拖拽排序 + WS 实时 key 统计)
 │    ProviderNewView.vue  供应商创建/编辑 (支持插件模式)
-│    KeysView.vue         Service Key 管理 (表格 + 权限对话框)
-│    StatsView.vue        用量统计 (数据磁贴 + Chart.js 折线图)
-│    SettingsView.vue     设置 (主题 + websearch 开关)
+│    KeysView.vue         Service Key 管理 (表格 + 权限对话框 + 分发链接)
+│    StatsView.vue        用量统计 (数据磁贴 + Chart.js 折线图 + 请求日志分页表)
+│    SettingsView.vue     设置 3 Tab: 通用(语言/主题/开机启动) + 路由(websearch/failover) + 数据(导出/导入/重置)
 │
 ├── components/
 │    AppShell.vue              MD3 导航抽屉 (响应式)
@@ -220,10 +228,10 @@ src/
      providers.ts    Provider 列表
      keys.ts         API Key 列表 (按 provider 分组)
      models.ts       Model 列表 (按 provider 分组)
-     dashboard.ts    仪表盘数据
+     dashboard.ts    仪表盘数据 (后端路由未注册, 见已知问题)
 ```
 
-前端通过 HTTP 访问管理 API（无认证），通过 WebSocket 接收实时推送。
+前端通过 HTTP 访问管理 API（无认证），通过 WebSocket 接收实时推送。语言切换经 `set_locale` Tauri command 同步到后端（托盘菜单文本），开机启动经 `@tauri-apps/plugin-autostart`，数据文件读写经 `plugin-dialog` + `plugin-fs`（路径白名单见安全边界）。
 
 ---
 
@@ -237,7 +245,8 @@ src/
 │  api_keys         Provider Key (AES-256-GCM 加密) │
 │  service_keys     客户端 Key (Argon2 哈希, 含 quota)│
 │  usage_log        请求日志 (自包含快照, 无 FK)      │
-│  settings         key-value 设置 + 轮询指针        │
+│  settings         key-value 设置 + 轮询指针 +       │
+│                   failover_enabled / locale 等     │
 │  plugins          插件注册记录                     │
 │  schema_version   迁移版本跟踪                     │
 │                                                   │
@@ -299,6 +308,10 @@ src/
 - **已知问题**: 前端 `api.ts` 定义了 `dashboardApi`（`/api/dashboard/overview`、`/api/dashboard/usage`），`stores/dashboard.ts` 也在使用，但后端 `router.rs` 未注册这两条路由。
 ```
 
+### 6.2 文件系统权限（capabilities）
+
+前端 WebView 的文件访问仅限**导出/导入对话框选中的文件**：`fs:allow-read-text-file` / `fs:allow-write-text-file` 带路径白名单（`$HOME/**`、`$DOWNLOAD/**`、`$DOCUMENT/**`、`$DESKTOP/**`、`$APPDATA/**`），配合 `dialog:default`（系统文件对话框）——WebView 无任意路径读写能力。
+
 ---
 
 ## 7. 关键设计约束
@@ -312,6 +325,8 @@ src/
 | usage_log 无 FK | 删除 Provider/Model/Key 不影响历史统计 |
 | 管理 API 无认证 | admin listener 绑 127.0.0.1 是安全模型，本机进程访问是接受的代价；public listener 只暴露需 key 的 `/v1/*` 与无敏感信息的 `/install` |
 | 协议转换不丢特性 | 不兼容的要显式转换 + warn 日志，不静默丢弃 |
+| failover 冷却纯内存 | 与密钥健康同一哲学，不持久化不广播；开关默认关闭，开启才改变请求行为 |
+| 数据导出用 SQL dump | SQLite 原生语句保真度高，导入即执行，天然支持跨版本迁移 |
 
 ---
 
@@ -320,6 +335,9 @@ src/
 ```
 xrl-router
   ├── Tauri 2          桌面框架 (WebView + 系统托盘)
+  ├── tauri-plugin-autostart  开机自启 (LaunchAgent + --minimized)
+  ├── tauri-plugin-dialog     导出/导入文件对话框
+  ├── tauri-plugin-fs         读写 .sql 备份文件
   ├── axum 0.7         HTTP 框架
   ├── tokio            异步运行时
   ├── rusqlite 0.32    SQLite (bundled)

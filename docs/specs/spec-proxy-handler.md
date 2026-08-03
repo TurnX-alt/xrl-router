@@ -76,13 +76,23 @@ data: [DONE]
 ```
 
 **状态码**:
-- `400` 请求格式错误（含模型不存在）
+- `400` 请求格式错误（含模型不存在 / 无路由候选）
 - `401` API key 无效
 - `403` 模型不在白名单
 - `429` 速率限制，或 5h/7d 滚动窗口配额超限（`quota_error`，携带 `retry-after` 头）
 - `500` 内部错误
-- `502` 上游 API 错误
+- `502` 上游网络错误（全部候选失败）
 - `503` 无可用密钥
+- `504` 响应头超时（全部候选失败）
+
+## 故障转移（Provider Failover）
+
+`failover_enabled` 开关（设置页「路由」Tab，默认关闭）开启时，同一 `display_name` 下的全部 Provider 候选按序尝试：
+
+- **候选来源**：`route.rs::resolve_route_candidates()`——同 display_name 全部 models JOIN providers 行，按 `sort_order ASC, created_at ASC` 排序、按 provider_id 去重、跳过插件离线的委托 provider；关闭时仅主 provider（`resolve_route`，行为与单 Provider 一致）
+- **双层循环**：外层 provider 候选（冷却中直接跳过），内层 key 轮换；key 级 4xx 先耗尽当前 provider 的 key 才切 provider
+- **冷却**：`failover.rs` 纯内存冷却表，provider 级失败（5xx/网络错误/响应头超时）标记 60s 冷却，2xx 成功立即清除
+- **请求体**：Anthropic/OpenAI 两种骨架循环外预构造，循环内按候选类型选用并覆写 `model`（候选可混合协议类型）
 
 ## 关键约束
 
@@ -90,22 +100,23 @@ data: [DONE]
 2. **模型替换**: 将 `display_name` 替换为上游的 `model_id`
 3. **配额检查**: 认证后先查 5h/7d 滚动窗口配额（`quota.rs::check_quota`），任一窗口触顶返回 429（`quota_error` + `retry-after`，message 含重置时间）
 4. **密钥轮换**: 401/403 标红，402/429 标黄，自动切换下一个 key
-5. **超时控制**: 连接 10s，响应 60s，流间隔 120s
-6. **重试上限**: 最多重试 `key_count` 次，防止死循环
+5. **超时控制**: 连接 10s，响应头 60s，流间隔 120s
+6. **重试边界**: 内层最多重试当前 provider 的 `key_count` 次；外层候选数由 `resolve_route_candidates` 决定，开关关闭时仅 1 个候选
 
 ## 错误处理
 
 | 场景 | 行为 |
 |------|------|
 | API key 无效 | 返回 401，不重试 |
-| 模型不存在 | 返回 400，不重试 |
+| 模型不存在 / 无路由候选 | 返回 400，不重试 |
 | 配额超限 | 返回 429 `quota_error` + `retry-after`，不重试 |
-| 上游 401/403 | 标红当前 key，切换下一个，重试 |
-| 上游 402/429 | 标黄当前 key，切换下一个，重试 |
-| 上游 5xx | 不切换 key，直接返回错误 |
-| 连接超时 | 返回 503，不重试 |
-| 响应超时 | 返回 504，不重试 |
-| 所有 key 都不可用 | 返回 503 |
+| 上游 401/403 | 标红当前 key，切换下一个（内层），重试 |
+| 上游 402/429 | 标黄当前 key，切换下一个（内层），重试 |
+| 上游 5xx | 有后续候选 → 标记 provider 冷却（60s）+ 切 provider（外层）重试；无后续候选 → 透传上游失败响应 |
+| 网络错误 | 有后续候选 → 切 provider；无后续候选 → 返回 502 |
+| 响应头超时 | 有后续候选 → 切 provider；无后续候选 → 返回 504 |
+| 全部 key 4xx 耗尽 | 透传最后一次上游失败响应 |
+| 无可用 key | 返回 503 |
 
 ## 实现位置
 
@@ -131,4 +142,5 @@ data: [DONE]
 - [x] 超时控制
 - [x] 错误处理
 - [x] 记录 `usage_log`
-- [x] 通过网关冒烟测试
+- [x] failover（`resolve_route_candidates` + 双层循环 + 60s 冷却 + 开关）
+- [x] 通过网关冒烟测试（含 failover 双假上游 E2E）

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>XRL Router · 客户分发</title>
+<title>XRL Router · 客户分发 / Client Deploy</title>
 <style>
   :root {
     --bg: #fef7ff; --on-bg: #1d1b20; --surface: #fef7ff; --surface-h: #ece6f0;
@@ -41,6 +41,7 @@
   .seg { display: inline-flex; background: var(--surface-h); border-radius: 9999px; padding: 3px; gap: 2px; }
   .seg button { background: transparent; color: var(--on-surface-var); padding: 6px 14px; font-size: 0.82rem; }
   .seg button.active { background: var(--primary); color: var(--on-primary); }
+  .lang-switch { position: fixed; top: 16px; right: 16px; z-index: 10; }
   .warn { color: var(--error); font-size: 0.8rem; margin: 8px 0 0; }
   .muted { color: var(--on-surface-var); font-size: 0.82rem; }
   .copy-ok { color: var(--primary); font-size: 0.8rem; opacity: 0; transition: opacity .2s; }
@@ -58,19 +59,109 @@
 </style>
 </head>
 <body>
+<div class="lang-switch seg">
+  <button id="lang-zh" class="active" onclick="setLang('zh')">中文</button>
+  <button id="lang-en" onclick="setLang('en')">English</button>
+</div>
 <div class="wrap" id="app"></div>
 <script>
 (function () {
-  var app = document.getElementById('app');
+  // ── 内联 i18n（纯静态页自包含，无构建依赖） ──
+  var I18N = {
+    zh: {
+      title: '客户分发',
+      subtitle: '网关地址：<code>{base}</code> · 密钥已嵌入命令',
+      no_key_title: '未携带密钥',
+      no_key_desc: '请从主机的 XRL Router 密钥管理页「创建密钥」，复制弹出的「分发链接」打开此页面。',
+      models_fetch_error: '拉取模型失败：{msg}',
+      cli_installed_note: '已勾选「已安装 Claude Code CLI」，命令省略安装段。',
+      cli_install_note: '命令将先安装 Claude Code CLI（需 Node.js ≥ 22），再写入配置。',
+      models_loading: '正在拉取网关可用模型…',
+      models_error_ignore: '可忽略，命令将不写默认模型（Claude Code 会用其默认模型名，若网关无对应别名将 404）。',
+      no_models: '网关暂无可用模型。请先在主机 XRL Router 配置供应商与模型。',
+      models_hint: '网关模型别名（写入 ANTHROPIC_DEFAULT_*_MODEL_NAME 与 CLAUDE_CODE_SUBAGENT_MODEL，Claude Code 实际请求此别名；官方 ID 对应槽位固定）',
+      cli_installed: '我已安装 Claude Code CLI',
+      default_model: '默认模型',
+      copy_cmd: '{platform} · 请复制以下命令',
+      verify: '安装后验证',
+      verify_desc: '在终端运行 <code>claude --version</code> 确认 CLI 可用；运行 <code>claude</code> 发消息，请求会经本机网关（主机 XRL Router 统计页可见流量）。',
+      key_warning: '⚠ 密钥已明文嵌入命令，请勿公开分享。',
+    },
+    en: {
+      title: 'Client Deploy',
+      subtitle: 'Gateway: <code>{base}</code> · key embedded in command',
+      no_key_title: 'No key provided',
+      no_key_desc: 'Create a key in the XRL Router key management page on the host, then open the "deploy link" from the popup.',
+      models_fetch_error: 'Failed to fetch models: {msg}',
+      cli_installed_note: 'Checked "Claude Code CLI installed" — install step omitted.',
+      cli_install_note: 'The command will install Claude Code CLI first (Node.js ≥ 22 required), then write the config.',
+      models_loading: 'Fetching gateway models…',
+      models_error_ignore: 'You can ignore this — the command will skip default models (Claude Code uses its own defaults; missing aliases may 404).',
+      no_models: 'No models available on the gateway. Configure providers and models on the host XRL Router first.',
+      models_hint: 'Gateway model aliases (written to ANTHROPIC_DEFAULT_*_MODEL_NAME and CLAUDE_CODE_SUBAGENT_MODEL; Claude Code requests these aliases, official IDs are fixed per slot)',
+      cli_installed: 'I have Claude Code CLI installed',
+      default_model: 'Default Model',
+      copy_cmd: '{platform} · copy the command below',
+      verify: 'Verify after install',
+      verify_desc: 'Run <code>claude --version</code> in a terminal to confirm the CLI works; run <code>claude</code> and send a message — traffic will flow through the local gateway (visible in the host XRL Router stats page).',
+      key_warning: '⚠ The key is embedded in plaintext in the command. Do not share publicly.',
+    },
+  };
+
+  var lang = 'zh';
   var params = new URLSearchParams(location.search);
+  var urlLang = params.get('lang');
+  var saved = null;
+  try { saved = localStorage.getItem('install-lang'); } catch (e) {}
+  if (urlLang === 'zh' || urlLang === 'en') {
+    lang = urlLang;
+  } else if (saved === 'zh' || saved === 'en') {
+    lang = saved;
+  } else {
+    lang = (navigator.language || '').toLowerCase().indexOf('en') === 0 ? 'en' : 'zh';
+  }
+
+  function tr(key, vars) {
+    var text = (I18N[lang] && I18N[lang][key]) || I18N.zh[key] || key;
+    if (vars) {
+      for (var k in vars) {
+        text = text.replace(new RegExp('\\{' + k + '\\}', 'g'), vars[k]);
+      }
+    }
+    return text;
+  }
+
+  // 语言切换（按钮在 <script> 前定义，window 上暴露）
+  window.setLang = function (l) {
+    lang = l;
+    try { localStorage.setItem('install-lang', l); } catch (e) {}
+    var zhBtn = document.getElementById('lang-zh');
+    var enBtn = document.getElementById('lang-en');
+    zhBtn.className = l === 'zh' ? 'active' : '';
+    enBtn.className = l === 'en' ? 'active' : '';
+    document.documentElement.lang = l === 'en' ? 'en' : 'zh-CN';
+    render();
+    fetchModels();
+  };
+  // 初始化按钮高亮
+  setTimeout(function () {
+    var zhBtn = document.getElementById('lang-zh');
+    var enBtn = document.getElementById('lang-en');
+    if (zhBtn && enBtn) {
+      zhBtn.className = lang === 'zh' ? 'active' : '';
+      enBtn.className = lang === 'en' ? 'active' : '';
+    }
+  }, 0);
+
+  var app = document.getElementById('app');
   var key = params.get('t') || '';
   var base = location.origin; // http://<本机IP>:19069
 
   if (!key) {
     app.innerHTML =
       '<div class="card placeholder">' +
-      '<p style="font-size:1.1rem;margin:0 0 8px">未携带密钥</p>' +
-      '<p class="muted" style="margin:0">请从主机的 XRL Router 密钥管理页「创建密钥」，复制弹出的「分发链接」打开此页面。</p>' +
+      '<p style="font-size:1.1rem;margin:0 0 8px">' + tr('no_key_title') + '</p>' +
+      '<p class="muted" style="margin:0">' + tr('no_key_desc') + '</p>' +
       '</div>';
     return;
   }
@@ -112,7 +203,7 @@
       })
       .catch(function (e) {
         state.modelsLoading = false;
-        state.modelsError = '拉取模型失败：' + (e && e.message ? e.message : e);
+        state.modelsError = tr('models_fetch_error', { msg: e && e.message ? e.message : e });
         render();
       });
   }
@@ -205,17 +296,17 @@
     var cmd = buildCommand();
     var platformLabel = state.platform === 'win' ? 'Windows (PowerShell)' : 'macOS / Linux (Bash)';
     var cliNote = state.cli
-      ? '<p class="muted">已勾选「已安装 Claude Code CLI」，命令省略安装段。</p>'
-      : '<p class="muted">命令将先安装 Claude Code CLI（需 Node.js ≥ 22），再写入配置。</p>';
+      ? '<p class="muted">' + tr('cli_installed_note') + '</p>'
+      : '<p class="muted">' + tr('cli_install_note') + '</p>';
 
     var modelBlock;
     if (state.modelsLoading) {
-      modelBlock = '<div class="model-row"><span class="spinner"></span><span class="muted">正在拉取网关可用模型…</span></div>';
+      modelBlock = '<div class="model-row"><span class="spinner"></span><span class="muted">' + tr('models_loading') + '</span></div>';
     } else if (state.modelsError) {
       modelBlock = '<p class="err">' + escapeHtml(state.modelsError) + '</p>' +
-        '<p class="muted">可忽略，命令将不写默认模型（Claude Code 会用其默认模型名，若网关无对应别名将 404）。</p>';
+        '<p class="muted">' + tr('models_error_ignore') + '</p>';
     } else if (!state.models.length) {
-      modelBlock = '<p class="muted">网关暂无可用模型。请先在主机 XRL Router 配置供应商与模型。</p>';
+      modelBlock = '<p class="muted">' + tr('no_models') + '</p>';
     } else {
       var opts = state.models.map(function (m) {
         var label = m.id + (m.owned_by ? ' · ' + m.owned_by : '');
@@ -224,37 +315,37 @@
       }).join('');
       modelBlock =
         '<div class="model-row">' +
-          '<span class="muted">网关模型别名（写入 ANTHROPIC_DEFAULT_*_MODEL_NAME 与 CLAUDE_CODE_SUBAGENT_MODEL，Claude Code 实际请求此别名；官方 ID 对应槽位固定）</span>' +
+          '<span class="muted">' + tr('models_hint') + '</span>' +
         '</div>' +
         '<div class="model-row"><select id="model-sel">' + opts + '</select></div>';
     }
 
     app.innerHTML =
-      '<h1>客户分发</h1>' +
-      '<p class="subtitle">网关地址：<code>' + base + '</code> · 密钥已嵌入命令</p>' +
+      '<h1>' + tr('title') + '</h1>' +
+      '<p class="subtitle">' + tr('subtitle', { base: escapeHtml(base) }) + '</p>' +
       '<div class="card">' +
         '<div class="seg">' +
           '<button id="seg-win" class="' + (state.platform === 'win' ? 'active' : '') + '">Windows</button>' +
           '<button id="seg-unix" class="' + (state.platform === 'unix' ? 'active' : '') + '">macOS / Linux</button>' +
         '</div>' +
         '<div class="checks">' +
-          '<label class="check"><input type="checkbox" id="chk-cli"' + (state.cli ? ' checked' : '') + '> 我已安装 Claude Code CLI</label>' +
+          '<label class="check"><input type="checkbox" id="chk-cli"' + (state.cli ? ' checked' : '') + '> ' + tr('cli_installed') + '</label>' +
         '</div>' +
         cliNote +
       '</div>' +
       '<div class="card">' +
-        '<p class="label">默认模型</p>' +
+        '<p class="label">' + tr('default_model') + '</p>' +
         modelBlock +
       '</div>' +
       '<div class="card">' +
-        '<p class="label">' + platformLabel + ' · 请复制以下命令</p>' +
+        '<p class="label">' + tr('copy_cmd', { platform: platformLabel }) + '</p>' +
         '<pre class="cmd-box" id="cmd">' + escapeHtml(cmd) + '</pre>' +
       '</div>' +
       '<div class="card">' +
-        '<p class="label">安装后验证</p>' +
-        '<p class="muted" style="margin:0">在终端运行 <code>claude --version</code> 确认 CLI 可用；运行 <code>claude</code> 发消息，请求会经本机网关（主机 XRL Router 统计页可见流量）。</p>' +
+        '<p class="label">' + tr('verify') + '</p>' +
+        '<p class="muted" style="margin:0">' + tr('verify_desc') + '</p>' +
       '</div>' +
-      '<p class="warn">⚠ 密钥已明文嵌入命令，请勿公开分享。</p>';
+      '<p class="warn">' + tr('key_warning') + '</p>';
 
     document.getElementById('seg-win').onclick = function () { state.platform = 'win'; render(); };
     document.getElementById('seg-unix').onclick = function () { state.platform = 'unix'; render(); };

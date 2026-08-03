@@ -1,14 +1,15 @@
 <template>
   <div v-if="!isOnline" class="connection-banner">
     <md-icon>cloud_off</md-icon>
-    <span>无法连接到后端服务</span>
-    <md-filled-button @click="retryConnection">重试</md-filled-button>
+    <span>{{ t('conn.offline') }}</span>
+    <md-filled-button @click="retryConnection">{{ t('conn.retry') }}</md-filled-button>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue';
 import { connectionState, BASE_URL } from '../api.js';
+import { t } from '../i18n';
 
 const isOnline = ref(connectionState.isOnline);
 let checkInterval: number | null = null;
@@ -21,7 +22,7 @@ const retryConnection = async () => {
       isOnline.value = true;
     }
   } catch (err) {
-    console.error('重试连接失败:', err);
+    console.error(t('conn.retry'), err);
   }
 };
 

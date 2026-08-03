@@ -10,7 +10,7 @@
           @click="navigateTo(item.path)"
         >
           <span class="nav-item__icon mdi" :class="item.icon"></span>
-          <span class="nav-item__label md-typescale-label-large">{{ item.label }}</span>
+          <span class="nav-item__label md-typescale-label-large">{{ t(item.labelKey) }}</span>
         </button>
       </nav>
     </aside>
@@ -23,15 +23,16 @@
 
 <script setup lang="ts">
 import { useRouter, useRoute } from 'vue-router';
+import { t } from '../i18n';
 
 const router = useRouter();
 const route = useRoute();
 
-const navItems: { path: string; label: string; icon: string }[] = [
-  { path: '/providers', label: '供应商', icon: 'mdi-cloud' },
-  { path: '/keys', label: '密钥', icon: 'mdi-key' },
-  { path: '/stats', label: '统计', icon: 'mdi-chart-bar' },
-  { path: '/settings', label: '设置', icon: 'mdi-cog' },
+const navItems: { path: string; labelKey: string; icon: string }[] = [
+  { path: '/providers', labelKey: 'nav.providers', icon: 'mdi-cloud' },
+  { path: '/keys', labelKey: 'nav.keys', icon: 'mdi-key' },
+  { path: '/stats', labelKey: 'nav.stats', icon: 'mdi-chart-bar' },
+  { path: '/settings', labelKey: 'nav.settings', icon: 'mdi-cog' },
 ];
 
 function isActive(path: string) {

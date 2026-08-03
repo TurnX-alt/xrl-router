@@ -235,11 +235,103 @@ impl super::Database {
         }
         Ok(result)
     }
+
+    /// 分页拉取请求日志，按时间逆序（同秒按 id 逆序，保证稳定排序）。
+    /// 返回 (总行数, 当前页行)。page >= 1；越界页返回空 data。
+    pub fn get_usage_log_page(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> anyhow::Result<(i64, Vec<serde_json::Value>)> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM usage_log", [], |row| row.get(0))?;
+        let offset = (page - 1).max(0) * page_size;
+
+        let mut stmt = conn.prepare(
+            "SELECT
+                id, timestamp,
+                provider_name, model_display_name,
+                service_key_name, service_key_masked,
+                key_name, key_masked,
+                request_type,
+                prompt_tokens, completion_tokens, latency_ms,
+                success, error_message
+             FROM usage_log
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![page_size, offset], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "timestamp": row.get::<_, i64>(1)?,
+                "provider_name": row.get::<_, String>(2)?,
+                "model_display_name": row.get::<_, String>(3)?,
+                "service_key_name": row.get::<_, String>(4)?,
+                "service_key_masked": row.get::<_, String>(5)?,
+                "key_name": row.get::<_, String>(6)?,
+                "key_masked": row.get::<_, String>(7)?,
+                "request_type": row.get::<_, String>(8)?,
+                "prompt_tokens": row.get::<_, i64>(9)?,
+                "completion_tokens": row.get::<_, i64>(10)?,
+                "latency_ms": row.get::<_, i64>(11)?,
+                "success": row.get::<_, i64>(12)? != 0,
+                "error_message": row.get::<_, Option<String>>(13)?,
+            }))
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok((total, result))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 分页拉取：时间逆序、总数正确、越界页空、success 字段回传。
+    #[test]
+    fn test_get_usage_log_page() {
+        let db = super::super::Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        // 插 25 行，timestamp 递增（1_000_000_000 + i），逆序分页后第一页应倒序返回
+        for i in 0..25i64 {
+            db.insert_usage_log(
+                1_000_000_000 + i,
+                "p1", "P1", "m1", "M1",
+                Some("pk1"), "PK", "pk-masked",
+                Some("sk1"), "SK", "sk-masked",
+                "/v1/messages",
+                10, 20, 30, i % 2 == 0, Some("err"), 0,
+            )
+            .unwrap();
+        }
+
+        // 第 1 页：10 条，逆序（最新的 1_000_000_024 在前）
+        let (total, page1) = db.get_usage_log_page(1, 10).unwrap();
+        assert_eq!(total, 25);
+        assert_eq!(page1.len(), 10);
+        assert_eq!(page1[0]["timestamp"], 1_000_000_024);
+        assert_eq!(page1[9]["timestamp"], 1_000_000_015);
+        // i=24 是偶数 → success = true；错误信息透传
+        assert_eq!(page1[0]["success"], serde_json::json!(true));
+        assert_eq!(page1[0]["error_message"], serde_json::json!("err"));
+
+        // 第 2 页 / 第 3 页：衔接正确
+        let (_, page2) = db.get_usage_log_page(2, 10).unwrap();
+        assert_eq!(page2[0]["timestamp"], 1_000_000_014);
+        let (_, page3) = db.get_usage_log_page(3, 10).unwrap();
+        assert_eq!(page3.len(), 5);
+        assert_eq!(page3[4]["timestamp"], 1_000_000_000);
+
+        // 越界页：空数据
+        let (total4, page4) = db.get_usage_log_page(4, 10).unwrap();
+        assert_eq!(total4, 25);
+        assert!(page4.is_empty());
+    }
 
     /// 5h / 7d 滚动窗口聚合：只有窗口内的行被计入，且两个窗口互不影响。
     #[test]

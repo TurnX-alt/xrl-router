@@ -24,6 +24,10 @@ pub struct AppState {
     pub key_stats_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// WebSearch 劫持开关（运行时可改、无锁读）。
     pub websearch_hijack: Arc<std::sync::atomic::AtomicBool>,
+    /// 故障转移开关：同一模型多 provider 时，主 provider 失败自动切换下一个（运行时可改）。
+    pub failover_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// provider 级冷却表：provider_id → 冷却到期 unix 秒（纯内存，设计选择同密钥健康）。
+    pub provider_cooldowns: Arc<std::sync::RwLock<std::collections::HashMap<String, i64>>>,
     /// Plugin manager: tracks connected plugins and their delegated providers.
     pub plugins: PluginManager,
 }
@@ -51,6 +55,15 @@ impl AppState {
                 .map(|v| v == "true")
                 .unwrap_or(false),
         ));
+        let failover_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
+            database
+                .get_setting("failover_enabled")
+                .ok()
+                .flatten()
+                .map(|v| v == "true")
+                .unwrap_or(false),
+        ));
+        let provider_cooldowns = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
         let plugins = PluginManager::new(database.clone(), providers.providers_map());
 
@@ -64,6 +77,8 @@ impl AppState {
             master_key,
             key_stats_tx,
             websearch_hijack,
+            failover_enabled,
+            provider_cooldowns,
             plugins,
         }
     }
@@ -292,6 +307,167 @@ mod tests {
         let resp = client.get(format!("http://{}/install", pub_addr)).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let html = resp.text().await.unwrap();
-        assert!(html.contains("快速部署"), "/install 应返回 install 页面 HTML");
+        assert!(html.contains("客户分发 / Client Deploy"), "/install 应返回 install 页面 HTML");
+
+        // /api/stats/requests：请求日志分页（冒烟测试早前插过 usage 行）
+        let resp = client
+            .get(format!("http://{}/api/stats/requests?page=1&page_size=10", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let logs: serde_json::Value = resp.json().await.unwrap();
+        assert!(logs["total"].as_i64().unwrap_or(0) >= 1, "日志应至少有一条");
+        assert!(logs["data"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+        assert!(logs["data"][0].get("success").is_some(), "日志应带 success 字段");
+        assert!(logs["data"][0].get("timestamp").is_some(), "日志应带 timestamp 字段");
+    }
+
+    /// 故障转移 E2E：主 provider 5xx → 自动切到备选 provider 成功；开关关闭 → 透传 5xx。
+    /// 两个本地假上游（A 返回 500、B 返回 200 SSE），同 display_name 两个 provider 各一 key。
+    #[tokio::test]
+    async fn test_failover_switches_provider_on_5xx() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::response::sse::{Event, KeepAlive, Sse};
+        use axum::routing::post;
+        use futures::stream;
+        use std::convert::Infallible;
+
+        // 假上游 A：一律 500
+        let router_a = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (StatusCode::INTERNAL_SERVER_ERROR, "boom from A").into_response()
+            }),
+        );
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener_a, router_a).await.unwrap();
+        });
+
+        // 假上游 B：200 SSE 流
+        let router_b = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let s = stream::iter(vec![
+                    Ok::<_, Infallible>(Event::default().data("hello from B")),
+                    Ok::<_, Infallible>(Event::default().data("[DONE]")),
+                ]);
+                Sse::new(s).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(60)))
+            }),
+        );
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener_b, router_b).await.unwrap();
+        });
+
+        // 网关：两个 provider（A sort 0 主、B sort 1 备）+ 同 display_name 模型 + 各一 key
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let master_key = [7u8; 32];
+        let save_provider = |db: &Database, id: &str, sort: i64, base: &str| {
+            db.save_provider(&crate::types::Provider {
+                id: id.to_string(),
+                name: format!("P-{}", id),
+                kind: crate::types::ProviderKind::Openai,
+                base_url: base.to_string(),
+                api_path: "/v1/chat/completions".to_string(),
+                config: serde_json::json!({}),
+                enabled: true,
+                created_at: 1,
+                updated_at: 1,
+                sort_order: sort,
+            })
+            .unwrap();
+        };
+        save_provider(&db, "pa", 0, &format!("http://{}", addr_a));
+        save_provider(&db, "pb", 1, &format!("http://{}", addr_b));
+        for (pid, key) in [("pa", "sk-test-a"), ("pb", "sk-test-b")] {
+            db.save_model(&crate::types::Model {
+                id: format!("m-{}", pid),
+                provider_id: pid.to_string(),
+                model_id: format!("real-{}", key),
+                display_name: "gpt-x".to_string(),
+                tier: "custom".to_string(),
+                context_window: 128000,
+                max_output_tokens: 4096,
+                capabilities: "[\"text\"]".to_string(),
+                enabled: true,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+            db.save_api_key(&crate::types::ApiKey {
+                id: format!("k-{}", pid),
+                provider_id: pid.to_string(),
+                name: format!("K-{}", pid),
+                key_hash: crate::crypto::encrypt(key, &master_key).unwrap(),
+                key_masked: format!("***{}", &key[key.len() - 1..]),
+                key_plain: None,
+                status: "green".to_string(),
+                last_error: None,
+                last_error_code: None,
+                last_error_time: None,
+                last_used_at: None,
+                balance: None,
+                balance_updated_at: None,
+                total_requests: 0,
+                total_tokens: 0,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        }
+        // service key（分发密钥）——空 allowed_models = 允许全部
+        let raw_service_key = "xrl-test-failover-key";
+        let sk_hash = crate::crypto::hash_service_key(raw_service_key).unwrap();
+        db.save_service_key("sk-failover", "故障转移测试", &sk_hash, "***key").unwrap();
+
+        // 开关开：AppState 构造前写入 settings（AppState::new 读取）
+        db.set_setting("failover_enabled", "true").unwrap();
+        let config = Config {
+            port: 0,
+            host: "127.0.0.1".to_string(),
+            ..Default::default()
+        };
+        let state = Arc::new(AppState::new(config, db.clone(), master_key));
+        let router = crate::api::build_admin_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        for _ in 0..50 {
+            if client.get(format!("http://{}/health", addr)).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let body = r#"{"model":"gpt-x","messages":[{"role":"user","content":"hi"}]}"#;
+        let send = || {
+            client
+                .post(format!("http://{}/v1/chat/completions", addr))
+                .header("x-api-key", raw_service_key)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+        };
+
+        // 开关开：A 500 → 自动切 B → 200 且内容来自 B
+        let resp = send().send().await.unwrap();
+        assert_eq!(resp.status(), 200, "failover 开启时 5xx 应自动切换备选 provider");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("hello from B"), "响应应来自备选 provider B: {}", text);
+
+        // 开关关：主 provider A 的 500 直接透传
+        db.set_setting("failover_enabled", "false").unwrap();
+        state.failover_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        let resp = send().send().await.unwrap();
+        assert_eq!(resp.status(), 500, "failover 关闭时 5xx 应透传");
     }
 }

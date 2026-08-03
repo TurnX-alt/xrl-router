@@ -745,3 +745,63 @@ pub fn resolve_route(state: &AppState, display_name: &str) -> Option<ResolvedRou
 
 - 若需公网访问（不在设计内），应做 TLS + 反向代理，而不是放开 public listener 到公网
 
+
+---
+
+## ADR-018: 国际化（zh-CN / en）与数据导出导入
+
+**日期**: 2026-08-03  
+**状态**: 已接受
+
+### 背景
+
+AGENTS.md 原 Non-Goal「不做国际化，中文即可」，2026-08 用户主动要求实现 i18n 并扩展到全应用，同时要求数据导入/导出/重置（原 Non-Goal「不做数据导出/报表」被推翻）。两条 Non-Goal 已同步更新为 ✅ 状态。
+
+### 决策
+
+1. **前端 i18n**：`src/i18n/` 极简实现（`t(key)` + `setLocale()` + `reactive` 响应式 + localStorage 持久化），不引入 vue-i18n；翻译 key 按模块前缀（`nav.*`、`keys.*`、`stats.*` 等），语言包为 `zh-CN.ts` / `en.ts`
+2. **主题增加「跟随系统」**：`Theme` 扩展为 `light | dark | system`，监听 `prefers-color-scheme` 变化自动切换
+3. **开机静默启动**：`tauri-plugin-autostart`（MacosLauncher::LaunchAgent + `--minimized` 参数）
+4. **数据管理**：`GET /api/data/export`（SQL dump）、`POST /api/data/import`、`POST /api/data/reset`，走 `db/settings.rs` 的 `export_sql` / `import_sql` / `reset_all_data`；前端用 `tauri-plugin-dialog` + `tauri-plugin-fs` 读写 .sql 文件
+5. **后端文本同步**：托盘菜单（显示窗口/退出）语言存 DB `settings.locale`，`set_locale` Tauri command 动态更新菜单文本；`install.html` 分发页内联双语字典，按浏览器语言 + 手动切换
+
+### 原因
+
+1. 极简 i18n 避免引入重依赖；设置页先行，全应用跟进，key 前缀模式保证可维护
+2. 数据导出用 SQL 而非 JSON：SQLite 原生 dump 保真度高，且导入即执行，天然支持跨版本迁移
+
+### 代价
+
+- 新增/修改 UI 文本时必须维护两个语言包（AGENTS.md 已注明约束）
+- 后端托盘菜单文本依赖前端调用 `set_locale` 同步，纯后端改动场景下保持上次语言
+
+---
+
+## ADR-019: 故障转移（Provider Failover）——同别名多 Provider 候选 + 60s 冷却
+
+**日期**: 2026-08-03  
+**状态**: 已接受
+
+### 背景
+
+同一模型别名配置在多个 Provider（官方 + 代理镜像）时，上游故障会让整个会话失败。PRD 原「指数退避重试」（F-39）停留在计划中——重试同一上游没有意义，真正的问题是选错上游。方案升级为「换上游」而非「重试同一上游」。
+
+### 决策
+
+1. **候选解析**：`route.rs` 新增 `resolve_route_candidates()`，返回同 `display_name` 下全部候选（`sort_order ASC, created_at ASC`，按 provider_id 去重，跳过插件离线的委托 provider）；原 `resolve_route()` 保留，供开关关闭时使用
+2. **双层循环**：`handler.rs` 两个入口对称重写——外层遍历 provider 候选，内层遍历 key 池；key 级 4xx（401/402/403/429）先耗尽当前 provider 的 key，provider 级失败（5xx/网络错误/响应头超时）才切 provider
+3. **冷却表纯内存**：`failover.rs` 的 `provider_cooldowns`（provider_id → 到期时间，60s），与密钥健康同一哲学——不持久化、不广播；2xx 成功立即清除冷却
+4. **开关默认关闭**：`failover_enabled` 存 settings 表 + `Arc<AtomicBool>` 运行时切换（设置页「路由」Tab）；关闭时 `resolve_route` 包成单元素 vec，行为与历史完全一致
+5. **请求体预构造**：循环外构建 Anthropic/OpenAI 两种 body 骨架，循环内按候选类型选用并覆写 model——支持候选混合 OpenAI/Anthropic 类型（mixed-kind failover）
+6. **错误码语义收窄**：网络错误 502、响应头超时 504、key 4xx 耗尽透传最后一次上游失败响应、无可用 key 503
+
+### 原因
+
+1. 按 provider_id 去重是必要的：同一 provider 多行同别名（如多个模型行指向同一 provider）去重后按 sort_order 取最前，避免同一上游被重复尝试
+2. 冷却 60s 而非指数退避：场景是「上游暂时不可用」，固定冷却足够且行为可预期；PRD 的指数退避重试（重试同一上游）已无意义，F-45 注明
+3. 开关默认关闭符合 AGENTS.md「不主动改变既有行为」原则——failover 是增益特性，不是修复
+
+### 代价
+
+- 双循环复杂度集中在一个文件（handler.rs 两个入口对称改，约 +800 行）；winner 选定后需重绑定 resolved/provider_id/real_model_id 等变量，流式段与 usage_log 字段才自洽
+- 开关关闭路径与历史行为一致，但新增了 `ProviderFailure` 枚举与失败上下文传递，后续改动需注意两个循环的对称性

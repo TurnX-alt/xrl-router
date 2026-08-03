@@ -1,10 +1,10 @@
 <template>
   <div class="page">
     <div class="page__header">
-      <h2 class="md-typescale-headline-medium page__title">密钥</h2>
+      <h2 class="md-typescale-headline-medium page__title">{{ t('keys.title') }}</h2>
       <md-filled-button @click="openCreate">
         <span slot="icon" class="mdi mdi-plus"></span>
-        创建密钥
+        {{ t('keys.create') }}
       </md-filled-button>
     </div>
 
@@ -12,22 +12,22 @@
 
     <div v-else-if="!keys.length" class="empty-state">
       <span class="mdi mdi-inbox-outline empty-state__icon"></span>
-      <p class="md-typescale-body-large">空空如也</p>
+      <p class="md-typescale-body-large">{{ t('common.empty') }}</p>
     </div>
 
     <div v-else class="table-card">
       <table class="table">
         <thead>
           <tr class="md-typescale-label-large">
-            <th>密钥</th><th>可用模型</th><th>限额</th><th>创建时间</th><th>修改时间</th><th></th>
+            <th>{{ t('keys.col_key') }}</th><th>{{ t('keys.col_models') }}</th><th>{{ t('keys.col_quota') }}</th><th>{{ t('keys.col_created') }}</th><th>{{ t('keys.col_updated') }}</th><th></th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="k in keys" :key="k.id" class="md-typescale-body-medium">
-            <td class="key-cell mono" :title="k.name">{{ k.name || '未命名' }} ({{ k.key_masked }})</td>
+            <td class="key-cell mono" :title="k.name">{{ k.name || t('common.unnamed') }} ({{ k.key_masked }})</td>
             <td class="models-cell">
               <div class="models-inner">
-                <span v-if="!k.allowed_models || !k.allowed_models.length" class="chip chip--all md-typescale-label-medium">全部</span>
+                <span v-if="!k.allowed_models || !k.allowed_models.length" class="chip chip--all md-typescale-label-medium">{{ t('common.all') }}</span>
                 <span v-for="m in (k.allowed_models || [])" :key="m" class="chip md-typescale-label-medium">{{ m }}</span>
               </div>
             </td>
@@ -59,63 +59,63 @@
       @closed="menuOpen = null"
     >
       <md-menu-item @click="renameFromMenu">
-        <span class="mdi mdi-pencil-outline"></span> 重命名
+        <span class="mdi mdi-pencil-outline"></span> {{ t('keys.rename') }}
       </md-menu-item>
       <md-menu-item @click="permFromMenu">
-        <span class="mdi mdi-shield-outline"></span> 修改权限
+        <span class="mdi mdi-shield-outline"></span> {{ t('keys.edit_perm') }}
       </md-menu-item>
       <md-menu-item @click="quotaFromMenu">
-        <span class="mdi mdi-tune-variant"></span> 配置额度
+        <span class="mdi mdi-tune-variant"></span> {{ t('keys.config_quota') }}
       </md-menu-item>
       <md-menu-item class="menu-item--danger" @click="deleteFromMenu">
-        <span class="mdi mdi-delete-outline"></span> 删除
+        <span class="mdi mdi-delete-outline"></span> {{ t('common.delete') }}
       </md-menu-item>
     </md-menu>
 
     <md-dialog :open="createOpen" @close="createOpen = false">
-      <div slot="headline">创建密钥</div>
+      <div slot="headline">{{ t('keys.create') }}</div>
       <div slot="content" class="form">
-        <md-outlined-text-field :value="newName" label="备注名" class="field" @input="newName = ($event.target as HTMLInputElement).value"></md-outlined-text-field>
+        <md-outlined-text-field :value="newName" :label="t('keys.rename_label')" class="field" @input="newName = ($event.target as HTMLInputElement).value"></md-outlined-text-field>
       </div>
       <div slot="actions">
-        <md-text-button @click="createOpen = false">取消</md-text-button>
-        <md-filled-button @click="createKey">创建</md-filled-button>
+        <md-text-button @click="createOpen = false">{{ t('common.cancel') }}</md-text-button>
+        <md-filled-button @click="createKey">{{ t('common.create') }}</md-filled-button>
       </div>
     </md-dialog>
 
     <md-dialog :open="renameOpen" @close="renameOpen = false">
-      <div slot="headline">重命名密钥</div>
+      <div slot="headline">{{ t('keys.rename_title') }}</div>
       <div slot="content" class="form">
-        <md-outlined-text-field :value="renameName" label="备注名" class="field" @input="renameName = ($event.target as HTMLInputElement).value"></md-outlined-text-field>
+        <md-outlined-text-field :value="renameName" :label="t('keys.rename_label')" class="field" @input="renameName = ($event.target as HTMLInputElement).value"></md-outlined-text-field>
       </div>
       <div slot="actions">
-        <md-text-button @click="renameOpen = false">取消</md-text-button>
-        <md-filled-button @click="renameKey">保存</md-filled-button>
+        <md-text-button @click="renameOpen = false">{{ t('common.cancel') }}</md-text-button>
+        <md-filled-button @click="renameKey">{{ t('common.save') }}</md-filled-button>
       </div>
     </md-dialog>
 
     <md-dialog :open="!!newKeyPlain" @close="newKeyPlain = ''">
-      <div slot="headline">密钥已创建 — 仅显示一次</div>
+      <div slot="headline">{{ t('keys.created_once') }}</div>
       <div slot="content" class="form">
-        <p class="warn md-typescale-body-medium"><span class="mdi mdi-alert"></span>请妥善保存，关闭后无法再次查看</p>
-        <p class="md-typescale-body-medium deploy-label">明文密钥</p>
+        <p class="warn md-typescale-body-medium"><span class="mdi mdi-alert"></span>{{ t('keys.save_warning') }}</p>
+        <p class="md-typescale-body-medium deploy-label">{{ t('keys.plain_key') }}</p>
         <div class="key-box mono md-typescale-body-large">{{ newKeyPlain }}</div>
         <template v-if="deployLink">
-          <p class="md-typescale-body-medium deploy-label">分发链接（含明文密钥，勿公开）</p>
+          <p class="md-typescale-body-medium deploy-label">{{ t('keys.deploy_link') }}</p>
           <div class="key-box mono md-typescale-body-medium deploy-box">{{ deployLink }}</div>
         </template>
       </div>
       <div slot="actions">
-        <md-text-button @click="copyKey"><span slot="icon" class="mdi mdi-content-copy"></span>复制</md-text-button>
-        <md-filled-button :disabled="!deployLink" @click="copyDeployLink"><span slot="icon" class="mdi mdi-link-variant"></span>复制分发链接</md-filled-button>
-        <md-text-button @click="newKeyPlain = ''">完成</md-text-button>
+        <md-text-button @click="copyKey"><span slot="icon" class="mdi mdi-content-copy"></span>{{ t('common.copy') }}</md-text-button>
+        <md-filled-button :disabled="!deployLink" @click="copyDeployLink"><span slot="icon" class="mdi mdi-link-variant"></span>{{ t('keys.copy_deploy') }}</md-filled-button>
+        <md-text-button @click="newKeyPlain = ''">{{ t('common.done') }}</md-text-button>
       </div>
     </md-dialog>
 
     <md-dialog :open="permOpen" @close="permOpen = false">
-      <div slot="headline">权限管理 — {{ editingKey?.name || '未命名' }}</div>
+      <div slot="headline">{{ t('keys.perm_title', { name: editingKey?.name || t('common.unnamed') }) }}</div>
       <div slot="content" class="form">
-        <p class="md-typescale-body-medium perm-desc">按供应商区分可用模型。不勾选任何模型表示允许全部。</p>
+        <p class="md-typescale-body-medium perm-desc">{{ t('keys.perm_desc') }}</p>
         <md-circular-progress v-if="modelsLoading" indeterminate></md-circular-progress>
         <div v-else class="perm-list">
           <template v-for="p in providerModels" :key="p.name">
@@ -126,41 +126,41 @@
             </label>
           </template>
         </div>
-        <p v-if="!allModels.length && !modelsLoading" class="md-typescale-body-medium">尚无供应商模型数据，请先在供应商页面配置。</p>
+        <p v-if="!allModels.length && !modelsLoading" class="md-typescale-body-medium">{{ t('keys.perm_no_models') }}</p>
       </div>
       <div slot="actions">
-        <md-text-button @click="permOpen = false">取消</md-text-button>
-        <md-filled-button @click="savePerms">保存</md-filled-button>
+        <md-text-button @click="permOpen = false">{{ t('common.cancel') }}</md-text-button>
+        <md-filled-button @click="savePerms">{{ t('common.save') }}</md-filled-button>
       </div>
     </md-dialog>
 
     <md-dialog :open="quotaOpen" @close="quotaOpen = false">
-      <div slot="headline">配置额度 — {{ quotaKey?.name || '未命名' }}</div>
+      <div slot="headline">{{ t('keys.quota_title', { name: quotaKey?.name || t('common.unnamed') }) }}</div>
       <div slot="content" class="form">
-        <p class="md-typescale-body-medium quota-desc">滚动窗口内可用的 tokens 上限。设为 0 表示不设限。任一窗口触顶后请求将返回 429，直到该窗口滚动重置。</p>
-        <md-outlined-text-field type="number" min="0" label="5 小时上限" class="field"
+        <p class="md-typescale-body-medium quota-desc">{{ t('keys.quota_desc') }}</p>
+        <md-outlined-text-field type="number" min="0" :label="t('keys.quota_5h_label')" class="field"
           :value="String(quota5h)" @input="quota5h = parseInt(($event.target as HTMLInputElement).value || '0', 10)">
         </md-outlined-text-field>
-        <div class="quota-preview mono md-typescale-body-medium">约 {{ formatAbbrev(quota5h) }} tokens</div>
-        <md-outlined-text-field type="number" min="0" label="7 天上限" class="field"
+        <div class="quota-preview mono md-typescale-body-medium">{{ t('keys.quota_preview', { value: formatAbbrev(quota5h) }) }}</div>
+        <md-outlined-text-field type="number" min="0" :label="t('keys.quota_7d_label')" class="field"
           :value="String(quota7d)" @input="quota7d = parseInt(($event.target as HTMLInputElement).value || '0', 10)">
         </md-outlined-text-field>
-        <div class="quota-preview mono md-typescale-body-medium">约 {{ formatAbbrev(quota7d) }} tokens</div>
+        <div class="quota-preview mono md-typescale-body-medium">{{ t('keys.quota_preview', { value: formatAbbrev(quota7d) }) }}</div>
       </div>
       <div slot="actions">
-        <md-text-button @click="quotaOpen = false">取消</md-text-button>
-        <md-filled-button @click="saveQuota">保存</md-filled-button>
+        <md-text-button @click="quotaOpen = false">{{ t('common.cancel') }}</md-text-button>
+        <md-filled-button @click="saveQuota">{{ t('common.save') }}</md-filled-button>
       </div>
     </md-dialog>
 
     <md-dialog :open="deleteOpen" @close="deleteOpen = false">
-      <div slot="headline">删除密钥</div>
+      <div slot="headline">{{ t('keys.delete_title') }}</div>
       <div slot="content" class="form">
-        <p class="md-typescale-body-medium">确定删除「{{ deleteTarget?.name || '未命名' }}」？此操作不可撤销。</p>
+        <p class="md-typescale-body-medium">{{ t('keys.delete_confirm', { name: deleteTarget?.name || t('common.unnamed') }) }}</p>
       </div>
       <div slot="actions">
-        <md-text-button @click="deleteOpen = false">取消</md-text-button>
-        <md-text-button class="confirm-del" @click="confirmDelete">确定删除</md-text-button>
+        <md-text-button @click="deleteOpen = false">{{ t('common.cancel') }}</md-text-button>
+        <md-text-button class="confirm-del" @click="confirmDelete">{{ t('keys.delete_confirm_btn') }}</md-text-button>
       </div>
     </md-dialog>
   </div>
@@ -170,6 +170,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { serviceKeysApi, providersApi, modelsApi, installApi, type ServiceKey } from '../api';
 import { wsClient } from '../ws';
+import { t } from '../i18n';
 
 type KeyRow = ServiceKey & { used_5h?: number; used_7d?: number };
 
@@ -259,11 +260,11 @@ function windowResetsIn(windowSecs: number): string {
   return resetsIn(windowSecs - (now % windowSecs));
 }
 
-/** 省略读数：≥1e8 → x.xx亿，≥1e4 → x.xx万，否则原样；0 → 不设限。 */
+/** 省略读数：≥1e8 → x.xx亿/B，≥1e4 → x.xx万/K，否则原样；0 → 不设限。 */
 function formatAbbrev(n: number): string {
-  if (!n || n <= 0) return '不设限';
-  if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿';
-  if (n >= 1e4) return (n / 1e4).toFixed(2) + '万';
+  if (!n || n <= 0) return t('keys.unlimited');
+  if (n >= 1e8) return (n / 1e8).toFixed(2) + t('keys.unit_yi');
+  if (n >= 1e4) return (n / 1e4).toFixed(2) + t('keys.unit_wan');
   return String(n);
 }
 
@@ -295,7 +296,7 @@ async function saveQuota() {
     quotaOpen.value = false;
     await fetchKeys();
   } catch (e: any) {
-    alert(`保存额度失败：${e?.message || e}`);
+    alert(t('keys.save_quota_failed', { msg: e?.message || e }));
   }
 }
 
@@ -304,11 +305,11 @@ const renameName = ref('');
 async function renameKey() {
   if (!editingKey.value) return;
   try {
-    await serviceKeysApi.update(editingKey.value.id, { name: renameName.value.trim() || '未命名' });
+    await serviceKeysApi.update(editingKey.value.id, { name: renameName.value.trim() || t('common.unnamed') });
     renameOpen.value = false;
     await fetchKeys();
   } catch (e: any) {
-    alert(`重命名失败：${e?.message || e}`);
+    alert(t('keys.rename_failed', { msg: e?.message || e }));
   }
 }
 
@@ -327,12 +328,12 @@ async function fetchKeys() {
 function openCreate() { newName.value = ''; createOpen.value = true; }
 async function createKey() {
   try {
-    const r = await serviceKeysApi.create({ name: newName.value || '未命名' });
+    const r = await serviceKeysApi.create({ name: newName.value || t('common.unnamed') });
     createOpen.value = false;
     newKeyPlain.value = r.key;
     await fetchKeys();
   } catch (e: any) {
-    alert(`创建密钥失败：${e?.message || e}`);
+    alert(t('keys.create_failed', { msg: e?.message || e }));
   }
 }
 async function copyKey() { try { await navigator.clipboard.writeText(newKeyPlain.value); } catch {} }
@@ -354,7 +355,7 @@ async function confirmDelete() {
     deleteTarget.value = null;
     await fetchKeys();
   } catch (e: any) {
-    alert(`删除失败：${e?.message || e}`);
+    alert(t('keys.delete_failed', { msg: e?.message || e }));
   }
 }
 
@@ -372,7 +373,7 @@ async function fetchAvailableModels() {
     const providerName = new Map(providers.map((p) => [p.id, p.name]));
     const groupsMap = new Map<string, string[]>();
     for (const m of models) {
-      const pname = providerName.get(m.provider_id) || '未知';
+      const pname = providerName.get(m.provider_id) || t('common.unknown');
       const name = m.display_name || m.model_id;
       if (!groupsMap.has(pname)) groupsMap.set(pname, []);
       if (!groupsMap.get(pname)!.includes(name)) groupsMap.get(pname)!.push(name);
@@ -397,7 +398,7 @@ async function savePerms() {
     permOpen.value = false;
     await fetchKeys();
   } catch (e: any) {
-    alert(`保存权限失败：${e?.message || e}`);
+    alert(t('keys.save_perm_failed', { msg: e?.message || e }));
   }
 }
 

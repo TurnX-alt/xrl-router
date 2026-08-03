@@ -13,7 +13,8 @@ xrl-router 是一个运行在本地的 LLM API 统一网关。客户端通过一
 | HTTP 客户端 | reqwest 0.12 (流式 SSE) |
 | 加密 | aes-gcm 0.10 (Provider Key 加密) + argon2 0.5 (Service Key 哈希) |
 | 前端 | Vue 3 + Pinia + Vue Router 4 |
-| UI | Material Web Components (MD3) + MDI 图标 + Chart.js + SortableJS (拖拽排序) |
+| UI | Material Web Components (MD3) + MDI 图标 + Chart.js + SortableJS (拖拽排序) + 自研 i18n (zh-CN/en) |
+| 桌面插件 | tauri-plugin-autostart (开机自启) + tauri-plugin-dialog/fs (数据导出导入) |
 | 构建 | Vite 8 (前端) + Cargo (后端) |
 
 ## 快速开始
@@ -84,6 +85,10 @@ pnpm build
 
 每个 Provider 可配多个 API Key，round-robin 轮询调度。上游返回 401/403 标红永久跳过，402/429 标黄冷却 5 分钟，2xx 恢复绿色。轮询指针持久化到 settings 表，重启后从上次位置继续。
 
+### 故障转移（Provider Failover）
+
+同一模型别名下配置多个 Provider 时，可开启故障转移（设置页「路由」Tab，默认关闭）：上游 5xx / 网络错误 / 响应头超时自动切换到下一个候选 Provider，并对失败的 Provider 冷却 60 秒（纯内存，不持久化）。开启后请求依次尝试候选（按 `sort_order` 排序），key 级 4xx（401/402/403/429）仍优先在 Provider 内换 key 耗尽后才切 Provider。关闭时行为与单 Provider 完全一致。
+
 ### 安全
 
 - Provider API Key: **AES-256-GCM** 加密存储，主密钥独立于数据库（`master.key`，权限 0600）
@@ -98,9 +103,9 @@ pnpm build
 
 外部服务通过 WebSocket 注册为「委托供应商」，将非标 API 桥接为标准接口。Router 负责密钥轮换和用量统计，插件负责协议转换和业务头注入。
 
-### 系统托盘
+### 系统托盘 + 开机静默启动
 
-关闭窗口后应用隐藏到系统托盘，网关继续运行。
+关闭窗口后应用隐藏到系统托盘，网关继续运行。开启「开机静默启动」（设置页通用 Tab）后，系统登录时以 `--minimized` 拉起应用，窗口不显示、网关照常运行、驻留托盘；托盘菜单语言跟随应用语言设置（zh-CN / en）。
 
 ### WebSocket 实时推送
 
@@ -109,6 +114,18 @@ pnpm build
 ### WebSearch 劫持
 
 可选功能：拦截包含 `web_search` 工具的请求，用本地 Bing 搜索替代上游 API 的搜索功能（通过设置页开关控制）。
+
+### 国际化（i18n）
+
+全应用支持 zh-CN / en 双语言（2026-08 起）：前端 `src/i18n/` 极简实现（`t()` + `setLocale()`，localStorage 持久化），后端托盘菜单与 install 分发页同步双语。主题支持 `light / dark / system` 三态，system 模式跟随操作系统（修复了 Tauri 窗口主题强制导致跟随失效的问题）。
+
+### 数据管理
+
+设置页「数据」Tab：**导出**为 SQL dump 文件（.sql，可跨版本迁移）、**导入**覆盖恢复（导入前有确认对话框）、**一键重置**全部数据（保留 schema 版本）。导出/导入通过系统文件对话框选择路径，需要 `tauri-plugin-dialog` + `tauri-plugin-fs`。
+
+### 请求日志
+
+统计页新增「请求日志」区块：分页表格（每页 10 条，时间逆序），展示时间 / 密钥 / 供应商 / 模型 / 输入输出 tokens / 成功失败状态（失败可悬停查看错误信息），配合用量图表使用。
 
 ## 当前状态
 

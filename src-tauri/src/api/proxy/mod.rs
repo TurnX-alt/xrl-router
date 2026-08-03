@@ -5,6 +5,7 @@
 //! `upstream` / `websearch`。`translate` / `sniff` 为既有子模块。
 
 pub mod auth;
+pub mod failover;
 pub mod handler;
 pub mod key_rotation;
 pub mod quota;
