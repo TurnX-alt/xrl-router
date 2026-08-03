@@ -1,7 +1,24 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "默认权限：允许 shell open 在系统浏览器打开外链",
+  "description": "默认权限：shell open、窗口主题、开机自启、文件对话框、文件读写",
   "windows": ["main"],
-  "permissions": ["core:default", "shell:allow-open", "core:window:allow-set-theme"]
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "core:window:allow-set-theme",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
+    "dialog:default",
+    "fs:default",
+    {
+      "identifier": "fs:allow-read-text-file",
+      "allow": [{ "path": "$HOME/**" }, { "path": "$DOWNLOAD/**" }, { "path": "$DOCUMENT/**" }, { "path": "$DESKTOP/**" }, { "path": "$APPDATA/**" }]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "$HOME/**" }, { "path": "$DOWNLOAD/**" }, { "path": "$DOCUMENT/**" }, { "path": "$DESKTOP/**" }, { "path": "$APPDATA/**" }]
+    }
+  ]
 }

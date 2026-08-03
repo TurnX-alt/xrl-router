@@ -21,10 +21,19 @@ use crate::gateway::server::AppState;
 use super::auth::verify_service_key;
 use super::key_rotation::{pick_key_for, update_key_health};
 use super::quota::check_quota;
-use super::route::resolve_route;
+use super::route::{resolve_route, ResolvedRoute};
 use super::upstream::forward_upstream_error;
 use super::websearch::{has_websearch_tool, run_websearch_loop};
 use super::{sniff, translate, UPSTREAM_CHUNK_TIMEOUT_SECS, UPSTREAM_HEADER_TIMEOUT_SECS};
+
+/// 首个 provider 级失败（5xx/网络错误/响应头超时）：failover 切换后若无任何
+/// provider 成功，按它转发/报错。携带那次尝试的候选与 key 上下文，
+/// 保证 usage_log 字段自洽（provider/model/key 必须同一次尝试）。
+enum ProviderFailure {
+    Network { cand: ResolvedRoute, key_id: String, key_name: String, key_masked: String, msg: String },
+    HeaderTimeout { cand: ResolvedRoute, key_id: String, key_name: String, key_masked: String, secs: u64 },
+    Upstream5xx { cand: ResolvedRoute, key_id: String, key_name: String, key_masked: String, status: u16 },
+}
 
 /// POST /v1/messages - Anthropic Messages API proxy (streaming only).
 pub async fn proxy_anthropic_messages(
@@ -84,25 +93,37 @@ pub async fn proxy_anthropic_messages(
         ));
     }
 
-    let resolved = match resolve_route(&state, &model_name).await {
-        Some(r) => {
-            info!(
-                trace_id = %trace_id,
-                provider_kind = %r.provider_kind,
-                real_model = %r.real_model_id,
-                "Route resolved"
-            );
-            r
-        }
-        None => {
-            warn!(trace_id = %trace_id, model = %model_name, "Model not found or not available");
-            return Err((
-                StatusCode::BAD_REQUEST,
-                HeaderMap::new(),
-                Json(json!({"error": {"type": "invalid_request_error", "message": "Model not found or not available"}})),
-            ))
+    // 路由解析：故障转移开关开启时取全部候选（同 display_name 的多 provider，
+    // 按 sort_order 排序），关闭时仅主 provider（与历史行为完全一致）。
+    let failover = state.failover_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let candidates: Vec<ResolvedRoute> = {
+        let cands = if failover {
+            super::route::resolve_route_candidates(&state, &model_name).await
+        } else {
+            resolve_route(&state, &model_name).await.map(|r| vec![r])
+        };
+        match cands {
+            Some(c) if !c.is_empty() => {
+                info!(
+                    trace_id = %trace_id,
+                    candidates = c.len(),
+                    provider_kind = %c[0].provider_kind,
+                    real_model = %c[0].real_model_id,
+                    "Route resolved"
+                );
+                c
+            }
+            _ => {
+                warn!(trace_id = %trace_id, model = %model_name, "Model not found or not available");
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    HeaderMap::new(),
+                    Json(json!({"error": {"type": "invalid_request_error", "message": "Model not found or not available"}})),
+                ))
+            }
         }
     };
+    let resolved = candidates[0].clone();
 
     let provider_is_anthropic = resolved.provider_kind == "anthropic";
     let needs_translation = !provider_is_anthropic;
@@ -115,26 +136,21 @@ pub async fn proxy_anthropic_messages(
         return run_websearch_loop(&state, &body, &resolved, provider_is_anthropic, &trace_id, &service_key).await;
     }
 
-    let mut request_body = if needs_translation {
-        translate::anthropic_req_to_openai(&body)
-    } else {
-        body.clone()
-    };
-
-    // Force streaming and substitute real model name for upstream.
-    if let Some(obj) = request_body.as_object_mut() {
-        obj.insert("model".to_string(), json!(resolved.real_model_id));
+    // 预构造两种格式的请求体骨架（翻译是纯函数）：故障转移的候选可能混合
+    // OpenAI/Anthropic 格式，循环内按候选 kind 选用变体，并覆写 model 为
+    // 候选的真实模型 ID（候选是 models 表的不同行，real_model_id 各自不同）。
+    let mut body_anthropic = body.clone();
+    if let Some(obj) = body_anthropic.as_object_mut() {
+        obj.insert("stream".to_string(), json!(true));
+    }
+    let mut body_openai = translate::anthropic_req_to_openai(&body);
+    if let Some(obj) = body_openai.as_object_mut() {
         obj.insert("stream".to_string(), json!(true));
         // Ask OpenAI-compatible upstreams to include token usage in the final
         // stream chunk so we can record it. Anthropic upstreams always include it.
-        if !provider_is_anthropic {
-            obj.insert("stream_options".to_string(), json!({"include_usage": true}));
-        }
+        obj.insert("stream_options".to_string(), json!({"include_usage": true}));
     }
 
-    let upstream_url = resolved.upstream_url.clone();
-    let provider_id = resolved.provider_id.clone();
-    let model_row_id = resolved.model_row_id.clone();
     let client = crate::http::build_http_client()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -142,125 +158,281 @@ pub async fn proxy_anthropic_messages(
 
     info!(
         trace_id = %trace_id,
-        upstream_url = %upstream_url,
+        upstream_url = %candidates[0].upstream_url,
         "Calling upstream API (streaming)"
     );
 
-    // Retry loop: 401/402/403/429 → mark current key, rotate to next, replay.
+    // 双循环：外层 provider 候选（failover），内层 key 轮换。
+    // 401/402/403/429 → 标记 key 健康后换 key（内层 continue，先耗尽当前 provider 的 key）；
+    // 5xx/网络错误/响应头超时 → 有后续候选时立即切 provider（外层 continue），否则与单 provider 时代一致；
+    // 2xx → 选中（winner）。
     let mut last_resp: Option<reqwest::Response> = None;
     let mut last_key_id: Option<String> = None;
     let mut last_key_name: Option<String> = None;
     let mut last_key_masked: Option<String> = None;
-    // 兜底：最多重试 key 总数次，防止任何意外死循环。
-    let max_attempts = state.keys.get_stats(&provider_id).map(|s| s.total as u32).unwrap_or(1);
-    let mut attempts: u32 = 0;
-    let response = loop {
-        attempts += 1;
-        if attempts > max_attempts {
-            match last_resp {
-                Some(r) => break r,
-                None => {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        HeaderMap::new(),
-                        Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
-                    ));
-                }
-            }
-        }
-        let picked = match pick_key_for(&state, &provider_id) {
-            Some(p) => p,
-            None => match last_resp {
-                // All keys exhausted: forward the last failed upstream response.
-                Some(r) => break r,
-                None => {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        HeaderMap::new(),
-                        Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
-                    ));
-                }
-            },
-        };
-        last_key_id = Some(picked.id.clone());
-        last_key_name = Some(picked.name.clone());
-        last_key_masked = Some(picked.key_masked.clone());
-        let key_name = picked.name.clone();
-        let key_masked = picked.key_masked.clone();
+    let mut last_candidate: ResolvedRoute = candidates[0].clone();
+    // 首个 provider 级失败（5xx/网络/超时）：无 winner 时按它转发/报错（比 key 级 4xx 更有诊断价值）
+    let mut provider_failure: Option<ProviderFailure> = None;
+    // 5xx 的原始响应（供透传）；key 级 4xx 用 last_resp
+    let mut failover_resp: Option<reqwest::Response> = None;
+    let mut response: Option<reqwest::Response> = None;
+    let mut winner: Option<(ResolvedRoute, super::route::PickedKey)> = None;
 
-        let mut req_builder = client.post(&upstream_url);
-        if provider_is_anthropic {
-            req_builder = req_builder
-                .header("x-api-key", &picked.key_hash)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", picked.key_hash));
-        }
-
-        let resp = match tokio::time::timeout(
-            Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
-            req_builder
-                .header("Content-Type", "application/json")
-                .json(&request_body)
-                .send(),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                // Network error (not a key problem) — don't retry, record and bail.
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                error!(trace_id = %trace_id, duration_ms, error = %e, "Upstream call failed");
-                let _ = state.database.insert_usage_log(
-                    chrono::Utc::now().timestamp(),
-                    &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
-                    Some(&picked.id), key_name.as_str(), key_masked.as_str(),
-                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
-                    "/v1/messages",
-                    0, 0, duration_ms, false, Some(&e.to_string()), 0,
-                );
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    HeaderMap::new(),
-                    Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
-                ));
-            }
-            Err(_) => {
-                // 上游建连后挂起不响应时，send() 会卡死；这里用超时兜底，避免整个重试循环被拖住。
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                let msg = format!(
-                    "upstream timed out after {}s waiting for response headers",
-                    UPSTREAM_HEADER_TIMEOUT_SECS
-                );
-                warn!(trace_id = %trace_id, duration_ms, key_id = %picked.id, "{}", msg);
-                let _ = state.database.insert_usage_log(
-                    chrono::Utc::now().timestamp(),
-                    &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
-                    Some(&picked.id), key_name.as_str(), key_masked.as_str(),
-                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
-                    "/v1/messages",
-                    0, 0, duration_ms, false, Some(&msg), 0,
-                );
-                return Err((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    HeaderMap::new(),
-                    Json(json!({"error": {"type": "api_error", "message": msg}})),
-                ));
-            }
-        };
-
-        let status = resp.status().as_u16();
-        update_key_health(&state.keys, &provider_id, &picked.key_hash, status);
-
-        if matches!(status, 401 | 402 | 403 | 429) {
-            warn!(trace_id = %trace_id, status, key_id = %picked.id, "upstream rejected key, rotating");
-            last_resp = Some(resp);
+    'provider: for (ci, cand) in candidates.iter().enumerate() {
+        // 冷却中的 provider 直接跳过（开关关闭时不会查冷却表，行为不变）
+        if failover && super::failover::is_provider_cooling(&state, &cand.provider_id) {
+            info!(trace_id = %trace_id, provider = %cand.provider_id, "provider cooling, skipping");
             continue;
         }
-        break resp;
-    };
+        last_candidate = cand.clone();
+        // 按候选格式选请求体变体，并覆写 model 为候选的真实模型 ID
+        let attempt_body = if cand.provider_kind == "anthropic" {
+            &mut body_anthropic
+        } else {
+            &mut body_openai
+        };
+        if let Some(obj) = attempt_body.as_object_mut() {
+            obj.insert("model".to_string(), json!(cand.real_model_id));
+        }
+        // 兜底：最多重试该 provider 的 key 总数次，防止任何意外死循环。
+        let max_attempts = state.keys.get_stats(&cand.provider_id).map(|s| s.total as u32).unwrap_or(1);
+        let mut attempts: u32 = 0;
+        loop {
+            attempts += 1;
+            if attempts > max_attempts {
+                if failover && ci + 1 < candidates.len() {
+                    super::failover::mark_provider_failed(&state, &cand.provider_id);
+                    continue 'provider;
+                }
+                break;
+            }
+            let picked = match pick_key_for(&state, &cand.provider_id) {
+                Some(p) => p,
+                None => {
+                    // 该 provider 的 key 全部不可用：有后续候选 → 切；否则透传最后一次失败响应
+                    if failover && ci + 1 < candidates.len() {
+                        super::failover::mark_provider_failed(&state, &cand.provider_id);
+                        continue 'provider;
+                    }
+                    break;
+                }
+            };
+            last_key_id = Some(picked.id.clone());
+            last_key_name = Some(picked.name.clone());
+            last_key_masked = Some(picked.key_masked.clone());
+            let key_name = picked.name.clone();
+            let key_masked = picked.key_masked.clone();
 
+            let mut req_builder = client.post(&cand.upstream_url);
+            if cand.provider_kind == "anthropic" {
+                req_builder = req_builder
+                    .header("x-api-key", &picked.key_hash)
+                    .header("anthropic-version", "2023-06-01");
+            } else {
+                req_builder = req_builder.header("Authorization", format!("Bearer {}", picked.key_hash));
+            }
+
+            let resp = match tokio::time::timeout(
+                Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
+                req_builder
+                    .header("Content-Type", "application/json")
+                    .json(&attempt_body)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    if failover && ci + 1 < candidates.len() {
+                        // provider 级故障：立即切下一个候选（不浪费 key 尝试）
+                        provider_failure = Some(ProviderFailure::Network {
+                            cand: cand.clone(),
+                            key_id: picked.id.clone(),
+                            key_name: picked.name.clone(),
+                            key_masked: picked.key_masked.clone(),
+                            msg: e.to_string(),
+                        });
+                        super::failover::mark_provider_failed(&state, &cand.provider_id);
+                        continue 'provider;
+                    }
+                    // Network error (not a key problem) — don't retry, record and bail.
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    error!(trace_id = %trace_id, duration_ms, error = %e, "Upstream call failed");
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                        Some(&picked.id), key_name.as_str(), key_masked.as_str(),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        "/v1/messages",
+                        0, 0, duration_ms, false, Some(&e.to_string()), 0,
+                    );
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
+                    ));
+                }
+                Err(_) => {
+                    if failover && ci + 1 < candidates.len() {
+                        provider_failure = Some(ProviderFailure::HeaderTimeout {
+                            cand: cand.clone(),
+                            key_id: picked.id.clone(),
+                            key_name: picked.name.clone(),
+                            key_masked: picked.key_masked.clone(),
+                            secs: UPSTREAM_HEADER_TIMEOUT_SECS,
+                        });
+                        super::failover::mark_provider_failed(&state, &cand.provider_id);
+                        continue 'provider;
+                    }
+                    // 上游建连后挂起不响应时，send() 会卡死；这里用超时兜底，避免整个重试循环被拖住。
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    let msg = format!(
+                        "upstream timed out after {}s waiting for response headers",
+                        UPSTREAM_HEADER_TIMEOUT_SECS
+                    );
+                    warn!(trace_id = %trace_id, duration_ms, key_id = %picked.id, "{}", msg);
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                        Some(&picked.id), key_name.as_str(), key_masked.as_str(),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        "/v1/messages",
+                        0, 0, duration_ms, false, Some(&msg), 0,
+                    );
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": msg}})),
+                    ));
+                }
+            };
+
+            let status = resp.status().as_u16();
+            update_key_health(&state.keys, &cand.provider_id, &picked.key_hash, status);
+
+            if matches!(status, 401 | 402 | 403 | 429) {
+                warn!(trace_id = %trace_id, status, key_id = %picked.id, "upstream rejected key, rotating");
+                last_resp = Some(resp);
+                continue;
+            }
+            if matches!(status, 500..=599) {
+                // provider 级故障：有后续候选 → 切；否则透传 5xx（与单 provider 时代一致）
+                if failover && ci + 1 < candidates.len() {
+                    provider_failure = Some(ProviderFailure::Upstream5xx {
+                        cand: cand.clone(),
+                        key_id: picked.id.clone(),
+                        key_name: picked.name.clone(),
+                        key_masked: picked.key_masked.clone(),
+                        status,
+                    });
+                    failover_resp = Some(resp);
+                    super::failover::mark_provider_failed(&state, &cand.provider_id);
+                    continue 'provider;
+                }
+                last_resp = Some(resp);
+                break;
+            }
+            // 2xx：选中，成功
+            super::failover::mark_provider_ok(&state, &cand.provider_id);
+            winner = Some((cand.clone(), picked));
+            response = Some(resp);
+            break;
+        }
+    }
+
+    // 循环后：优先 winner（成功响应）；无 winner 时按 provider_failure > last_resp > 503 处理。
+    // 注意重新绑定 resolved/provider_id/model_row_id/needs_translation ——
+    // 流式段与日志字段一律取 winner 的 provider/model/key（候选是 models 表不同行）。
+    let (resolved, _winner_key) = match winner {
+        Some((r, k)) => (r, k),
+        None => {
+            match provider_failure {
+                Some(ProviderFailure::Network { cand, key_id, key_name, key_masked, msg }) => {
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    error!(trace_id = %trace_id, duration_ms, error = %msg, "Upstream call failed");
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                        Some(&key_id), key_name.as_str(), key_masked.as_str(),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        "/v1/messages",
+                        0, 0, duration_ms, false, Some(&msg), 0,
+                    );
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": msg}})),
+                    ));
+                }
+                Some(ProviderFailure::HeaderTimeout { cand, key_id, key_name, key_masked, secs }) => {
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    let msg = format!("upstream timed out after {}s waiting for response headers", secs);
+                    warn!(trace_id = %trace_id, duration_ms, key_id = %key_id, "{}", msg);
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                        Some(&key_id), key_name.as_str(), key_masked.as_str(),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        "/v1/messages",
+                        0, 0, duration_ms, false, Some(&msg), 0,
+                    );
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": msg}})),
+                    ));
+                }
+                Some(ProviderFailure::Upstream5xx { cand, key_id, key_name, key_masked, .. }) => {
+                    // 5xx 响应在 failover_resp 中保留，透传给客户端
+                    if let Some(r) = failover_resp {
+                        let s = r.status().as_u16();
+                        return Ok(forward_upstream_error(
+                            &state.database, &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                            Some(&key_id), Some(&key_name), Some(&key_masked),
+                            Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                            "/v1/messages",
+                            r, s, &trace_id, &start_time,
+                        )
+                        .await);
+                    }
+                    // 理论不可达（5xx 必存 failover_resp），兜底 503
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
+                    ));
+                }
+                None => {}
+            }
+            // key 级 4xx（401/402/403/429 全耗尽）：透传最后一次失败响应
+            if let Some(r) = last_resp {
+                let s = r.status().as_u16();
+                return Ok(forward_upstream_error(
+                    &state.database, &last_candidate.provider_id, last_candidate.provider_name.as_str(),
+                    &last_candidate.model_row_id, model_name.as_str(),
+                    last_key_id.as_deref(), last_key_name.as_deref(), last_key_masked.as_deref(),
+                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                    "/v1/messages",
+                    r, s, &trace_id, &start_time,
+                )
+                .await);
+            }
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                HeaderMap::new(),
+                Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
+            ));
+        }
+    };
+    let response = response.unwrap();
     let upstream_status = response.status().as_u16();
+
+    // failover 后 winner 的 provider 可能是混合 kind 中的任何一个：
+    // 响应分支与 usage 字段按 winner 决定（流式段后续全部使用这些重绑定变量）
+    let provider_id = resolved.provider_id.clone();
+    let model_row_id = resolved.model_row_id.clone();
+    let provider_is_anthropic = resolved.provider_kind == "anthropic";
+    let needs_translation = !provider_is_anthropic;
 
     if upstream_status >= 400 {
         return Ok(forward_upstream_error(
@@ -557,49 +729,56 @@ pub async fn proxy_openai_chat(
         ));
     }
 
-    let resolved = match resolve_route(&state, &model_name).await {
-        Some(r) => {
-            info!(
-                trace_id = %trace_id,
-                provider_kind = %r.provider_kind,
-                real_model = %r.real_model_id,
-                "Route resolved"
-            );
-            r
-        }
-        None => {
-            warn!(trace_id = %trace_id, model = %model_name, "Model not found");
-            return Err((
-                StatusCode::BAD_REQUEST,
-                HeaderMap::new(),
-                Json(json!({"error": {"type": "invalid_request_error", "message": "Model not found"}})),
-            ))
+    // 路由解析：故障转移开关开启时取全部候选（同 display_name 的多 provider，
+    // 按 sort_order 排序），关闭时仅主 provider（与历史行为完全一致）。
+    let failover = state.failover_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let candidates: Vec<ResolvedRoute> = {
+        let cands = if failover {
+            super::route::resolve_route_candidates(&state, &model_name).await
+        } else {
+            resolve_route(&state, &model_name).await.map(|r| vec![r])
+        };
+        match cands {
+            Some(c) if !c.is_empty() => {
+                info!(
+                    trace_id = %trace_id,
+                    candidates = c.len(),
+                    provider_kind = %c[0].provider_kind,
+                    real_model = %c[0].real_model_id,
+                    "Route resolved"
+                );
+                c
+            }
+            _ => {
+                warn!(trace_id = %trace_id, model = %model_name, "Model not found");
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    HeaderMap::new(),
+                    Json(json!({"error": {"type": "invalid_request_error", "message": "Model not found"}})),
+                ))
+            }
         }
     };
+    let resolved = candidates[0].clone();
 
     let provider_is_anthropic = resolved.provider_kind == "anthropic";
     let needs_translation = provider_is_anthropic;
 
-    let mut request_body = if needs_translation {
-        translate::openai_req_to_anthropic(&body)
-    } else {
-        body.clone()
-    };
-
-    // Force streaming and substitute real model name for upstream.
-    if let Some(obj) = request_body.as_object_mut() {
-        obj.insert("model".to_string(), json!(resolved.real_model_id));
+    // 预构造两种格式的请求体骨架（翻译是纯函数）：故障转移的候选可能混合
+    // OpenAI/Anthropic 格式，循环内按候选 kind 选用变体，并覆写 model 为
+    // 候选的真实模型 ID（候选是 models 表的不同行，real_model_id 各自不同）。
+    let mut body_openai = body.clone();
+    if let Some(obj) = body_openai.as_object_mut() {
         obj.insert("stream".to_string(), json!(true));
         // Ask OpenAI-compatible upstreams to include token usage in the final
         // stream chunk so we can record it. Anthropic upstreams always include it.
-        if !provider_is_anthropic {
-            obj.insert("stream_options".to_string(), json!({"include_usage": true}));
-        }
+        obj.insert("stream_options".to_string(), json!({"include_usage": true}));
+    }
+    let mut body_anthropic = translate::openai_req_to_anthropic(&body);
+    if let Some(obj) = body_anthropic.as_object_mut() {
+        obj.insert("stream".to_string(), json!(true));
     }
 
-    let upstream_url = resolved.upstream_url.clone();
-    let provider_id = resolved.provider_id.clone();
-    let model_row_id = resolved.model_row_id.clone();
     let client = crate::http::build_http_client()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -607,122 +786,279 @@ pub async fn proxy_openai_chat(
 
     info!(
         trace_id = %trace_id,
-        upstream_url = %upstream_url,
+        upstream_url = %candidates[0].upstream_url,
         "Calling upstream API (streaming)"
     );
 
-    // Retry loop: 401/402/403/429 → mark current key, rotate to next, replay.
+    // 双循环：外层 provider 候选（failover），内层 key 轮换。
+    // 401/402/403/429 → 标记 key 健康后换 key（内层 continue，先耗尽当前 provider 的 key）；
+    // 5xx/网络错误/响应头超时 → 有后续候选时立即切 provider（外层 continue），否则与单 provider 时代一致；
+    // 2xx → 选中（winner）。
     let mut last_resp: Option<reqwest::Response> = None;
     let mut last_key_id: Option<String> = None;
     let mut last_key_name: Option<String> = None;
     let mut last_key_masked: Option<String> = None;
-    // 兜底：最多重试 key 总数次，防止任何意外死循环。
-    let max_attempts = state.keys.get_stats(&provider_id).map(|s| s.total as u32).unwrap_or(1);
-    let mut attempts: u32 = 0;
-    let response = loop {
-        attempts += 1;
-        if attempts > max_attempts {
-            match last_resp {
-                Some(r) => break r,
-                None => {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        HeaderMap::new(),
-                        Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
-                    ));
-                }
-            }
-        }
-        let picked = match pick_key_for(&state, &provider_id) {
-            Some(p) => p,
-            None => match last_resp {
-                Some(r) => break r,
-                None => {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        HeaderMap::new(),
-                        Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
-                    ));
-                }
-            },
-        };
-        last_key_id = Some(picked.id.clone());
-        last_key_name = Some(picked.name.clone());
-        last_key_masked = Some(picked.key_masked.clone());
-        let key_name = picked.name.clone();
-        let key_masked = picked.key_masked.clone();
+    let mut last_candidate: ResolvedRoute = candidates[0].clone();
+    // 首个 provider 级失败（5xx/网络/超时）：无 winner 时按它转发/报错（比 key 级 4xx 更有诊断价值）
+    let mut provider_failure: Option<ProviderFailure> = None;
+    // 5xx 的原始响应（供透传）；key 级 4xx 用 last_resp
+    let mut failover_resp: Option<reqwest::Response> = None;
+    let mut response: Option<reqwest::Response> = None;
+    let mut winner: Option<(ResolvedRoute, super::route::PickedKey)> = None;
 
-        let mut req_builder = client.post(&upstream_url);
-        if provider_is_anthropic {
-            req_builder = req_builder
-                .header("x-api-key", &picked.key_hash)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", picked.key_hash));
-        }
-
-        let resp = match tokio::time::timeout(
-            Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
-            req_builder
-                .header("Content-Type", "application/json")
-                .json(&request_body)
-                .send(),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                error!(trace_id = %trace_id, duration_ms, error = %e, "Upstream call failed");
-                let _ = state.database.insert_usage_log(
-                    chrono::Utc::now().timestamp(),
-                    &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
-                    Some(&picked.id), key_name.as_str(), key_masked.as_str(),
-                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
-                    "/v1/chat/completions",
-                    0, 0, duration_ms, false, Some(&e.to_string()), 0,
-                );
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    HeaderMap::new(),
-                    Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
-                ));
-            }
-            Err(_) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                let msg = format!(
-                    "upstream timed out after {}s waiting for response headers",
-                    UPSTREAM_HEADER_TIMEOUT_SECS
-                );
-                warn!(trace_id = %trace_id, duration_ms, key_id = %picked.id, "{}", msg);
-                let _ = state.database.insert_usage_log(
-                    chrono::Utc::now().timestamp(),
-                    &provider_id, resolved.provider_name.as_str(), &model_row_id, model_name.as_str(),
-                    Some(&picked.id), key_name.as_str(), key_masked.as_str(),
-                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
-                    "/v1/chat/completions",
-                    0, 0, duration_ms, false, Some(&msg), 0,
-                );
-                return Err((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    HeaderMap::new(),
-                    Json(json!({"error": {"type": "api_error", "message": msg}})),
-                ));
-            }
-        };
-
-        let status = resp.status().as_u16();
-        update_key_health(&state.keys, &provider_id, &picked.key_hash, status);
-
-        if matches!(status, 401 | 402 | 403 | 429) {
-            warn!(trace_id = %trace_id, status, key_id = %picked.id, "upstream rejected key, rotating");
-            last_resp = Some(resp);
+    'provider: for (ci, cand) in candidates.iter().enumerate() {
+        // 冷却中的 provider 直接跳过（开关关闭时不会查冷却表，行为不变）
+        if failover && super::failover::is_provider_cooling(&state, &cand.provider_id) {
+            info!(trace_id = %trace_id, provider = %cand.provider_id, "provider cooling, skipping");
             continue;
         }
-        break resp;
-    };
+        last_candidate = cand.clone();
+        // 按候选格式选请求体变体，并覆写 model 为候选的真实模型 ID
+        let attempt_body = if cand.provider_kind == "anthropic" {
+            &mut body_anthropic
+        } else {
+            &mut body_openai
+        };
+        if let Some(obj) = attempt_body.as_object_mut() {
+            obj.insert("model".to_string(), json!(cand.real_model_id));
+        }
+        // 兜底：最多重试该 provider 的 key 总数次，防止任何意外死循环。
+        let max_attempts = state.keys.get_stats(&cand.provider_id).map(|s| s.total as u32).unwrap_or(1);
+        let mut attempts: u32 = 0;
+        loop {
+            attempts += 1;
+            if attempts > max_attempts {
+                if failover && ci + 1 < candidates.len() {
+                    super::failover::mark_provider_failed(&state, &cand.provider_id);
+                    continue 'provider;
+                }
+                break;
+            }
+            let picked = match pick_key_for(&state, &cand.provider_id) {
+                Some(p) => p,
+                None => {
+                    // 该 provider 的 key 全部不可用：有后续候选 → 切；否则透传最后一次失败响应
+                    if failover && ci + 1 < candidates.len() {
+                        super::failover::mark_provider_failed(&state, &cand.provider_id);
+                        continue 'provider;
+                    }
+                    break;
+                }
+            };
+            last_key_id = Some(picked.id.clone());
+            last_key_name = Some(picked.name.clone());
+            last_key_masked = Some(picked.key_masked.clone());
+            let key_name = picked.name.clone();
+            let key_masked = picked.key_masked.clone();
 
+            let mut req_builder = client.post(&cand.upstream_url);
+            if cand.provider_kind == "anthropic" {
+                req_builder = req_builder
+                    .header("x-api-key", &picked.key_hash)
+                    .header("anthropic-version", "2023-06-01");
+            } else {
+                req_builder = req_builder.header("Authorization", format!("Bearer {}", picked.key_hash));
+            }
+
+            let resp = match tokio::time::timeout(
+                Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
+                req_builder
+                    .header("Content-Type", "application/json")
+                    .json(&attempt_body)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    if failover && ci + 1 < candidates.len() {
+                        // provider 级故障：立即切下一个候选（不浪费 key 尝试）
+                        provider_failure = Some(ProviderFailure::Network {
+                            cand: cand.clone(),
+                            key_id: picked.id.clone(),
+                            key_name: picked.name.clone(),
+                            key_masked: picked.key_masked.clone(),
+                            msg: e.to_string(),
+                        });
+                        super::failover::mark_provider_failed(&state, &cand.provider_id);
+                        continue 'provider;
+                    }
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    error!(trace_id = %trace_id, duration_ms, error = %e, "Upstream call failed");
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                        Some(&picked.id), key_name.as_str(), key_masked.as_str(),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        "/v1/chat/completions",
+                        0, 0, duration_ms, false, Some(&e.to_string()), 0,
+                    );
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": e.to_string()}})),
+                    ));
+                }
+                Err(_) => {
+                    if failover && ci + 1 < candidates.len() {
+                        provider_failure = Some(ProviderFailure::HeaderTimeout {
+                            cand: cand.clone(),
+                            key_id: picked.id.clone(),
+                            key_name: picked.name.clone(),
+                            key_masked: picked.key_masked.clone(),
+                            secs: UPSTREAM_HEADER_TIMEOUT_SECS,
+                        });
+                        super::failover::mark_provider_failed(&state, &cand.provider_id);
+                        continue 'provider;
+                    }
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    let msg = format!(
+                        "upstream timed out after {}s waiting for response headers",
+                        UPSTREAM_HEADER_TIMEOUT_SECS
+                    );
+                    warn!(trace_id = %trace_id, duration_ms, key_id = %picked.id, "{}", msg);
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                        Some(&picked.id), key_name.as_str(), key_masked.as_str(),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        "/v1/chat/completions",
+                        0, 0, duration_ms, false, Some(&msg), 0,
+                    );
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": msg}})),
+                    ));
+                }
+            };
+
+            let status = resp.status().as_u16();
+            update_key_health(&state.keys, &cand.provider_id, &picked.key_hash, status);
+
+            if matches!(status, 401 | 402 | 403 | 429) {
+                warn!(trace_id = %trace_id, status, key_id = %picked.id, "upstream rejected key, rotating");
+                last_resp = Some(resp);
+                continue;
+            }
+            if matches!(status, 500..=599) {
+                // provider 级故障：有后续候选 → 切；否则透传 5xx（与单 provider 时代一致）
+                if failover && ci + 1 < candidates.len() {
+                    provider_failure = Some(ProviderFailure::Upstream5xx {
+                        cand: cand.clone(),
+                        key_id: picked.id.clone(),
+                        key_name: picked.name.clone(),
+                        key_masked: picked.key_masked.clone(),
+                        status,
+                    });
+                    failover_resp = Some(resp);
+                    super::failover::mark_provider_failed(&state, &cand.provider_id);
+                    continue 'provider;
+                }
+                last_resp = Some(resp);
+                break;
+            }
+            // 2xx：选中，成功
+            super::failover::mark_provider_ok(&state, &cand.provider_id);
+            winner = Some((cand.clone(), picked));
+            response = Some(resp);
+            break;
+        }
+    }
+
+    // 循环后：优先 winner（成功响应）；无 winner 时按 provider_failure > last_resp > 503 处理。
+    // 注意重新绑定 resolved/provider_id/model_row_id/needs_translation ——
+    // 流式段与日志字段一律取 winner 的 provider/model/key（候选是 models 表不同行）。
+    let (resolved, _winner_key) = match winner {
+        Some((r, k)) => (r, k),
+        None => {
+            match provider_failure {
+                Some(ProviderFailure::Network { cand, key_id, key_name, key_masked, msg }) => {
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    error!(trace_id = %trace_id, duration_ms, error = %msg, "Upstream call failed");
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                        Some(&key_id), key_name.as_str(), key_masked.as_str(),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        "/v1/chat/completions",
+                        0, 0, duration_ms, false, Some(&msg), 0,
+                    );
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": msg}})),
+                    ));
+                }
+                Some(ProviderFailure::HeaderTimeout { cand, key_id, key_name, key_masked, secs }) => {
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    let msg = format!("upstream timed out after {}s waiting for response headers", secs);
+                    warn!(trace_id = %trace_id, duration_ms, key_id = %key_id, "{}", msg);
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                        Some(&key_id), key_name.as_str(), key_masked.as_str(),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        "/v1/chat/completions",
+                        0, 0, duration_ms, false, Some(&msg), 0,
+                    );
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": msg}})),
+                    ));
+                }
+                Some(ProviderFailure::Upstream5xx { cand, key_id, key_name, key_masked, .. }) => {
+                    // 5xx 响应在 failover_resp 中保留，透传给客户端
+                    if let Some(r) = failover_resp {
+                        let s = r.status().as_u16();
+                        return Ok(forward_upstream_error(
+                            &state.database, &cand.provider_id, cand.provider_name.as_str(), &cand.model_row_id, model_name.as_str(),
+                            Some(&key_id), Some(&key_name), Some(&key_masked),
+                            Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                            "/v1/chat/completions",
+                            r, s, &trace_id, &start_time,
+                        )
+                        .await);
+                    }
+                    // 理论不可达（5xx 必存 failover_resp），兜底 503
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        HeaderMap::new(),
+                        Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
+                    ));
+                }
+                None => {}
+            }
+            // key 级 4xx（401/402/403/429 全耗尽）：透传最后一次失败响应
+            if let Some(r) = last_resp {
+                let s = r.status().as_u16();
+                return Ok(forward_upstream_error(
+                    &state.database, &last_candidate.provider_id, last_candidate.provider_name.as_str(),
+                    &last_candidate.model_row_id, model_name.as_str(),
+                    last_key_id.as_deref(), last_key_name.as_deref(), last_key_masked.as_deref(),
+                    Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                    "/v1/chat/completions",
+                    r, s, &trace_id, &start_time,
+                )
+                .await);
+            }
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                HeaderMap::new(),
+                Json(json!({"error": {"type": "api_error", "message": "No available upstream keys"}})),
+            ));
+        }
+    };
+    let response = response.unwrap();
     let upstream_status = response.status().as_u16();
+
+    // failover 后 winner 的 provider 可能是混合 kind 中的任何一个：
+    // 响应分支与 usage 字段按 winner 决定（流式段后续全部使用这些重绑定变量）
+    let provider_id = resolved.provider_id.clone();
+    let model_row_id = resolved.model_row_id.clone();
+    let provider_is_anthropic = resolved.provider_kind == "anthropic";
+    let needs_translation = provider_is_anthropic;
 
     if upstream_status >= 400 {
         return Ok(forward_upstream_error(

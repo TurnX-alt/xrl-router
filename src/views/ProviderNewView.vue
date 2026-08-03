@@ -1,12 +1,12 @@
 <template>
   <div class="page">
     <h2 class="md-typescale-headline-medium page__title">
-      {{ isEdit ? '维护供应商' : isPluginMode ? '添加委托供应商' : '添加供应商' }}
+      {{ isEdit ? t('providerNew.title.edit') : isPluginMode ? t('providerNew.title.plugin') : t('providerNew.title.create') }}
     </h2>
 
     <md-outlined-text-field
       :value="name"
-      label="供应商名称"
+      :label="t('providerNew.name_label')"
       class="field"
       @input="name = ($event.target as HTMLInputElement).value"
     ></md-outlined-text-field>
@@ -14,7 +14,7 @@
     <md-outlined-select
       v-show="!isPluginMode"
       :value="kind"
-      label="API 格式"
+      :label="t('providerNew.kind_label')"
       class="field"
       menu-positioning="fixed"
       @input="kind = ($event.target as HTMLInputElement).value as 'openai' | 'anthropic'"
@@ -26,7 +26,7 @@
     <md-outlined-text-field
       v-show="!isPluginMode"
       :value="baseUrl"
-      label="Base URL"
+      :label="t('providerNew.base_url_label')"
       placeholder="https://api.example.com"
       class="field"
       @input="baseUrl = ($event.target as HTMLInputElement).value"
@@ -37,7 +37,7 @@
       :value="apiKeysText"
       type="textarea"
       rows="5"
-      label="API Key"
+      :label="t('providerNew.api_key_label')"
       placeholder="sk-xxxxxxxx&#10;sk-yyyyyyyy"
       class="field"
       @input="apiKeysText = ($event.target as HTMLInputElement).value"
@@ -47,21 +47,21 @@
       :value="modelsText"
       type="textarea"
       rows="5"
-      label="可用模型"
-      placeholder="gpt-4o&#10;claude-opus-4-8&lt;-my-opus"
+      :label="t('providerNew.models_label')"
+      :placeholder="t('providerNew.models_placeholder')"
       class="field"
       @input="modelsText = ($event.target as HTMLInputElement).value"
     ></md-outlined-text-field>
 
     <div v-if="isPluginMode && pluginInfo && pluginInfo.key_count > 0" class="keys-info">
       <span class="mdi mdi-key"></span>
-      已自动同步 {{ pluginInfo.key_count }} 把密钥
+      {{ t('providerNew.keys_synced', { count: pluginInfo.key_count }) }}
     </div>
 
     <div class="actions">
-      <md-text-button @click="$router.push('/providers')">取消</md-text-button>
+      <md-text-button @click="$router.push('/providers')">{{ t('common.cancel') }}</md-text-button>
       <md-filled-button @click="save" :disabled="saving || !canSave">
-        {{ saving ? '保存中...' : isEdit ? '保存修改' : '保存供应商' }}
+        {{ saving ? t('providerNew.saving') : isEdit ? t('providerNew.save_edit') : t('providerNew.save_create') }}
       </md-filled-button>
     </div>
   </div>
@@ -71,6 +71,7 @@
 import { ref, computed, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { providersApi, keysApi, modelsApi } from '../api';
+import { t } from '../i18n';
 
 const router = useRouter();
 const route = useRoute();
@@ -151,7 +152,7 @@ async function save() {
         }
       }
       for (const key of parseLines(apiKeysText.value)) {
-        await keysApi.create(providerId, { name: payload.name + ' 密钥', key });
+        await keysApi.create(providerId, { name: payload.name + t('providerNew.key_suffix'), key });
       }
     }
 
@@ -184,7 +185,7 @@ async function save() {
 
     router.push('/providers');
   } catch (e: any) {
-    alert(`保存失败：${e?.message || e}`);
+    alert(t('providerNew.save_failed', { msg: e?.message || e }));
   } finally {
     saving.value = false;
   }
@@ -212,7 +213,7 @@ onMounted(async () => {
           .join('\n');
       }
     } catch (e: any) {
-      alert(`插件信息加载失败：${e?.message || e}`);
+      alert(t('providerNew.plugin_load_failed', { msg: e?.message || e }));
     }
     return;
   }
@@ -261,7 +262,7 @@ onMounted(async () => {
       }
     }
   } catch (e: any) {
-    alert(`加载失败：${e?.message || e}`);
+    alert(t('providerNew.load_failed', { msg: e?.message || e }));
   }
 });
 </script>

@@ -19,8 +19,8 @@ src-tauri/src/                 后端 Rust
 ├── gateway/server.rs          AppState + start_gateway (双 listener) + CORS
 ├── api/
 │   ├── router.rs              axum 路由表（build_admin_router / build_public_router）
-│   ├── handlers/*             管理 API 处理器（按实体分文件；install.rs 托管 /install 页面）
-│   └── proxy/*                LLM 代理核心（handler/auth/quota/route/key_rotation/upstream/websearch/sniff/translate）
+│   ├── handlers/*             管理 API 处理器（按实体分文件；install.rs 托管 /install 页面；data.rs 数据导出/导入/重置）
+│   └── proxy/*                LLM 代理核心（handler/auth/quota/route/failover/key_rotation/upstream/websearch/sniff/translate）
 ├── db/*                       SQLite 封装（mod.rs + schema.rs + 按实体分文件）
 ├── types/*                    数据结构定义（Provider/Model/ApiKey/Chat/Route/...）
 ├── providers/                 Provider 适配器（proxy 不经过它）
@@ -142,14 +142,14 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 
 - ❌ **不引入非 MD3 的组件库**（Ant Design、shadcn、Radix 等）
 - ❌ **不做响应式移动适配**。Tauri 窗口默认 1200x800，桌面场景
-- ❌ **不做国际化**。中文即可
+- ✅ **国际化已实现**（zh-CN / en，2026-08 起）。`src/i18n/` 提供 `t()` 与 `setLocale()`；新增页面时必须为新字符串补充两个语言包的 key，禁止硬编码中文
 - ❌ **不做 Onboarding / 引导流程**。用户是开发者，看文档就行
 
 ### 数据层面
 
 - ❌ **不做价格追踪**。V9 已经把 `cost_per_mtok_*` 列全删了，历史证明 UI 从不使用
 - ❌ **不做计费 / 充值**。Token 配额（5h/7d 滚动窗口）已实现且足够本地自用，无需金额计费
-- ❌ **不做数据导出 / 报表**。StatsView 的图表足够
+- ✅ **数据导出/导入/重置已实现**（2026-08 起）。设置页「数据」Tab：导出为 SQL 文件、导入覆盖、一键重置。新增数据表时必须同步更新 `db/settings.rs` 的 `export_sql()` / `reset_all_data()` 表清单
 - ❌ **不做跨设备同步**。本地优先是核心卖点
 
 ## 什么时候该拒绝用户的请求

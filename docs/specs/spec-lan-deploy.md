@@ -58,6 +58,8 @@
 
 **输入**：URL query `?t=<明文 service key>`。无 `t` → 显示"请从密钥管理页获取分发链接"。
 
+**语言**：页面内联双语字典（zh/en，纯静态自包含，无构建依赖），标题「客户分发 / Client Deploy」，右上角固定语言切换按钮。语言优先级：URL `?lang=` 参数 > localStorage `install-lang` > `navigator.language`（en 前缀 → English，否则中文）。切换语言时重渲染并重新拉取模型列表。
+
 **拉取模型**：页面打开时用 `t` 调 `GET /v1/models`（`x-api-key: <t>`，同源 19069 无 CORS 问题），
 取可用别名列表（`data[].id` = display_name）。默认选中第一项（后端按 tier 排序，通常为主模型）。
 拉取失败则提示可忽略，但 Claude Code 会用官方模型名请求而 404。

@@ -196,6 +196,28 @@ export const statsApi = {
     request<{ data: StatsRow[]; top_model: TopModel | null }>(`/api/stats?from=${params.from}&to=${params.to}&tz_offset=${params.tz_offset}${params.granularity ? `&granularity=${params.granularity}` : ''}`),
 };
 
+// --- Request log (paged, newest first) ---
+export interface RequestLogRow {
+  id: number;
+  timestamp: number;
+  provider_name: string;
+  model_display_name: string;
+  service_key_name: string;
+  service_key_masked: string;
+  request_type: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  latency_ms: number;
+  success: boolean;
+  error_message: string | null;
+}
+
+export const requestLogApi = {
+  page: (params: { page?: number; page_size?: number }) =>
+    request<{ total: number; page: number; page_size: number; data: RequestLogRow[] }>(
+      `/api/stats/requests?page=${params.page ?? 1}&page_size=${params.page_size ?? 10}`),
+};
+
 // --- Public API ---
 export const publicApi = {
   health: () => request<any>('/health'),
@@ -203,9 +225,16 @@ export const publicApi = {
 
 // --- App Settings ---
 export const settingsApi = {
-  get: () => request<{ websearch_hijack: boolean }>('/api/settings'),
-  update: (data: { websearch_hijack?: boolean }) =>
+  get: () => request<{ websearch_hijack: boolean; failover_enabled: boolean }>('/api/settings'),
+  update: (data: { websearch_hijack?: boolean; failover_enabled?: boolean }) =>
     request<{ status: string }>('/api/settings', { method: 'PUT', body: data }),
+};
+
+// --- Data (import / export / reset) ---
+export const dataApi = {
+  export: () => request<string>('/api/data/export'),
+  import: (sql: string) => request<{ status: string }>('/api/data/import', { method: 'POST', body: { sql } }),
+  reset: () => request<{ status: string }>('/api/data/reset', { method: 'POST' }),
 };
 
 // --- Install（局域网分发）---

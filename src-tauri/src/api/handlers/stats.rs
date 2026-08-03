@@ -22,6 +22,31 @@ pub(crate) struct StatsQuery {
     tz_offset: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct LogQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+/// GET /api/stats/requests — 请求日志分页（时间逆序），每页默认 10 条。
+pub(crate) async fn get_stats_requests(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LogQuery>,
+) -> impl IntoResponse {
+    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params.page_size.unwrap_or(10).clamp(1, 100);
+    let (total, data) = state
+        .database
+        .get_usage_log_page(page, page_size)
+        .unwrap_or_else(|_| (0, Vec::new()));
+    Json(serde_json::json!({
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "data": data,
+    }))
+}
+
 pub(crate) async fn get_stats(
     State(state): State<Arc<AppState>>,
     Query(params): Query<StatsQuery>,
@@ -51,12 +76,14 @@ pub(crate) async fn get_stats(
 pub(crate) async fn get_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "websearch_hijack": state.websearch_hijack.load(std::sync::atomic::Ordering::Relaxed),
+        "failover_enabled": state.failover_enabled.load(std::sync::atomic::Ordering::Relaxed),
     }))
 }
 
 #[derive(Deserialize)]
 pub(crate) struct UpdateSettingsRequest {
     websearch_hijack: Option<bool>,
+    failover_enabled: Option<bool>,
 }
 
 pub(crate) async fn update_settings(
@@ -67,6 +94,16 @@ pub(crate) async fn update_settings(
         state.websearch_hijack.store(v, std::sync::atomic::Ordering::Relaxed);
         let val = if v { "true" } else { "false" };
         if let Err(e) = state.database.set_setting("websearch_hijack", val) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ));
+        }
+    }
+    if let Some(v) = req.failover_enabled {
+        state.failover_enabled.store(v, std::sync::atomic::Ordering::Relaxed);
+        let val = if v { "true" } else { "false" };
+        if let Err(e) = state.database.set_setting("failover_enabled", val) {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),

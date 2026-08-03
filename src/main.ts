@@ -3,10 +3,15 @@ import { createPinia } from 'pinia';
 import { createRouter, createWebHistory } from 'vue-router';
 import App from './App.vue';
 import { routes } from './router.js';
-import { initTheme } from './theme';
+import { initTheme, initSystemThemeListener } from './theme';
+import { initI18n } from './i18n';
 
 // 应用持久化的主题（在 mount 前设置，避免闪烁）
 initTheme();
+initSystemThemeListener();
+
+// 初始化国际化
+initI18n();
 
 // Material Web Components — individual imports (not all.js)
 import '@material/web/button/filled-button.js';
@@ -31,6 +36,10 @@ import '@material/web/checkbox/checkbox.js';
 import '@material/web/chips/chip-set.js';
 import '@material/web/chips/input-chip.js';
 import '@material/web/progress/circular-progress.js';
+import '@material/web/tabs/tabs.js';
+import '@material/web/tabs/secondary-tab.js';
+import '@material/web/labs/segmentedbutton/outlined-segmented-button.js';
+import '@material/web/labs/segmentedbuttonset/outlined-segmented-button-set.js';
 
 // Material Design Icons (MDI)
 import '@mdi/font/css/materialdesignicons.min.css';

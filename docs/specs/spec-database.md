@@ -287,6 +287,14 @@ db.execute(
 | 版本号冲突 | 跳过已执行的迁移 |
 | 数据库锁超时 | 重试 3 次，仍失败则启动失败 |
 
+## 数据导出 / 导入 / 重置（2026-08 新增，`db/settings.rs`）
+
+管理 API：`GET /api/data/export`、`POST /api/data/import`（body `{sql}`）、`POST /api/data/reset`（`api/handlers/data.rs`）。
+
+- **`export_sql()`**: 覆盖 providers / models / api_keys / service_keys / plugins / usage_log / settings **七张表**，DROP + CREATE + INSERT，事务包裹，字符串转义单引号。**新增数据表时必须同步表清单**
+- **`import_sql()`**: 直接 `execute_batch`（替换式导入，天然跨版本迁移）
+- **`reset_all_data()`**: 按固定表序 DELETE（usage_log / plugins / service_keys / api_keys / models / providers / settings），保留 schema_version
+
 ## 实现位置
 
 - `src-tauri/src/db/schema.rs` - MIGRATIONS 数组（所有 DDL 内联）
@@ -295,8 +303,8 @@ db.execute(
 - `src-tauri/src/db/models.rs` - Model CRUD
 - `src-tauri/src/db/api_keys.rs` - API Key CRUD
 - `src-tauri/src/db/service_keys.rs` - Service Key CRUD
-- `src-tauri/src/db/usage.rs` - Usage Log 查询
-- `src-tauri/src/db/settings.rs` - Settings CRUD
+- `src-tauri/src/db/usage.rs` - Usage Log 查询 + 请求日志分页
+- `src-tauri/src/db/settings.rs` - Settings CRUD + 导出/导入/重置
 
 ## 测试要求
 
@@ -310,5 +318,6 @@ db.execute(
 - [x] 迁移按序执行，跳过已应用的版本
 - [x] UPSERT 使用 `ON CONFLICT DO UPDATE`
 - [x] `usage_log` 自包含快照（无外键）
-- [x] `settings` 表支持运行时配置
+- [x] `settings` 表支持运行时配置（failover_enabled / locale / 轮询指针）
+- [x] 数据导出/导入/重置（`export_sql` / `import_sql` / `reset_all_data`）
 - [x] 通过所有单元测试

@@ -75,6 +75,17 @@ pub fn get_usage_by_day_and_key(
 ) -> anyhow::Result<Vec<serde_json::Value>>
 ```
 
+### 请求日志分页（2026-08 新增）
+
+```rust
+pub fn get_usage_log_page(page: i64, page_size: i64) -> anyhow::Result<PagedRows>
+```
+
+- **排序**: `timestamp DESC, id DESC`（同秒按 id 逆序，保证稳定分页）
+- **分页**: page 默认 1，page_size 默认 10、clamp 1–100；`COUNT(*)` 总数 + 当页行
+- **行字段**: `provider_name` / `model_display_name` / `service_key_name` / `key_masked` / `prompt_tokens` / `completion_tokens` / `latency_ms` / `success` / `error_message`
+- **HTTP 端点**: `GET /api/stats/requests?page=N&page_size=M` → `{total, page, page_size, data}`（`api/handlers/stats.rs::get_stats_requests`）
+
 ## 输出契约
 
 统计查询返回 `Vec<serde_json::Value>`（使用 `json!({})` 宏构建，无强类型结构体）。
@@ -159,4 +170,5 @@ CREATE INDEX idx_usage_service_key ON usage_log(service_key_id);
 - [x] 时区偏移支持
 - [x] 索引优化查询性能
 - [x] 异步写入（不影响请求延迟）
+- [x] 请求日志分页（`get_usage_log_page` + `GET /api/stats/requests`，含分页单元测试）
 - [x] 通过所有单元测试
