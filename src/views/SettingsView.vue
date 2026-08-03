@@ -8,7 +8,7 @@
       <div class="section__head">
         <span class="section__icon mdi mdi-information-outline"></span>
         <div>
-          <h3 class="md-typescale-title-medium">关于</h3>
+          <h3 class="md-typescale-title-medium">关于 (v{{ appVersion }})</h3>
           <p class="md-typescale-body-medium section__desc">
             XRL Router 是一个多 Provider AI LLM API 路由网关，支持跨 Provider 的模型层级调度和协议翻译。
           </p>
@@ -65,24 +65,39 @@
         </div>
       </div>
       <div class="section__body">
-        <md-outlined-button class="danger-btn" @click="destroy">
+        <md-outlined-button class="danger-btn" @click="destroyOpen = true">
           <span slot="icon" class="mdi mdi-delete-forever"></span>
           清除所有本地数据
         </md-outlined-button>
       </div>
     </section>
+
+    <md-dialog :open="destroyOpen" @close="destroyOpen = false">
+      <div slot="headline">清除所有本地数据</div>
+      <div slot="content" class="dialog-content">
+        <p class="md-typescale-body-medium">确定清除所有本地存储的数据吗？此操作不可恢复。</p>
+      </div>
+      <div slot="actions">
+        <md-text-button @click="destroyOpen = false">取消</md-text-button>
+        <md-text-button class="confirm-destroy" @click="confirmDestroy">确定清除</md-text-button>
+      </div>
+    </md-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
+import { getVersion } from '@tauri-apps/api/app';
 import { settingsApi } from '../api';
 import { getTheme, setTheme, type Theme } from '../theme';
 import { open as openUrl } from '@tauri-apps/plugin-shell';
 
 const router = useRouter();
 const GITHUB_URL = 'https://github.com/wpy030414/xrl-router';
+
+const appVersion = ref('—');
+const destroyOpen = ref(false);
 
 async function openExternal() {
   try {
@@ -116,12 +131,16 @@ onMounted(async () => {
   } catch {
     // ignore
   }
+  try {
+    appVersion.value = await getVersion();
+  } catch {
+    // 非 Tauri 环境（如纯浏览器调试）取不到版本号，保留占位
+  }
 });
 
-function destroy() {
-  if (!confirm('确定清除所有本地数据？此操作不可恢复。')) return;
+function confirmDestroy() {
   localStorage.clear();
-  alert('本地数据已清除');
+  destroyOpen.value = false;
   router.push('/');
 }
 </script>
@@ -172,4 +191,7 @@ function destroy() {
 
 .switch-row { display: flex; align-items: center; gap: 12px; }
 .switch-label { color: var(--md-sys-color-on-surface-variant); }
+
+.confirm-destroy { color: var(--md-sys-color-error); }
+.dialog-content { min-width: 320px; }
 </style>
