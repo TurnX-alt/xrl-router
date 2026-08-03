@@ -26,7 +26,7 @@
         :data-id="p.id"
       >
         <span class="card__drag mdi mdi-drag-horizontal-variant" title="拖动排序"></span>
-        <span class="card__avatar mdi" :class="p.kind === 'anthropic' ? 'avatar--anthropic' : 'avatar--openai'">
+        <span class="card__avatar mdi" :class="avatarClass(p)">
             <!-- Official Anthropic logo from simple-icons -->
             <svg v-if="p.kind === 'anthropic'" viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
               <path d="M11.376 24L10.776 23.544L10.44 22.8L10.776 21.312L11.16 19.392L11.472 17.856L11.76 15.96L11.928 15.336L11.904 15.288L11.784 15.312L10.344 17.28L8.16 20.232L6.432 22.056L6.024 22.224L5.304 21.864L5.376 21.192L5.784 20.616L8.16 17.568L9.6 15.672L10.536 14.592L10.512 14.448H10.464L4.128 18.576L3 18.72L2.496 18.264L2.568 17.52L2.808 17.28L4.704 15.96L9.432 13.32L9.504 13.08L9.432 12.96H9.192L8.4 12.912L5.712 12.84L3.384 12.744L1.104 12.624L0.528 12.504L0 11.784L0.048 11.424L0.528 11.112L1.224 11.16L2.736 11.28L5.016 11.424L6.672 11.52L9.12 11.784H9.504L9.552 11.616L9.432 11.52L9.336 11.424L6.96 9.84L4.416 8.16L3.072 7.176L2.352 6.672L1.992 6.216L1.848 5.208L2.496 4.488L3.384 4.56L3.6 4.608L4.488 5.304L6.384 6.768L8.88 8.616L9.24 8.904L9.408 8.808V8.736L9.24 8.472L7.896 6.024L6.456 3.528L5.808 2.496L5.64 1.872C5.576 1.656 5.544 1.416 5.544 1.152L6.288 0.144001L6.696 0L7.704 0.144001L8.112 0.504001L8.736 1.92L9.72 4.152L11.28 7.176L11.736 8.088L11.976 8.904L12.072 9.168H12.24V9.024L12.36 7.296L12.6 5.208L12.84 2.52L12.912 1.752L13.296 0.840001L14.04 0.360001L14.616 0.624001L15.096 1.32L15.024 1.752L14.76 3.6L14.184 6.504L13.824 8.472H14.04L14.28 8.208L15.264 6.912L16.92 4.848L17.64 4.032L18.504 3.12L19.056 2.688H20.088L20.832 3.816L20.496 4.992L19.44 6.336L18.552 7.464L17.28 9.168L16.512 10.536L16.584 10.632H16.752L19.608 10.008L21.168 9.744L22.992 9.432L23.832 9.816L23.928 10.2L23.592 11.016L21.624 11.496L19.32 11.952L15.888 12.768L15.84 12.792L15.888 12.864L17.424 13.008L18.096 13.056H19.728L22.752 13.272L23.544 13.8L24 14.424L23.928 14.928L22.704 15.528L21.072 15.144L17.232 14.232L15.936 13.92H15.744V14.016L16.848 15.096L18.84 16.896L21.36 19.224L21.48 19.8L21.168 20.28L20.832 20.232L18.624 18.552L17.76 17.808L15.84 16.2H15.72V16.368L16.152 17.016L18.504 20.544L18.624 21.624L18.456 21.96L17.832 22.176L17.184 22.056L15.792 20.136L14.376 17.952L13.224 16.008L13.104 16.104L12.408 23.352L12.096 23.712L11.376 24Z"/>
@@ -38,7 +38,7 @@
           </span>
         <div class="card__body">
           <h3 class="md-typescale-title-medium card__name">
-            {{ p.name }}
+            <span class="card__name-text" :title="p.name">{{ p.name }}</span>
             <span
               v-if="keyStatsMap[p.id]"
               class="card__key-stats"
@@ -48,7 +48,8 @@
               {{ keyStatsMap[p.id].green }}/{{ keyStatsMap[p.id].total }}
             </span>
           </h3>
-          <span v-if="p.base_url" class="card__endpoint md-typescale-body-medium mono">{{ p.base_url }}</span>
+          <span v-if="isPluginProvider(p)" class="card__endpoint md-typescale-body-medium" :class="{ 'endpoint--offline': !pluginOnlineMap[p.id] }" title="由插件委托接入">{{ pluginOnlineMap[p.id] ? '插件（在线）' : '插件（离线）' }}</span>
+          <span v-else-if="p.base_url" class="card__endpoint md-typescale-body-medium mono" :title="p.base_url">{{ p.base_url }}</span>
         </div>
         <div class="card__actions">
           <md-icon-button
@@ -92,8 +93,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import Sortable from 'sortablejs';
 import { providersApi, keysApi, type Provider } from '../api';
 import { wsClient } from '../ws';
@@ -111,6 +113,24 @@ const deleteTarget = ref<Provider | null>(null);
 const menuOpen = ref<string | null>(null);
 const menuAnchor = ref('');
 const menuTarget = ref<Provider | null>(null);
+
+// 插件在线状态：provider_id -> online。
+// 由 /api/plugins 列表初始化，由 plugin-online/offline/activated Tauri 事件实时刷新。
+const pluginOnlineMap = reactive<Record<string, boolean>>({});
+let unlistenFns: UnlistenFn[] = [];
+
+// 判断是否为插件供应商（config 含 plugin_id，即委托 Provider）
+function isPluginProvider(p: Provider): boolean {
+  return !!(p.config as any)?.plugin_id;
+}
+
+// 头像着色：普通供应商与已连接插件→品牌彩色；未连接插件→黑白灰。
+function avatarClass(p: Provider): string {
+  if (isPluginProvider(p) && !pluginOnlineMap[p.id]) {
+    return 'avatar--offline';
+  }
+  return p.kind === 'anthropic' ? 'avatar--anthropic' : 'avatar--openai';
+}
 
 function toggleMenu(p: Provider) {
   if (menuOpen.value === p.id) {
@@ -167,6 +187,21 @@ function onKeyStats(event: any) {
       green: event.green,
       total: event.total,
     };
+  }
+}
+
+// 拉取插件在线状态：/api/plugins 列表带 connected 字段，按 provider_id 建表。
+// 初始加载用；之后由 plugin-online/offline/activated 事件实时刷新。
+async function loadPluginStatuses() {
+  try {
+    const resp = await fetch('http://localhost:19068/api/plugins');
+    if (!resp.ok) return;
+    const plugins = await resp.json();
+    for (const p of plugins) {
+      if (p.provider_id) pluginOnlineMap[p.provider_id] = !!p.connected;
+    }
+  } catch {
+    // 忽略——后端未起或请求失败时，插件图标默认按灰显
   }
 }
 
@@ -233,16 +268,33 @@ async function initSortable() {
   sortable = new Sortable(gridEl.value, opts);
 }
 
-onMounted(() => {
+onMounted(async () => {
   fetchProviders();
   loadKeyStats();
+  loadPluginStatuses();
   wsClient.connect();
   wsClient.on('key_stats', onKeyStats);
+
+  // 监听插件生命周期 Tauri 事件，实时刷新图标在线状态。
+  // 后端在 register/reconnect/confirm/disconnect 时 emit，payload 含 provider_id。
+  unlistenFns = await Promise.all([
+    listen<{ provider_id: string }>('plugin-online', (e) => {
+      if (e.payload?.provider_id) pluginOnlineMap[e.payload.provider_id] = true;
+    }),
+    listen<{ provider_id: string }>('plugin-activated', (e) => {
+      if (e.payload?.provider_id) pluginOnlineMap[e.payload.provider_id] = true;
+    }),
+    listen<{ provider_id: string }>('plugin-offline', (e) => {
+      if (e.payload?.provider_id) pluginOnlineMap[e.payload.provider_id] = false;
+    }),
+  ]);
 });
 
 onUnmounted(() => {
   wsClient.off('key_stats', onKeyStats);
   sortable?.destroy();
+  unlistenFns.forEach((fn) => fn());
+  unlistenFns = [];
 });
 </script>
 
@@ -272,8 +324,11 @@ onUnmounted(() => {
 .card__avatar svg { width: 22px; height: 22px; }
 .avatar--openai { background: var(--md-sys-color-openai-brand); color: #fff; }
 .avatar--anthropic { background: var(--md-sys-color-anthropic-brand); color: #fff; }
-.card__body { display: flex; flex-direction: column; gap: 2px; }
-.card__name { margin: 0; display: flex; align-items: center; gap: 6px; }
+.avatar--offline { background: var(--md-sys-color-surface-container-high); color: var(--md-sys-color-on-surface-variant); }
+.endpoint--offline { color: var(--md-sys-color-outline); font-style: italic; }
+.card__body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.card__name { margin: 0; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.card__name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .card__enabled-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .dot--on { background: var(--md-sys-color-primary); }
 .dot--off { background: var(--md-sys-color-outline-variant); }
@@ -294,7 +349,7 @@ onUnmounted(() => {
 }
 .card__chip { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: var(--md-sys-shape-corner-full); font-size: 0.75rem; font-weight: 500; }
 .chip { display: inline-flex; align-items: center; padding: 2px 10px; border-radius: var(--md-sys-shape-corner-full); background: var(--md-sys-color-secondary-container); color: var(--md-sys-color-on-secondary-container); font-size: 0.75rem; width: fit-content; margin-top: 2px; }
-.card__endpoint { color: var(--md-sys-color-on-surface-variant); font-size: 0.75rem; word-break: break-all; display: block; margin-top: 4px; }
+.card__endpoint { color: var(--md-sys-color-on-surface-variant); font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; margin-top: 4px; }
 .card__actions { display: flex; justify-content: flex-end; position: relative; }
 .card__more-btn { --md-icon-button-icon-size: 20px; width: 36px; height: 36px; }
 .form { min-width: 300px; }

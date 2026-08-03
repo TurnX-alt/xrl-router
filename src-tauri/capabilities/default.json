@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "默认权限：允许 shell open 在系统浏览器打开外链",
   "windows": ["main"],
-  "permissions": ["core:default", "shell:allow-open"]
+  "permissions": ["core:default", "shell:allow-open", "core:window:allow-set-theme"]
 }

@@ -4,7 +4,7 @@
    ============================================================ */
 
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
 
   /* MD3 Color tokens — light */
   --md-sys-color-primary: #6750A4;
@@ -67,6 +67,7 @@
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --md-sys-color-primary: #D0BCFF;
   --md-sys-color-on-primary: #381E72;
   --md-sys-color-primary-container: #4F378B;
@@ -111,6 +112,29 @@ body {
   margin: 0;
   background: var(--md-sys-color-surface);
   color: var(--md-sys-color-on-surface);
+}
+
+/* 滚动条配色跟随主题（color-scheme 已让原生滚动条自适应；
+   此处显式着色作为 WebView 兜底，避免部分环境仍用系统色） */
+* {
+  scrollbar-color: var(--md-sys-color-outline-variant) transparent;
+}
+*::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--md-sys-color-outline-variant);
+  border-radius: var(--md-sys-shape-corner-full);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--md-sys-color-outline);
+  background-clip: content-box;
 }
 
 /* 桌面应用体验：默认禁止选中文本（除输入类元素外），
