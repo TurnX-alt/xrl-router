@@ -1,7 +1,7 @@
 //! 全部 Axum 路由的定义。
 //!
 //! 单 listener 绑 `0.0.0.0:port`，通过路径级 IP 中间件控制访问权限：
-//! - 公开路径：`/health`、`/ws`、`/ws/plugin`、`/install`、`/fm/*`（广播电台）、
+//! - 公开路径：`/health`、`/ws`、`/ws/plugin`、`/install`、
 //!   `/v1/*` 代理（套 rate_limit，128 req/min）。
 //! - 管理路径：`/api/*`（CRUD + 密钥 + 数据导出等）——仅允许 loopback IP 访问，
 //!   非本机请求被 `admin_ip_guard` 中间件拦截返回 403。
@@ -99,9 +99,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ws/plugin", get(handlers::plugin_ws_handler))
         // Install 静态页（局域网设备访问）
         .route("/install", get(handlers::serve_install_page))
-        // Claude FM 广播电台直播流（公开路径，局域网设备可访问）
-        .route("/fm/live", get(handlers::fm_live))
-        .route("/fm/meta", get(handlers::fm_current_meta))
         // /api/* 管理路由（IP 限制）
         .merge(api_routes)
         // /v1/* 代理（套 rate_limit，128 req/min）

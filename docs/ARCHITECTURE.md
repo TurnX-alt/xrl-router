@@ -34,8 +34,7 @@ xrl-router 是一个 **Tauri 2 桌面应用**，内部跑着一个 Rust axum HTT
 │  ├─ /install 静态页 (局域网)      ├─ CRUD: providers,keys,models          │
 │  ├─ /v1/* 代理 (service key)     ├─ stats, settings, plugins             │
 │  ├─ /health  /  /ws  /ws/plugin  ├─ install/local-ip                     │
-│  └─ 同一套 proxy_routes           ├─ fm/live, fm/meta                     │
-│    (rate_limit + 64MiB body)      └─ data/export,import,reset             │
+│  └─ 同一套 proxy_routes           └─ data/export,import,reset             │
 │                                                                           │
 │  请求入口 → 认证 → 路由解析 → 密钥选取 → 协议转换 → 上游转发 → 流式回传    │
 │                                                                           │
@@ -77,7 +76,7 @@ main.rs
             │    ├─ install.rs  (/install 静态页 + /api/install/local-ip)
             │    ├─ websocket.rs  (/ws 端点)
             │    ├─ plugin.rs     (插件 REST + WS)
-            │    └─ fm.rs         Claude FM 广播电台引擎 (FmEngine + /fm/live + /fm/meta)
+            │    └─ fm.rs         Claude FM 播放引擎 (rodio + souvlaki, std::thread)
             └─ proxy/         LLM 代理核心
                  ├─ handler.rs     薄入口层: 认证 + 请求体准备 (~250 行)
                  ├─ stream.rs      流式引擎核心: 路由解析 → 立即返回 Response → 后台 spawn 双循环 (~550 行)
@@ -216,8 +215,8 @@ src/
 ├── ws.ts              WebSocket 客户端 (自动重连 3s, 事件 pub/sub)
 ├── theme.ts           主题 light/dark/system (localStorage 持久化, prefers-color-scheme 监听)
 ├── i18n/              自研 i18n: index.ts (t/setLocale/initI18n, localStorage + 后端托盘同步) + zh-CN.ts / en.ts
-├── fm/                Claude FM 前端（极简 ~40 行：单例 <audio> 收听后端直播流）
-│    └─ player.ts      挂载 /fm/live，监听 fm-meta 事件更新曲目元数据
+├── fm/                Claude FM 前端（极简 ~60 行：纯命令/事件，无音频逻辑）
+│    └─ player.ts      通过 Tauri command 控制播放，监听 fm-meta/fm-ready 事件
 │
 ├── styles/
 │    global.css                全局样式 (MD3 design tokens + [data-theme="dark"])
@@ -241,7 +240,7 @@ src/
      models.ts       Model 列表 (按 provider 分组)
 ```
 
-前端通过 HTTP 访问管理 API（无认证），通过 WebSocket 接收实时推送。语言切换经 `set_locale` Tauri command 同步到后端（托盘菜单文本），开机启动经 `@tauri-apps/plugin-autostart`，外链打开经 `@tauri-apps/plugin-shell`，数据文件读写经 `plugin-dialog` + `plugin-fs`（路径白名单见安全边界）。Claude FM 播放状态经 `fm_set_playing` / `fm_ready` Tauri command 同步到托盘菜单勾选。
+前端通过 HTTP 访问管理 API（无认证），通过 WebSocket 接收实时推送。语言切换经 `set_locale` Tauri command 同步到后端（托盘菜单文本），开机启动经 `@tauri-apps/plugin-autostart`，外链打开经 `@tauri-apps/plugin-shell`，数据文件读写经 `plugin-dialog` + `plugin-fs`（路径白名单见安全边界）。Claude FM 通过 `fm_toggle` / `fm_play` / `fm_pause` / `fm_get_state` Tauri command 控制播放，通过 `fm-meta` / `fm-ready` / `fm-state-changed` 事件接收状态更新。
 
 ---
 
@@ -361,6 +360,10 @@ xrl-router
   │  网络基础设施
   ├── reqwest 0.12     HTTP 客户端 (流式 SSE, cookie 复用, 系统代理继承)
   ├── scraper 0.20     HTML 解析 (Bing 搜索结果提取)
+  │
+  │  音频 / 媒体控制
+  ├── rodio 0.20       音频播放 (MP3 解码 + 系统音频设备输出)
+  ├── souvlaki 0.8     系统媒体控制 (macOS Now Playing / Windows SMTC / Linux MPRIS)
   │
   │  前端
   ├── Vue 3            UI 框架

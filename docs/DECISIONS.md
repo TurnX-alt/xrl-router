@@ -1062,3 +1062,64 @@ let keys: Vec<KeyEntry> = raw.into_iter().filter_map(|(.., cipher, ..)| {
     Some(KeyEntry { key_hash: plain, status: KeyStatus::Green, .. })
 }).collect();
 ```
+
+---
+
+## ADR-025: Claude FM 播放下沉后端 + 系统媒体控制集成
+
+**日期**: 2026-08-08  
+**状态**: 已接受
+
+### 背景
+
+Claude FM 此前的架构链路：Rust 后端从 CDN 拉音频字节 → `broadcast::channel` → HTTP chunked `/fm/live` → 前端 `<audio>` 标签缓冲 2~5s → 实际播放。为补偿前端缓冲延迟，引入了"墙钟锚点 + `currentTime` 二分查找"的间接 caption 同步机制。但误差根源始终存在——后端字节流进度与前端播放位置不可消除的延迟。
+
+### 决策
+
+将音频解码与播放从前端 `<audio>` 标签迁移到 Rust 后端，直接输出到系统音频设备：
+
+1. **rodio 0.20**：MP3 解码 + 系统音频设备输出，在专用 `std::thread` 中运行（rodio 需要稳定线程，不能用 tokio）
+2. **souvlaki 0.8**：系统媒体控制集成（macOS Now Playing / 媒体键、Windows SMTC、Linux MPRIS），在主线程初始化，通过 `mpsc` channel 接收控制消息
+3. **异步预加载（双缓冲）**：当前曲播放时 `tauri::async_runtime::spawn` 预下载下一曲（`tokio::sync::oneshot` 传递结果），切歌零等待
+4. **删除 HTTP 直播流**：移除 `/fm/live`、`/fm/meta`、`/fm/schedule` 三个 HTTP 端点，FM 不再经过网络层
+5. **前端退化为纯展示+控制层**：`src/fm/player.ts` 从 ~180 行简化为 ~100 行，删除 `<audio>` 单例、HTTP 请求、墙钟同步逻辑，仅通过 Tauri command（`fm_toggle` / `fm_play` / `fm_pause` / `fm_get_state`）和事件（`fm-meta` / `fm-ready` / `fm-state-changed`）与后端交互
+6. **托盘 FM 菜单直接调引擎**：托盘点击不再 emit `fm-toggle` 事件绕前端中转，直接调用 `FmEngine.toggle()`
+
+### 原因
+
+1. **消除误差根因**：后端直接播放，播放位置即真相，不再需要墙钟锚点间接计算
+2. **简化架构**：前端从 ~180 行减至 ~100 行，删除所有音频相关逻辑；后端不再需要 broadcast channel + HTTP chunked 流
+3. **系统级集成**：macOS 控制中心、媒体键、锁屏 Now Playing widget 均可控制播放，用户体验显著提升
+4. **切歌零等待**：双缓冲预加载使曲目切换无感知延迟
+
+### 代价
+
+- `std::thread` 与 `tokio` 异步运行时的桥接：CDN 下载通过 `tauri::async_runtime::block_on` 桥接，增加一层间接性
+- souvlaki 在 macOS debug build 可能 panic（#77），release build 正常；Windows SMTC `set_metadata` 可能 hang（#39）——通过 `Option<MediaControls>` + 错误容错降级为 stub
+- 首次播放延迟 1~3s（CDN 下载首曲），后续曲目因预加载而零等待
+
+### 实现
+
+```rust
+// api/handlers/fm.rs
+pub struct FmEngine {
+    control_tx: Arc<mpsc::Sender<FmControl>>,
+    control_rx: Arc<Mutex<Option<mpsc::Receiver<FmControl>>>>,
+    state: Arc<Mutex<FmPlaybackState>>,
+    http_client: reqwest::Client,
+}
+
+// lib.rs — souvlaki 初始化（主线程）
+let platform_config = souvlaki::PlatformConfig { ... };
+let media_controls = MediaControls::new(platform_config).ok();
+// souvlaki 回调 → control_tx.send(FmControl::Toggle/Play/Pause)
+
+// engine_loop（std::thread）
+let sink = rodio::Sink::try_new(&stream_handle)?;
+loop {
+    let bytes = next_preload.blocking_recv()?;  // 双缓冲
+    sink.append(rodio::Decoder::new(Cursor::new(bytes))?);
+    controls.set_metadata(...);
+    // 100ms 轮询 control_rx + sink.empty()
+}
+```

@@ -123,6 +123,44 @@ fn fm_set_playing(app: tauri::AppHandle, playing: bool) -> Result<(), String> {
     }
 }
 
+/// 切换 FM 播放/暂停（前端 / 托盘 / 系统媒体键均可调用）。
+#[tauri::command]
+fn fm_toggle(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<Arc<AppState>>();
+    state.fm.toggle();
+    Ok(())
+}
+
+/// 播放 FM。
+#[tauri::command]
+fn fm_play(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<Arc<AppState>>();
+    state.fm.play();
+    Ok(())
+}
+
+/// 暂停 FM。
+#[tauri::command]
+fn fm_pause(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<Arc<AppState>>();
+    state.fm.pause();
+    Ok(())
+}
+
+/// 获取 FM 播放状态快照（前端初始化时调用）。
+#[tauri::command]
+fn fm_get_state(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.state::<Arc<AppState>>();
+    let ps = state.fm.get_state();
+    Ok(serde_json::json!({
+        "playing": ps.playing,
+        "ready": ps.ready,
+        "artist": ps.artist,
+        "title": ps.title,
+        "index": ps.index,
+    }))
+}
+
 /// 前端 Claude FM 预热完成时调用：把 FM 勾选项加入托盘菜单。
 /// 预热完成前 FM 菜单项隐藏，避免在音源未就绪时误操作。
 #[tauri::command]
@@ -191,6 +229,10 @@ pub fn run() {
             set_autostart,
             set_locale,
             fm_set_playing,
+            fm_toggle,
+            fm_play,
+            fm_pause,
+            fm_get_state,
             fm_ready,
             get_gateway_base
         ])
@@ -276,17 +318,55 @@ pub fn run() {
                             let _ = w.set_focus();
                         }
                     }
-                    // Claude FM：勾选 = 播放，取消勾选 = 暂停。
-                    // 勾选状态由点击事件自行翻转（CheckMenuItem 原生行为），
-                    // 播放器随后 emit fm-toggle 事件驱动前端 toggle。
+                    // Claude FM：直接调用引擎 toggle（不再绕前端中转）。
+                    // 勾选状态由 fm-state-changed 事件同步。
                     "fm" => {
                         info!("tray: fm clicked");
-                        let _ = app.emit("fm-toggle", ());
+                        let state = app.state::<Arc<AppState>>();
+                        state.fm.toggle();
                     }
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
+
+            // ── 系统媒体控制（souvlaki）初始化 ──
+            // souvlaki 在主线程创建 MediaControls。macOS 的 MPRemoteCommandCenter /
+            // MPNowPlayingInfoCenter 必须在主线程调用，故 MediaControls 存入 managed
+            // state（`MediaControlsState`），引擎线程经 `run_on_main_thread` dispatch
+            // 到这里访问。Windows SMTC 暂降级为 stub（Tauri 2 难以提取 HWND，传 None）。
+            let media_controls = souvlaki::MediaControls::new(souvlaki::PlatformConfig {
+                display_name: "Claude FM",
+                dbus_name: "im.xrl.router",
+                hwnd: None,
+            });
+            let mut media_controls = match media_controls {
+                Ok(mut ctrl) => {
+                    let control_tx = app_state.fm.control_tx_clone();
+                    let _ = ctrl.attach(move |event: souvlaki::MediaControlEvent| {
+                        match event {
+                            souvlaki::MediaControlEvent::Toggle => {
+                                let _ = control_tx.send(crate::api::handlers::fm::FmControl::Toggle);
+                            }
+                            souvlaki::MediaControlEvent::Play => {
+                                let _ = control_tx.send(crate::api::handlers::fm::FmControl::Play);
+                            }
+                            souvlaki::MediaControlEvent::Pause => {
+                                let _ = control_tx.send(crate::api::handlers::fm::FmControl::Pause);
+                            }
+                            _ => {}
+                        }
+                    });
+                    Some(ctrl)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize system media controls: {}", e);
+                    None
+                }
+            };
+            app.manage(crate::api::handlers::fm::MediaControlsState(
+                std::sync::Mutex::new(media_controls.take()),
+            ));
 
             // Start gateway server in Tauri's async runtime
             let state = app_state.clone();

@@ -54,12 +54,12 @@ src/                           前端 Vue 3
 ├── theme.ts                   明/暗/跟随系统主题（localStorage 持久化，prefers-color-scheme 监听）
 ├── i18n/                      自研 i18n：index.ts（t/setLocale/initI18n）+ zh-CN.ts / en.ts
 ├── styles/global.css          全局样式（MD3 design tokens + [data-theme="dark"]）
-├── fm/                        Claude FM 播放器（极简前端：单例 <audio> 收听后端直播流，~40 行）
+├── fm/                        Claude FM 播放器（极简前端：~60 行纯命令/事件）
 ├── views/*                    6 个页面（ClaudeFm/Providers/ProviderNew/Keys/Stats/Settings）
 ├── components/*               AppShell / ConnectionStatus / PluginRegisterDialog
 └── stores/*                   3 个 Pinia stores（providers/keys/models）
 
-> **Claude FM**：所有播放逻辑（歌单、墙钟时间轴、音源解析、预加载、切歌）在 Rust 后端 `FmEngine`（`api/handlers/fm.rs`）完成。引擎以 `tokio::spawn` 后台任务运行，通过 `broadcast::channel` 推送音频字节给所有 `/fm/live` 订阅者。前端 `src/fm/player.ts`（~40 行）只有一个模块级单例 `<audio>` 收听直播流 + 监听 `fm-meta` 事件更新曲目元数据。托盘勾选经 `fm_set_playing` / `fm_ready` Tauri command 同步（见 `lib.rs`）。改 FM 逻辑改 `api/handlers/fm.rs`，改播放器 UI 改 `ClaudeFmView.vue`。
+> **Claude FM**：音频解码与播放由 Rust 后端 `FmEngine`（`api/handlers/fm.rs`）直接完成——rodio 输出到系统音频设备，souvlaki 接入系统媒体控制（macOS Now Playing / Windows SMTC / Linux MPRIS）。引擎以 `std::thread::spawn` 运行（rodio 需要稳定线程），通过 `mpsc` channel 接收播放控制消息。前端 `src/fm/player.ts`（~60 行）仅负责展示元信息（通过 `fm-meta` 事件）和控制播放暂停（通过 `fm_toggle` / `fm_play` / `fm_pause` Tauri command）。托盘 FM 菜单点击直接调用引擎（不再绕前端中转）。改 FM 逻辑改 `api/handlers/fm.rs`，改播放器 UI 改 `ClaudeFmView.vue`。
 
 src-tauri/assets/install.html   局域网 install 静态页（include_str! 编译进二进制）
 
@@ -196,6 +196,6 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 | 修改代理逻辑 | `api/proxy/stream.rs`（流式引擎核心）、`api/proxy/handler.rs`（薄入口）、`api/proxy/translate/`、`http.rs`（代理配置） |
 | 修改密钥池 | `keys/pool/mod.rs` 注释的锁序规则 |
 | 修改前端 | `src/main.ts`（MD3 导入模式）、`src/styles/global.css`（design tokens） |
-| 修改 Claude FM | `src-tauri/src/api/handlers/fm.rs`（广播电台引擎）、`src/fm/player.ts`（前端单例）、`src/views/ClaudeFmView.vue`（UI）、`lib.rs`（托盘 `fm` command） |
+| 修改 Claude FM | `src-tauri/src/api/handlers/fm.rs`（rodio 播放引擎 + souvlaki 媒体控制）、`src/fm/player.ts`（前端纯命令/事件）、`src/views/ClaudeFmView.vue`（UI）、`lib.rs`（托盘 + Tauri commands + souvlaki 初始化） |
 | 新增插件消息 | `plugin/types.rs`、`plugin/registry.rs` |
 | 修改协议转换 | `api/proxy/translate/common.rs`、两个方向文件 |

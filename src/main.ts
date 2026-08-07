@@ -5,7 +5,7 @@ import App from './App.vue';
 import { routes } from './router.js';
 import { initTheme, initSystemThemeListener } from './theme';
 import { initI18n } from './i18n';
-import { initPrewarm } from './fm/player';
+import { initFm } from './fm/player';
 
 // 应用持久化的主题（在 mount 前设置，避免闪烁）
 initTheme();
@@ -14,8 +14,8 @@ initSystemThemeListener();
 // 初始化国际化
 initI18n();
 
-// Claude FM 首曲预热：启动即解析直链并预缓冲，首次点击播放几乎零延迟
-initPrewarm();
+// Claude FM 初始化：连接后端引擎，获取初始状态并监听事件
+initFm();
 
 // Material Web Components — individual imports (not all.js)
 import '@material/web/button/filled-button.js';

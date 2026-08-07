@@ -60,6 +60,12 @@ tauri-plugin-autostart = "2.5.1"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-fs = "2.5.1"
 
+# Audio playback
+rodio = "0.20"
+
+# System media controls (macOS Now Playing / Windows SMTC / Linux MPRIS)
+souvlaki = "0.8"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
