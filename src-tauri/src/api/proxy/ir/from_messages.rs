@@ -35,9 +35,21 @@ pub fn messages_req_to_ir(req: &Value) -> IrRequest {
         .map(|arr| {
             arr.iter()
                 .filter_map(|t| {
-                    let name = t["name"].as_str()?;
+                    // server-side 内置工具（web_search_20250305 等）：可能只有 type 没有 name，
+                    // 归一化为 name="web_search"，保证 websearch 劫持对 Messages 客户端生效
+                    let name = match t["name"].as_str() {
+                        Some(n) => n.to_string(),
+                        None => {
+                            let ty = t["type"].as_str().unwrap_or("");
+                            if ty.starts_with("web_search") {
+                                "web_search".to_string()
+                            } else {
+                                return None;
+                            }
+                        }
+                    };
                     Some(IrTool {
-                        name: name.to_string(),
+                        name,
                         description: t.get("description").and_then(|d| d.as_str()).map(String::from),
                         input_schema: t
                             .get("input_schema")

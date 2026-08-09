@@ -1,37 +1,27 @@
-//! WebSearch 劫持：把 server-side web_search 改写为自定义 tool，
-//! 在代理内本地跑 tool-calling loop（Bing 搜索），累积内容转 SSE 返回。
+//! WebSearch 劫持：本地 Bing 搜索 → 注入 IR system → 委托正常流式转发。
 //!
-//! IR 版本：所有格式操作通过 IR 中间表示，支持三种客户端格式 × 三种上游格式。
+//! 跳过 LLM tool-calling loop：代理自己提取搜索关键词（取最后一条 user 消息文本），
+//! 本地跑 Bing 搜索，把结果作为 system block 注入 IR，清除 tools/tool_choice，
+//! 然后交回 proxy_stream 正常流式转发给上游 LLM。
+//!
+//! 优势：省掉一轮 LLM 非流式调用 + key failover 由 proxy_stream 天然支持。
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
-use axum::Json;
-use bytes::Bytes;
-use serde_json::{json, Value};
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tracing::warn;
 
-use crate::gateway::server::AppState;
-
-use super::auth::ServiceKeyInfo;
-use super::ir;
 use super::ir::types::*;
-use super::key_rotation::{pick_key_for, update_key_health};
-use super::route::ResolvedRoute;
-use super::stream::{send_error_event, ClientFormat};
 
 /// IR 请求的 tools 里是否含 server-side web_search 工具。
 pub(super) fn has_websearch_tool_ir(req: &IrRequest) -> bool {
+    tracing::debug!(tools_count = req.tools.len(), "Checking for websearch tool");
+    for tool in &req.tools {
+        tracing::debug!(tool_name = %tool.name, "  Found tool");
+    }
     req.tools
         .iter()
         .any(|t| t.name.starts_with("web_search"))
 }
 
-/// 把 Bing 结果格式化成喂给 LLM 的 tool_result 文本。
+/// 把 Bing 结果格式化成喂给 LLM 的文本。
 fn format_search_text(results: &[crate::search::SearchResult]) -> String {
     results
         .iter()
@@ -41,1062 +31,74 @@ fn format_search_text(results: &[crate::search::SearchResult]) -> String {
         .join("\n\n")
 }
 
-/// WebSearch 劫持 loop 入口：操作 IR，支持三种客户端格式。
+/// 本地 Bing 搜索 → 注入 IR system → 清除 tools/tool_choice。
 ///
-/// 与主代理路径一致：立即返回 Response（含 `:keepalive` 首字节），hijack loop
-/// 在后台 spawn 完成。上游错误通过 SSE error event 传达。
-pub(super) async fn run_websearch_loop(
-    state: Arc<AppState>,
-    ir_request: IrRequest,
-    resolved: ResolvedRoute,
-    client_format: ClientFormat,
-    trace_id: String,
-    service_key: ServiceKeyInfo,
-) -> Result<Response, (StatusCode, HeaderMap, Json<Value>)> {
-    use std::convert::Infallible;
+/// 返回修改后的 IrRequest，直接传给 proxy_stream 正常流式转发。
+/// 不再需要 tool-calling loop：搜索决策完全本地完成。
+pub(super) async fn enrich_ir_with_search(mut ir_request: IrRequest) -> IrRequest {
+    // 1. 提取搜索关键词
+    let query = extract_search_query(&ir_request.messages);
+    tracing::info!(query = %query, messages_count = ir_request.messages.len(), "websearch: extracted query");
 
-    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(100);
-
-    // 初始 keepalive
-    let _ = tx.send(Ok(Bytes::from(":keepalive\n\n"))).await;
-
-    tokio::spawn(async move {
-        let trace_id = &trace_id;
-
-        // ── keepalive 心跳 + 取消信号 ─────────────────────────────
-        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-        let keepalive_tx = tx.clone();
-        let keepalive_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(super::stream::SSE_KEEPALIVE_SECS));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if keepalive_tx.send(Ok(Bytes::from(":keepalive\n\n"))).await.is_err() {
-                            break;
-                        }
-                    }
-                    _ = &mut cancel_rx => break,
-                }
-            }
-        });
-        struct CancelOnDrop(Option<oneshot::Sender<()>>);
-        impl Drop for CancelOnDrop {
-            fn drop(&mut self) {
-                if let Some(tx) = self.0.take() {
-                    let _ = tx.send(());
-                }
-            }
+    // 2. 本地 Bing 搜索
+    let search_text = match crate::search::bing::search(&query).await {
+        Ok(results) if results.is_empty() => {
+            tracing::warn!(query = %query, "websearch: Bing returned 0 results");
+            format!("No web search results found for: {}", query)
         }
-        let _cancel_guard = CancelOnDrop(Some(cancel_tx));
-        let _keepalive_handle = keepalive_handle;
-
-        let picked = match pick_key_for(&state, &resolved.provider_id) {
-            Some(p) => p,
-            None => {
-                send_error_event(&tx, client_format, "api_error", "No available upstream keys");
-                return;
-            }
-        };
-
-        let client = crate::http::build_http_client()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
-
-        let upstream_url = resolved.upstream_url.clone();
-        let model = resolved.real_model_id.clone();
-        let max_tokens = ir_request.max_tokens.unwrap_or(4096);
-        let provider_kind = resolved.provider_kind.clone();
-        let model_display_name = ir_request.model.clone();
-
-        // 构建 web_search 工具定义（IR 格式）
-        let web_search_tool = IrTool {
-            name: "web_search".to_string(),
-            description: Some("Search the web (Bing) for up-to-date information.".to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "The search query"}},
-                "required": ["query"]
-            }),
-        };
-
-        // 构建劫持用的 IR 请求（替换 tools 为 web_search）
-        let mut hijack_ir = ir_request.clone();
-        hijack_ir.tools = vec![web_search_tool];
-        hijack_ir.tool_choice = Some(IrToolChoice::Auto);
-        hijack_ir.stream = false;
-
-        let mut accumulated: Vec<IrContentBlock> = Vec::new();
-        let mut final_stop = IrStopReason::EndTurn;
-        let mut accum_usage = IrUsage::default();
-
-        let outcome: Result<(), (String, String)> = hijack_upstream(
-            &client,
-            &upstream_url,
-            &model,
-            &picked.key_hash,
-            &provider_kind,
-            &hijack_ir,
-            max_tokens,
-            &state.keys,
-            &resolved.provider_id,
-            &mut accumulated,
-            &mut final_stop,
-            &mut accum_usage,
-        )
-        .await;
-
-        if let Err((err_type, msg)) = outcome {
-            // 劫持失败也记录 usage_log（此前只记成功，失败完全不可见）
-            let _ = state.database.insert_usage_log(
-                chrono::Utc::now().timestamp(),
-                &resolved.provider_id,
-                resolved.provider_name.as_str(),
-                &resolved.model_row_id,
-                &model_display_name,
-                Some(&picked.id),
-                picked.name.as_str(),
-                picked.key_masked.as_str(),
-                Some(service_key.id.as_str()),
-                service_key.name.as_str(),
-                service_key.key_masked.as_str(),
-                match client_format {
-                    ClientFormat::Messages => "/v1/messages",
-                    ClientFormat::ChatCompletions => "/v1/chat/completions",
-                    ClientFormat::Responses => "/v1/responses",
-                },
-                0, 0, 0, false,
-                Some(&format!("websearch hijack: {}: {}", err_type, msg)),
-                0,
-            );
-            send_error_event(&tx, client_format, &err_type, &msg);
-            return;
+        Ok(results) => {
+            tracing::info!(query = %query, results_count = results.len(), "websearch: Bing search succeeded");
+            format_search_text(&results)
         }
-
-        let _ = state.database.insert_usage_log(
-            chrono::Utc::now().timestamp(),
-            &resolved.provider_id,
-            resolved.provider_name.as_str(),
-            &resolved.model_row_id,
-            &model_display_name,
-            Some(&picked.id),
-            picked.name.as_str(),
-            picked.key_masked.as_str(),
-            Some(service_key.id.as_str()),
-            service_key.name.as_str(),
-            service_key.key_masked.as_str(),
-            match client_format {
-                ClientFormat::Messages => "/v1/messages",
-                ClientFormat::ChatCompletions => "/v1/chat/completions",
-                ClientFormat::Responses => "/v1/responses",
-            },
-            accum_usage.input_tokens as i64,
-            accum_usage.output_tokens as i64,
-            0,
-            true,
-            None,
-            accum_usage.cache_read_input_tokens as i64,
-        );
-
-        // 渲染累积内容为客户端格式 SSE
-        let segments = render_accumulated_ir(
-            client_format,
-            &accumulated,
-            final_stop,
-            &accum_usage,
-        );
-        for seg in segments {
-            if tx.send(Ok(seg)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    Ok(super::stream::sse_response(rx))
-}
-
-/// 统一上游劫持 loop：根据 provider_kind 从 IR 生成上游请求，
-/// 解析上游非流式响应为 IR content blocks，累积到 accumulated。
-async fn hijack_upstream(
-    client: &reqwest::Client,
-    upstream_url: &str,
-    model: &str,
-    api_key: &str,
-    provider_kind: &str,
-    ir_request: &IrRequest,
-    max_tokens: u64,
-    pool: &crate::keys::KeyPool,
-    provider_id: &str,
-    accumulated: &mut Vec<IrContentBlock>,
-    final_stop: &mut IrStopReason,
-    accum_usage: &mut IrUsage,
-) -> Result<(), (String, String)> {
-    // 构建对话消息（可变，每轮追加 tool_result）
-    let mut messages = ir_request.messages.clone();
-
-    let mut loop_count = 0u32;
-    for _ in 0..5 {
-        loop_count += 1;
-        // 从 IR 生成上游请求体
-        let mut req_body = match provider_kind {
-            "messages" => ir::to_messages::ir_req_to_messages(ir_request),
-            "responses" => ir::to_responses::ir_req_to_responses(ir_request),
-            _ => ir::to_chat_completions::ir_req_to_chat_completions(ir_request),
-        };
-
-        // 替换 messages 为当前对话状态
-        match provider_kind {
-            "messages" => {
-                let msgs: Vec<Value> = messages
-                    .iter()
-                    .map(|m| {
-                        let role = match m.role {
-                            IrRole::User => "user",
-                            IrRole::Assistant => "assistant",
-                        };
-                        let content = ir_content_to_messages_value(&m.content);
-                        json!({"role": role, "content": content})
-                    })
-                    .collect();
-                req_body["messages"] = json!(msgs);
-                req_body["stream"] = json!(false);
-                req_body["max_tokens"] = json!(max_tokens);
-            }
-            "responses" => {
-                // Responses 格式：替换 input 为当前对话状态。
-                // function_call / function_call_output 必须是 input 数组的独立 item，
-                // 不能嵌在 message content 里。
-                req_body["stream"] = json!(false);
-                if let Some(mt) = req_body.get_mut("max_output_tokens") {
-                    *mt = json!(max_tokens);
-                }
-                let mut input: Vec<Value> = Vec::new();
-                for m in &messages {
-                    let role = match m.role {
-                        IrRole::User => "user",
-                        IrRole::Assistant => "assistant",
-                    };
-                    let mut text_parts: Vec<Value> = Vec::new();
-                    let mut function_calls: Vec<Value> = Vec::new();
-                    let mut function_outputs: Vec<Value> = Vec::new();
-                    for block in &m.content {
-                        match block {
-                            IrContentBlock::Text { text, .. } => {
-                                text_parts.push(json!({"type": "input_text", "text": text}));
-                            }
-                            IrContentBlock::Thinking { thinking, .. } => {
-                                text_parts.push(json!({"type": "reasoning", "text": thinking}));
-                            }
-                            IrContentBlock::ToolUse { id, name, input } => {
-                                function_calls.push(json!({
-                                    "type": "function_call",
-                                    "call_id": id,
-                                    "name": name,
-                                    "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
-                                }));
-                            }
-                            IrContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } => {
-                                let output = match content {
-                                    IrToolResultContent::Text(t) => t.clone(),
-                                    IrToolResultContent::Blocks(blocks) => blocks
-                                        .iter()
-                                        .filter_map(|b| {
-                                            if let IrContentBlock::Text { text, .. } = b {
-                                                Some(text.clone())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n"),
-                                };
-                                let mut obj = json!({
-                                    "type": "function_call_output",
-                                    "call_id": tool_use_id,
-                                    "output": [{"type": "input_text", "text": output}]
-                                });
-                                if *is_error {
-                                    obj["output"] = json!([{"type": "input_text", "text": format!("ERROR: {}", output)}]);
-                                }
-                                function_outputs.push(obj);
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !text_parts.is_empty() {
-                        input.push(json!({
-                            "type": "message",
-                            "role": role,
-                            "content": text_parts
-                        }));
-                    }
-                    input.extend(function_calls);
-                    input.extend(function_outputs);
-                }
-                req_body["input"] = json!(input);
-            }
-            _ => {
-                let msgs: Vec<Value> = ir_messages_to_chat_completions_value(&messages);
-                req_body["messages"] = json!(msgs);
-                req_body["stream"] = json!(false);
-                req_body["max_tokens"] = json!(max_tokens);
-            }
-        }
-
-        let mut resp = None;
-        for attempt in 0..3 {
-            let mut req_builder = client.post(upstream_url);
-            if provider_kind == "messages" {
-                req_builder = req_builder
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01");
-            } else {
-                req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-            }
-
-            let r = req_builder
-                .header("Content-Type", "application/json")
-                .json(&req_body)
-                .send()
-                .await
-                .map_err(|e| ("api_error".to_string(), e.to_string()))?;
-
-            let status = r.status().as_u16();
-            update_key_health(pool, provider_id, api_key, status);
-            // 5xx 瞬时故障：重试至多 3 次（无固定间隔，等上游恢复）
-            if status >= 500 && attempt < 2 {
-                warn!("websearch hijack upstream {} (5xx), retrying", status);
-                continue;
-            }
-            resp = Some(r);
-            break;
-        }
-        let resp = resp.unwrap();
-
-        let status = resp.status().as_u16();
-        let msg_val: Value = resp
-            .json()
-            .await
-            .map_err(|e| ("api_error".to_string(), e.to_string()))?;
-
-        if status >= 400 {
-            let msg = msg_val["error"]["message"]
-                .as_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("upstream error {}", status));
-            return Err(("api_error".to_string(), msg));
-        }
-
-        // 解析上游响应为 IR content blocks
-        let (content_blocks, stop_reason, usage) = match provider_kind {
-            "messages" => parse_anthropic_response(&msg_val),
-            "responses" => parse_responses_response(&msg_val),
-            _ => parse_chat_response(&msg_val),
-        };
-
-        // 累积 usage
-        accum_usage.input_tokens += usage.input_tokens;
-        accum_usage.output_tokens += usage.output_tokens;
-        accum_usage.cache_read_input_tokens += usage.cache_read_input_tokens;
-
-        // 累积 content blocks
-        accumulated.extend(content_blocks.clone());
-
-        // 检查是否需要继续 tool-calling loop
-        if stop_reason != IrStopReason::ToolUse {
-            *final_stop = stop_reason;
-            break;
-        }
-
-        // 提取 web_search tool_use 的 (id, query) — 在 move content_blocks 之前
-        let ws_calls: Vec<(String, String)> = content_blocks
-            .iter()
-            .filter_map(|b| {
-                if let IrContentBlock::ToolUse { id, name, input } = b {
-                    if name == "web_search" {
-                        let query = input["query"].as_str().unwrap_or("").to_string();
-                        return Some((id.clone(), query));
-                    }
-                }
-                None
-            })
-            .collect();
-
-        if ws_calls.is_empty() {
-            *final_stop = stop_reason;
-            break;
-        }
-
-        // 追加 assistant 消息（含 tool_use）
-        messages.push(IrMessage {
-            role: IrRole::Assistant,
-            content: content_blocks,
-        });
-
-        // 执行 Bing 搜索并构建 tool_result
-        let mut tool_results: Vec<IrContentBlock> = Vec::new();
-        for (id, query) in &ws_calls {
-            let bing = crate::search::bing::search(query).await.unwrap_or_default();
-            let search_text = format_search_text(&bing);
-
-            // 累积 web_search_tool_result（给客户端看的）
-            accumulated.push(IrContentBlock::ToolResult {
-                tool_use_id: id.clone(),
-                content: IrToolResultContent::Text(search_text.clone()),
-                is_error: false,
-            });
-
-            // tool_result 消息（给上游下一轮用的）
-            tool_results.push(IrContentBlock::ToolResult {
-                tool_use_id: id.clone(),
-                content: IrToolResultContent::Text(search_text),
-                is_error: false,
-            });
-        }
-
-        messages.push(IrMessage {
-            role: IrRole::User,
-            content: tool_results,
-        });
-
-        // 轮数上限 2：每轮 = 上游往返 + Bing 搜索，多轮会拖到 40s+，
-        // 撞上 Claude Code 的搜索超时窗口。第 2 轮结束都返回当前累积结果，
-        // 保证响应速度。
-        if loop_count >= 2 {
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-/// 解析 Anthropic 非流式响应为 IR content blocks。
-fn parse_anthropic_response(msg: &Value) -> (Vec<IrContentBlock>, IrStopReason, IrUsage) {
-    let stop = msg["stop_reason"]
-        .as_str()
-        .map(IrStopReason::from_messages)
-        .unwrap_or(IrStopReason::EndTurn);
-
-    let content = msg["content"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|b| {
-                    match b["type"].as_str()? {
-                        "text" => Some(IrContentBlock::Text {
-                            text: b["text"].as_str().unwrap_or("").to_string(),
-                            cache_control: None,
-                        }),
-                        "tool_use" => Some(IrContentBlock::ToolUse {
-                            id: b["id"].as_str().unwrap_or("").to_string(),
-                            name: b["name"].as_str().unwrap_or("").to_string(),
-                            input: b.get("input").cloned().unwrap_or(Value::Null),
-                        }),
-                        "thinking" => Some(IrContentBlock::Thinking {
-                            thinking: b["thinking"].as_str().unwrap_or("").to_string(),
-                            signature: None,
-                        }),
-                        _ => None,
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let usage = IrUsage {
-        input_tokens: msg["usage"]["input_tokens"].as_u64().unwrap_or(0)
-            + msg["usage"]["cache_creation_input_tokens"]
-                .as_u64()
-                .unwrap_or(0),
-        output_tokens: msg["usage"]["output_tokens"].as_u64().unwrap_or(0),
-        cache_read_input_tokens: msg["usage"]["cache_read_input_tokens"]
-            .as_u64()
-            .unwrap_or(0),
-        ..Default::default()
-    };
-
-    (content, stop, usage)
-}
-
-/// 解析 Chat Completions 非流式响应为 IR content blocks。
-fn parse_chat_response(msg: &Value) -> (Vec<IrContentBlock>, IrStopReason, IrUsage) {
-    let choice = &msg["choices"][0];
-    let finish = choice["finish_reason"]
-        .as_str()
-        .map(IrStopReason::from_chat_completions)
-        .unwrap_or(IrStopReason::EndTurn);
-
-    let mut content: Vec<IrContentBlock> = Vec::new();
-
-    // reasoning_content
-    if let Some(rc) = choice["message"]["reasoning_content"].as_str() {
-        if !rc.is_empty() {
-            content.push(IrContentBlock::Thinking {
-                thinking: rc.to_string(),
-                signature: None,
-            });
-        }
-    }
-
-    // text content
-    if let Some(text) = choice["message"]["content"].as_str() {
-        if !text.is_empty() {
-            content.push(IrContentBlock::Text {
-                text: text.to_string(),
-                cache_control: None,
-            });
-        }
-    }
-
-    // tool_calls
-    if let Some(tool_calls) = choice["message"]["tool_calls"].as_array() {
-        for tc in tool_calls {
-            let id = tc["id"].as_str().unwrap_or("").to_string();
-            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-            let arguments = tc["function"]["arguments"].as_str().unwrap_or("{}");
-            let input: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-            content.push(IrContentBlock::ToolUse { id, name, input });
-        }
-    }
-
-    let usage = IrUsage {
-        input_tokens: msg["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-        output_tokens: msg["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-        cache_read_input_tokens: msg["usage"]
-            .get("prompt_cache_hit_tokens")
-            .or_else(|| {
-                msg["usage"]
-                    .get("prompt_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-            })
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        ..Default::default()
-    };
-
-    (content, finish, usage)
-}
-
-/// 解析 Responses API 非流式响应为 IR content blocks。
-fn parse_responses_response(msg: &Value) -> (Vec<IrContentBlock>, IrStopReason, IrUsage) {
-    let mut content: Vec<IrContentBlock> = Vec::new();
-
-    if let Some(output) = msg.get("output").and_then(|v| v.as_array()) {
-        for item in output {
-            match item["type"].as_str().unwrap_or("") {
-                "message" => {
-                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                content.push(IrContentBlock::Text {
-                                    text: text.to_string(),
-                                    cache_control: None,
-                                });
-                            }
-                        }
-                    }
-                }
-                "function_call" => {
-                    let id = item
-                        .get("call_id")
-                        .or_else(|| item.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let name = item["name"].as_str().unwrap_or("").to_string();
-                    let arguments = item["arguments"].as_str().unwrap_or("{}");
-                    let input: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-                    content.push(IrContentBlock::ToolUse { id, name, input });
-                }
-                "reasoning" => {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        content.push(IrContentBlock::Thinking {
-                            thinking: text.to_string(),
-                            signature: None,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let status = msg
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("completed");
-    // Responses API 没有显式 stop_reason：有 function_call 输出 → ToolUse，
-    // status=incomplete → MaxTokens，否则 EndTurn。
-    let has_function_call = msg
-        .get("output")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().any(|item| item["type"].as_str() == Some("function_call")))
-        .unwrap_or(false);
-    let stop = if has_function_call {
-        IrStopReason::ToolUse
-    } else {
-        match status {
-            "incomplete" => IrStopReason::MaxTokens,
-            _ => IrStopReason::EndTurn,
+        Err(e) => {
+            tracing::warn!(query = %query, error = %e, "websearch: Bing search failed");
+            format!("Web search unavailable: {}. Do NOT make up information. Inform the user that the search is temporarily unavailable.", e)
         }
     };
 
-    let usage = ir::usage::extract_responses_usage(msg);
-
-    (content, stop, usage)
-}
-
-/// 将 IR content blocks 渲染为 Anthropic content Value。
-fn ir_content_to_messages_value(blocks: &[IrContentBlock]) -> Value {
-    let arr: Vec<Value> = blocks
-        .iter()
-        .filter_map(|block| match block {
-            IrContentBlock::Text { text, cache_control } => {
-                let mut obj = json!({"type": "text", "text": text});
-                if let Some(cc) = cache_control {
-                    obj["cache_control"] = cc.clone();
-                }
-                Some(obj)
-            }
-            IrContentBlock::Thinking { thinking, .. } => {
-                Some(json!({"type": "thinking", "thinking": thinking}))
-            }
-            IrContentBlock::ToolUse { id, name, input } => {
-                Some(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
-            }
-            IrContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => {
-                let c = match content {
-                    IrToolResultContent::Text(t) => json!(t),
-                    IrToolResultContent::Blocks(blocks) => ir_content_to_messages_value(blocks),
-                };
-                let mut obj = json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": c});
-                if *is_error {
-                    obj["is_error"] = json!(true);
-                }
-                Some(obj)
-            }
-            IrContentBlock::Image { source } => {
-                let src = match source {
-                    IrImageSource::Base64 { media_type, data } => {
-                        json!({"type": "base64", "media_type": media_type, "data": data})
-                    }
-                    IrImageSource::Url { url } => json!({"type": "url", "url": url}),
-                };
-                Some(json!({"type": "image", "source": src}))
-            }
-        })
-        .collect();
-    json!(arr)
-}
-
-/// 将 IR messages 渲染为 Chat Completions messages Value。
-fn ir_messages_to_chat_completions_value(messages: &[IrMessage]) -> Vec<Value> {
-    let mut result = Vec::new();
-
-    for msg in messages {
-        let role = match msg.role {
-            IrRole::User => "user",
-            IrRole::Assistant => "assistant",
-        };
-
-        let mut text_parts: Vec<String> = vec![];
-        let mut tool_calls: Vec<Value> = vec![];
-        let mut reasoning_content: Option<String> = None;
-        let mut tool_results: Vec<(String, String)> = vec![];
-        // 是否渲染过任何内容块（纯 tool_result 的消息不产生空 user 消息）
-        let mut rendered_any = false;
-
-        for block in &msg.content {
-            match block {
-                IrContentBlock::Text { text, .. } => { text_parts.push(text.clone()); rendered_any = true; }
-                IrContentBlock::Thinking { thinking, .. } => {
-                    reasoning_content = Some(thinking.clone());
-                    rendered_any = true;
-                }
-                IrContentBlock::ToolUse { id, name, input } => {
-                    rendered_any = true;
-                    tool_calls.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
-                        }
-                    }));
-                }
-                IrContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    ..
-                } => {
-                    let text = match content {
-                        IrToolResultContent::Text(t) => t.clone(),
-                        IrToolResultContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| {
-                                if let IrContentBlock::Text { text, .. } = b {
-                                    Some(text.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    };
-                    tool_results.push((tool_use_id.clone(), text));
-                }
-                _ => {}
-            }
+    // 3. 搜索结果注入 system prompt
+    let search_block = IrSystemBlock {
+        text: format!(
+            "[Web Search Results for: {}]\n{}\n\nUse the above search results to answer the user's question. Cite sources using [N] notation.",
+            query, search_text
+        ),
+        cache_control: None,
+    };
+    ir_request.system = match ir_request.system.take() {
+        Some(IrSystemContent::Text(t)) => Some(IrSystemContent::Blocks(vec![
+            IrSystemBlock { text: t, cache_control: None },
+            search_block,
+        ])),
+        Some(IrSystemContent::Blocks(mut blocks)) => {
+            blocks.push(search_block);
+            Some(IrSystemContent::Blocks(blocks))
         }
-
-        // Tool results 作为独立的 tool role 消息
-        for (tool_call_id, text) in &tool_results {
-            result.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": text
-            }));
-        }
-
-        // 普通消息（纯 tool_result 的消息已被 tool role 消息替代，不产生空 user 消息）
-        if rendered_any {
-            let mut msg_obj = json!({"role": role});
-            if !text_parts.is_empty() {
-                msg_obj["content"] = json!(text_parts.join("\n"));
-            } else if tool_calls.is_empty() {
-                msg_obj["content"] = json!("");
-            }
-            if let Some(rc) = reasoning_content {
-                msg_obj["reasoning_content"] = json!(rc);
-            }
-            if !tool_calls.is_empty() {
-                msg_obj["tool_calls"] = json!(tool_calls);
-                if msg_obj.get("content").is_none() {
-                    msg_obj["content"] = Value::Null;
-                }
-            }
-            result.push(msg_obj);
-        }
-    }
-
-    result
-}
-
-/// 将累积的 IR content blocks 渲染为客户端格式 SSE 字节序列。
-fn render_accumulated_ir(
-    client_format: ClientFormat,
-    content: &[IrContentBlock],
-    stop_reason: IrStopReason,
-    usage: &IrUsage,
-) -> Vec<Bytes> {
-    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-
-    // 过滤中间轮次的 tool_use/tool_result，只向客户端输出最终内容。
-    // web_search 劫持对客户端是透明的：客户端发起的 web_search 调用在
-    // 网关内部完成，不该把工具调用块回传给客户端（客户端无法识别
-    // web_search_tool_result 特殊块，会报 malformed response）。
-    let final_content: Vec<IrContentBlock> = content
-        .iter()
-        .filter(|b| matches!(b, IrContentBlock::Text { .. } | IrContentBlock::Thinking { .. }))
-        .cloned()
-        .collect();
-
-    match client_format {
-        ClientFormat::Messages => {
-            render_anthropic_sse(&msg_id, &final_content, stop_reason, usage)
-        }
-        ClientFormat::ChatCompletions => {
-            render_chat_sse(&msg_id, &final_content, stop_reason, usage)
-        }
-        ClientFormat::Responses => {
-            render_responses_sse(&msg_id, &final_content, stop_reason, usage)
-        }
-    }
-}
-
-/// 渲染 Anthropic SSE 字节序列。
-fn render_anthropic_sse(
-    msg_id: &str,
-    content: &[IrContentBlock],
-    stop_reason: IrStopReason,
-    usage: &IrUsage,
-) -> Vec<Bytes> {
-    let mk = |event_type: &str, payload: Value| -> Bytes {
-        let data = serde_json::to_string(&payload).unwrap_or_default();
-        Bytes::from(format!("event: {}\ndata: {}\n\n", event_type, data))
+        None => Some(IrSystemContent::Blocks(vec![search_block])),
     };
 
-    let mut out = vec![mk(
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": msg_id, "type": "message", "role": "assistant",
-                "model": "", "content": [], "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": 0, "output_tokens": 0}
-            }
-        }),
-    )];
+    // 4. 清除工具
+    let tools_count = ir_request.tools.len();
+    ir_request.tools = Vec::new();
+    ir_request.tool_choice = None;
+    tracing::info!(cleared_tools = tools_count, "websearch: IR enriched, tools cleared");
 
-    for (i, block) in content.iter().enumerate() {
-        match block {
-            IrContentBlock::Text { text, .. } => {
-                out.push(mk("content_block_start", json!({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}})));
-                out.push(mk("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": text}})));
-                out.push(mk("content_block_stop", json!({"type": "content_block_stop", "index": i})));
-            }
-            IrContentBlock::ToolUse { id, name, input } => {
-                out.push(mk("content_block_start", json!({"type": "content_block_start", "index": i, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}})));
-                let input_json = serde_json::to_string(input).unwrap_or_default();
-                out.push(mk("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": input_json}})));
-                out.push(mk("content_block_stop", json!({"type": "content_block_stop", "index": i})));
-            }
-            IrContentBlock::ToolResult { tool_use_id, content: tc, .. } => {
-                // web_search_tool_result 在 Anthropic 格式中作为特殊块
-                let result_blocks = match tc {
-                    IrToolResultContent::Text(t) => json!([{"type": "text", "text": t}]),
-                    IrToolResultContent::Blocks(blocks) => ir_content_to_messages_value(blocks),
-                };
-                out.push(mk("content_block_start", json!({"type": "content_block_start", "index": i, "content_block": {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": result_blocks}})));
-                out.push(mk("content_block_stop", json!({"type": "content_block_stop", "index": i})));
-            }
-            IrContentBlock::Thinking { thinking, .. } => {
-                out.push(mk("content_block_start", json!({"type": "content_block_start", "index": i, "content_block": {"type": "thinking", "thinking": ""}})));
-                out.push(mk("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": {"type": "thinking_delta", "thinking": thinking}})));
-                out.push(mk("content_block_stop", json!({"type": "content_block_stop", "index": i})));
-            }
-            _ => {}
-        }
-    }
-
-    out.push(mk(
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason.as_anthropic_str(), "stop_sequence": null},
-            "usage": {"output_tokens": usage.output_tokens, "cache_read_input_tokens": usage.cache_read_input_tokens}
-        }),
-    ));
-    out.push(mk("message_stop", json!({"type": "message_stop"})));
-    out
+    ir_request
 }
 
-/// 渲染 Chat Completions SSE 字节序列。
-fn render_chat_sse(
-    msg_id: &str,
-    content: &[IrContentBlock],
-    stop_reason: IrStopReason,
-    usage: &IrUsage,
-) -> Vec<Bytes> {
-    let mk = |payload: Value| -> Bytes {
-        let data = serde_json::to_string(&payload).unwrap_or_default();
-        Bytes::from(format!("data: {}\n\n", data))
-    };
-
-    let created = chrono::Utc::now().timestamp();
-    let mut out = vec![];
-
-    // 第一个 chunk: role
-    out.push(mk(json!({
-        "id": msg_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": "",
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
-    })));
-
-    // 文本内容
-    for block in content {
-        match block {
-            IrContentBlock::Text { text, .. } => {
-                out.push(mk(json!({
-                    "id": msg_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": "",
-                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
-                })));
+/// 从 messages 中提取最后一条 user 消息文本作为搜索关键词。
+fn extract_search_query(messages: &[IrMessage]) -> String {
+    for msg in messages.iter().rev() {
+        if msg.role == IrRole::User {
+            let text: String = msg.content.iter().filter_map(|b| match b {
+                IrContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            }).collect::<Vec<_>>().join(" ");
+            if !text.trim().is_empty() {
+                return text.trim().to_string();
             }
-            IrContentBlock::Thinking { thinking, .. } => {
-                out.push(mk(json!({
-                    "id": msg_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": "",
-                    "choices": [{"index": 0, "delta": {"reasoning_content": thinking}, "finish_reason": null}]
-                })));
-            }
-            IrContentBlock::ToolUse { id, name, input } => {
-                let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
-                out.push(mk(json!({
-                    "id": msg_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": "",
-                    "choices": [{"index": 0, "delta": {
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": args}
-                        }]
-                    }, "finish_reason": null}]
-                })));
-            }
-            _ => {}
         }
     }
-
-    // finish chunk with usage
-    let output_tokens = if usage.output_tokens > 0 {
-        usage.output_tokens
-    } else {
-        usage.output_chars / 4
-    };
-    out.push(mk(json!({
-        "id": msg_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": "",
-        "choices": [{"index": 0, "delta": {}, "finish_reason": stop_reason.as_chat_finish_reason()}],
-        "usage": {
-            "prompt_tokens": usage.input_tokens + usage.cache_read_input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": usage.input_tokens + usage.cache_read_input_tokens + output_tokens,
-            "prompt_tokens_details": {"cached_tokens": usage.cache_read_input_tokens}
-        }
-    })));
-    out.push(Bytes::from("data: [DONE]\n\n"));
-    out
-}
-
-/// 渲染 Responses SSE 字节序列。
-fn render_responses_sse(
-    msg_id: &str,
-    content: &[IrContentBlock],
-    stop_reason: IrStopReason,
-    usage: &IrUsage,
-) -> Vec<Bytes> {
-    let mk = |event_type: &str, payload: Value| -> Bytes {
-        let data = serde_json::to_string(&payload).unwrap_or_default();
-        Bytes::from(format!("event: {}\ndata: {}\n\n", event_type, data))
-    };
-
-    let mut out = vec![];
-
-    // response.created
-    out.push(mk("response.created", json!({
-        "type": "response.created",
-        "response": {"id": msg_id, "model": "", "status": "in_progress", "output": []}
-    })));
-
-    // 内容
-    for (i, block) in content.iter().enumerate() {
-        match block {
-            IrContentBlock::Text { text, .. } => {
-                out.push(mk("response.output_item.added", json!({
-                    "type": "response.output_item.added",
-                    "output_index": i,
-                    "item": {"type": "message", "role": "assistant", "content": []}
-                })));
-                out.push(mk("response.output_text.delta", json!({
-                    "type": "response.output_text.delta",
-                    "output_index": i,
-                    "delta": text
-                })));
-                out.push(mk("response.output_item.done", json!({
-                    "type": "response.output_item.done",
-                    "output_index": i,
-                    "item": {}
-                })));
-            }
-            IrContentBlock::ToolUse { id, name, input } => {
-                let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
-                out.push(mk("response.output_item.added", json!({
-                    "type": "response.output_item.added",
-                    "output_index": i,
-                    "item": {"type": "function_call", "call_id": id, "name": name, "arguments": args}
-                })));
-                out.push(mk("response.output_item.done", json!({
-                    "type": "response.output_item.done",
-                    "output_index": i,
-                    "item": {}
-                })));
-            }
-            IrContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => {
-                // web_search_tool_result → function_call_output item
-                let output = match content {
-                    IrToolResultContent::Text(t) => t.clone(),
-                    IrToolResultContent::Blocks(blocks) => blocks
-                        .iter()
-                        .filter_map(|b| {
-                            if let IrContentBlock::Text { text, .. } = b {
-                                Some(text.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                };
-                // 规范结构：output 是 content parts 数组（input_text），错误时 is_error: true
-                let mut item = json!({
-                    "type": "function_call_output",
-                    "call_id": tool_use_id,
-                    "output": [{"type": "input_text", "text": output}]
-                });
-                if *is_error {
-                    item["output"] = json!([{"type": "input_text", "text": format!("ERROR: {}", output)}]);
-                }
-                out.push(mk("response.output_item.added", json!({
-                    "type": "response.output_item.added",
-                    "output_index": i,
-                    "item": item
-                })));
-                out.push(mk("response.output_item.done", json!({
-                    "type": "response.output_item.done",
-                    "output_index": i,
-                    "item": {}
-                })));
-            }
-            _ => {}
-        }
-    }
-
-    // response.completed
-    let output_tokens = if usage.output_tokens > 0 {
-        usage.output_tokens
-    } else {
-        usage.output_chars / 4
-    };
-    out.push(mk("response.completed", json!({
-        "type": "response.completed",
-        "response": {
-            "id": msg_id,
-            "model": "",
-            "status": "completed",
-            "output": [],
-            "usage": {
-                "input_tokens": usage.input_tokens + usage.cache_read_input_tokens,
-                "output_tokens": output_tokens,
-                "input_tokens_details": {"cached_tokens": usage.cache_read_input_tokens}
-            }
-        }
-    })));
-    out
+    "search".to_string() // fallback
 }
 
 #[cfg(test)]
@@ -1104,42 +106,475 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // ── 构造 IR 请求辅助 ─────────────────────────────────────
+    fn make_ir_request_with_websearch(user_message: &str) -> IrRequest {
+        IrRequest {
+            model: "claude-opus-4-8".to_string(),
+            system: Some(IrSystemContent::Text("You are a helpful assistant.".to_string())),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text {
+                    text: user_message.to_string(),
+                    cache_control: None,
+                }],
+            }],
+            tools: vec![IrTool {
+                name: "web_search".to_string(),
+                description: None,
+                input_schema: json!({}),
+            }],
+            tool_choice: Some(IrToolChoice::Auto),
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            stream: true,
+        }
+    }
+
+    // ── 基础单元测试 ──────────────────────────────────────────
+
     #[test]
-    fn test_parse_responses_stop_reason_function_call() {
-        // Responses 输出含 function_call → ToolUse（websearch loop 需要继续）
-        let msg = json!({
-            "id": "resp_1",
-            "status": "completed",
-            "output": [{
-                "id": "fc_1", "type": "function_call", "call_id": "fc_1",
-                "name": "web_search", "arguments": "{\"query\":\"测试\"}"
-            }]
-        });
-        let (content, stop, _) = parse_responses_response(&msg);
-        assert_eq!(stop, IrStopReason::ToolUse);
-        assert!(content.iter().any(|b| matches!(b, IrContentBlock::ToolUse { name, .. } if name == "web_search")));
+    fn test_has_websearch_tool_ir() {
+        let req = IrRequest {
+            model: "test".to_string(),
+            system: None,
+            messages: vec![],
+            tools: vec![IrTool {
+                name: "web_search".to_string(),
+                description: None,
+                input_schema: json!({}),
+            }],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            stream: false,
+        };
+        assert!(has_websearch_tool_ir(&req));
+
+        let req_no_tools = IrRequest {
+            model: "test".to_string(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            stream: false,
+        };
+        assert!(!has_websearch_tool_ir(&req_no_tools));
     }
 
     #[test]
-    fn test_parse_responses_stop_reason_text() {
-        // 纯文本输出 → EndTurn
-        let msg = json!({
-            "id": "resp_1",
-            "status": "completed",
-            "output": [{
-                "id": "msg_1", "type": "message", "role": "assistant",
-                "content": [{"type": "output_text", "text": "结果是晴天"}]
-            }]
-        });
-        let (content, stop, _) = parse_responses_response(&msg);
-        assert_eq!(stop, IrStopReason::EndTurn);
-        assert!(content.iter().any(|b| matches!(b, IrContentBlock::Text { text, .. } if text == "结果是晴天")));
+    fn test_extract_search_query() {
+        let messages = vec![
+            IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text {
+                    text: "Hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            IrMessage {
+                role: IrRole::Assistant,
+                content: vec![IrContentBlock::Text {
+                    text: "Hi!".to_string(),
+                    cache_control: None,
+                }],
+            },
+            IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text {
+                    text: "今日金价多少？".to_string(),
+                    cache_control: None,
+                }],
+            },
+        ];
+        assert_eq!(extract_search_query(&messages), "今日金价多少？");
     }
 
     #[test]
-    fn test_parse_responses_stop_reason_incomplete() {
-        let msg = json!({"id": "resp_1", "status": "incomplete", "output": []});
-        let (_, stop, _) = parse_responses_response(&msg);
-        assert_eq!(stop, IrStopReason::MaxTokens);
+    fn test_extract_search_query_empty() {
+        let messages: Vec<IrMessage> = vec![];
+        assert_eq!(extract_search_query(&messages), "search");
+    }
+
+    #[test]
+    fn test_format_search_text() {
+        let results = vec![
+            crate::search::SearchResult {
+                title: "Test".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: "A snippet".to_string(),
+            },
+        ];
+        let text = format_search_text(&results);
+        assert!(text.contains("[1] Test"));
+        assert!(text.contains("https://example.com"));
+        assert!(text.contains("A snippet"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 端到端管道测试：IR → Bing 搜索 → IR 注入 → 上游 JSON
+    // ═══════════════════════════════════════════════════════════════
+
+    fn make_ir_with_websearch(user_msg: &str) -> IrRequest {
+        IrRequest {
+            model: "test-model".to_string(),
+            system: Some(IrSystemContent::Text("You are a helpful assistant.".to_string())),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text {
+                    text: user_msg.to_string(),
+                    cache_control: None,
+                }],
+            }],
+            tools: vec![IrTool {
+                name: "web_search".to_string(),
+                description: None,
+                input_schema: json!({}),
+            }],
+            tool_choice: Some(IrToolChoice::Auto),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            stream: false,
+        }
+    }
+
+    /// 管道 Step 1: IR 请求检测到 web_search 工具
+    #[test]
+    fn test_e2e_step1_detect_websearch_tool() {
+        let ir = make_ir_with_websearch("张雪峰的死因");
+        assert!(has_websearch_tool_ir(&ir), "IR should detect web_search tool");
+        assert_eq!(ir.tools.len(), 1);
+        assert!(matches!(ir.tool_choice, Some(IrToolChoice::Auto)));
+    }
+
+    /// 管道 Step 2: 模拟 Bing 结果注入 system prompt（不走网络）
+    #[test]
+    fn test_e2e_step2_inject_search_results_into_system() {
+        let mut ir = make_ir_with_websearch("张雪峰的死因");
+
+        // 模拟 Bing 返回 3 条结果
+        let fake_results = vec![
+            crate::search::SearchResult {
+                title: "41岁张雪峰去世，死因曝光".to_string(),
+                url: "https://www.sohu.com/a/1001465544".to_string(),
+                snippet: "医院随后公布死因——心源性猝死".to_string(),
+            },
+            crate::search::SearchResult {
+                title: "张雪峰离世细节曝光".to_string(),
+                url: "https://zhuanlan.zhihu.com/p/202025575".to_string(),
+                snippet: "因心源性猝死永远停在了41岁".to_string(),
+            },
+            crate::search::SearchResult {
+                title: "张雪峰老师心源性猝死的原因解析".to_string(),
+                url: "https://zhuanlan.zhihu.com/p/2019915159".to_string(),
+                snippet: "张雪峰老师在公司跑步后突发不适".to_string(),
+            },
+        ];
+
+        let search_text = format_search_text(&fake_results);
+
+        // 模拟 enrich_ir_with_search 的注入逻辑
+        let search_block = IrSystemBlock {
+            text: format!(
+                "[Web Search Results for: {}]\n{}\n\nUse the above search results to answer the user's question. Cite sources using [N] notation.",
+                "张雪峰的死因", search_text
+            ),
+            cache_control: None,
+        };
+
+        // 原 system 是 Text → 应升级为 Blocks
+        ir.system = match ir.system.take() {
+            Some(IrSystemContent::Text(t)) => Some(IrSystemContent::Blocks(vec![
+                IrSystemBlock { text: t, cache_control: None },
+                search_block,
+            ])),
+            _ => unreachable!(),
+        };
+        ir.tools = Vec::new();
+        ir.tool_choice = None;
+
+        // 验证 system 已升级
+        match ir.system.as_ref().unwrap() {
+            IrSystemContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2, "Should have original + search block");
+                assert_eq!(blocks[0].text, "You are a helpful assistant.");
+                assert!(blocks[1].text.contains("[Web Search Results for: 张雪峰的死因]"));
+                assert!(blocks[1].text.contains("心源性猝死"));
+                assert!(blocks[1].text.contains("Cite sources using [N] notation"));
+            }
+            _ => panic!("System should be Blocks after injection"),
+        }
+
+        // 验证 tools 已清除
+        assert!(ir.tools.is_empty());
+        assert!(ir.tool_choice.is_none());
+    }
+
+    /// 管道 Step 3: 注入后的 IR 序列化为 Anthropic Messages 格式
+    #[test]
+    fn test_e2e_step3_serialize_to_messages() {
+        let ir = build_enriched_ir();
+
+        let json = crate::api::proxy::ir::to_messages::ir_req_to_messages(&ir);
+
+        // system 应为数组（原始 + 搜索结果两个 block）
+        let system = json.get("system").expect("should have system");
+        let system_arr = system.as_array().expect("system should be array");
+        assert_eq!(system_arr.len(), 2);
+        assert_eq!(system_arr[0]["text"].as_str().unwrap(), "You are a helpful assistant.");
+        assert!(system_arr[1]["text"].as_str().unwrap().contains("[Web Search Results"));
+
+        // tools 应不存在
+        assert!(json.get("tools").is_none(), "tools should be cleared");
+
+        // messages 正常
+        let msgs = json["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"].as_str().unwrap(), "user");
+    }
+
+    /// 管道 Step 3b: 注入后的 IR 序列化为 Chat Completions 格式
+    #[test]
+    fn test_e2e_step3b_serialize_to_chat_completions() {
+        let ir = build_enriched_ir();
+
+        let json = crate::api::proxy::ir::to_chat_completions::ir_req_to_chat_completions(&ir);
+
+        // system 应合并为 messages[0]
+        let msgs = json["messages"].as_array().unwrap();
+        assert!(msgs.len() >= 2, "should have system + user messages");
+        assert_eq!(msgs[0]["role"].as_str().unwrap(), "system");
+        let sys_content = msgs[0]["content"].as_str().unwrap();
+        assert!(sys_content.contains("You are a helpful assistant."));
+        assert!(sys_content.contains("[Web Search Results"));
+
+        // tools 应不存在
+        assert!(json.get("tools").is_none(), "tools should be cleared");
+    }
+
+    /// 管道 Step 3c: 注入后的 IR 序列化为 Responses 格式
+    #[test]
+    fn test_e2e_step3c_serialize_to_responses() {
+        let ir = build_enriched_ir();
+
+        let json = crate::api::proxy::ir::to_responses::ir_req_to_responses(&ir);
+
+        // system 应在 input[0]
+        let input = json["input"].as_array().unwrap();
+        assert!(input.len() >= 2, "should have system + user input items");
+        assert_eq!(input[0]["role"].as_str().unwrap(), "system");
+        let content = input[0]["content"].as_array().unwrap();
+        // 两个 system block → 两个 input_text part
+        assert_eq!(content.len(), 2);
+        assert!(content[1]["text"].as_str().unwrap().contains("[Web Search Results"));
+
+        // tools 应不存在
+        assert!(json.get("tools").is_none(), "tools should be cleared");
+    }
+
+    /// 管道 Step 4: 完整 E2E — 最终发给上游的 JSON 应包含搜索结果且不含 tools
+    #[test]
+    fn test_e2e_step4_final_upstream_json() {
+        let ir = build_enriched_ir();
+
+        // 模拟 stream.rs 中 pick provider 后的序列化逻辑
+        let body = crate::api::proxy::ir::to_messages::ir_req_to_messages(&ir);
+
+        let json_str = serde_json::to_string(&body).unwrap();
+        println!("Final upstream JSON (truncated):\n{}", &json_str[..json_str.len().min(500)]);
+
+        // 关键断言
+        assert!(json_str.contains("心源性猝死"), "JSON should contain search result content");
+        assert!(json_str.contains("[Web Search Results"), "JSON should contain search marker");
+        assert!(json_str.contains("Cite sources using [N]"), "JSON should contain citation instruction");
+        assert!(!json_str.contains("\"tools\""), "JSON should NOT contain tools field");
+        assert!(json_str.contains("\"stream\":true"), "JSON should have stream=true");
+    }
+
+    /// 管道异常路径: Bing 返回空结果时 LLM 被告知无结果
+    #[test]
+    fn test_e2e_empty_search_results() {
+        let search_text = format!("No web search results found for: {}", "随机无意义字符串xyz123");
+
+        let search_block = IrSystemBlock {
+            text: format!(
+                "[Web Search Results for: {}]\n{}\n\nUse the above search results to answer the user's question. Cite sources using [N] notation.",
+                "随机无意义字符串xyz123", search_text
+            ),
+            cache_control: None,
+        };
+
+        let ir = IrRequest {
+            model: "test".to_string(),
+            system: Some(IrSystemContent::Blocks(vec![
+                IrSystemBlock { text: "You are a helpful assistant.".to_string(), cache_control: None },
+                search_block,
+            ])),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text { text: "随机无意义字符串xyz123".to_string(), cache_control: None }],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None, temperature: None, top_p: None, thinking: None, stream: false,
+        };
+
+        let json = crate::api::proxy::ir::to_messages::ir_req_to_messages(&ir);
+        let sys = json["system"].as_array().unwrap();
+        let search_text = sys[1]["text"].as_str().unwrap();
+        assert!(search_text.contains("No web search results found"));
+    }
+
+    /// 管道异常路径: Bing 搜索失败时 LLM 被告知不可用
+    #[test]
+    fn test_e2e_search_error_fallback() {
+        let error_msg = "Web search unavailable: timeout. Do NOT make up information. Inform the user that the search is temporarily unavailable.";
+
+        let search_block = IrSystemBlock {
+            text: format!(
+                "[Web Search Results for: {}]\n{}\n\nUse the above search results to answer the user's question. Cite sources using [N] notation.",
+                "test query", error_msg
+            ),
+            cache_control: None,
+        };
+
+        let ir = IrRequest {
+            model: "test".to_string(),
+            system: Some(IrSystemContent::Blocks(vec![
+                IrSystemBlock { text: "original system".to_string(), cache_control: None },
+                search_block,
+            ])),
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None, temperature: None, top_p: None, thinking: None, stream: false,
+        };
+
+        let json = crate::api::proxy::ir::to_messages::ir_req_to_messages(&ir);
+        let sys = json["system"].as_array().unwrap();
+        assert!(sys[1]["text"].as_str().unwrap().contains("Do NOT make up information"));
+    }
+
+    /// 管道边界: 已有 cache_control 的 system blocks 应保留
+    #[test]
+    fn test_e2e_preserve_cache_control() {
+        let mut ir = make_ir_with_websearch("test");
+        ir.system = Some(IrSystemContent::Blocks(vec![
+            IrSystemBlock {
+                text: "cached system".to_string(),
+                cache_control: Some(json!({"type": "ephemeral"})),
+            },
+        ]));
+
+        // 模拟注入
+        let search_block = IrSystemBlock {
+            text: "[Web Search Results] fake results".to_string(),
+            cache_control: None,
+        };
+        match ir.system {
+            Some(IrSystemContent::Blocks(ref mut blocks)) => blocks.push(search_block),
+            _ => unreachable!(),
+        }
+        ir.tools = Vec::new();
+        ir.tool_choice = None;
+
+        let json = crate::api::proxy::ir::to_messages::ir_req_to_messages(&ir);
+        let sys = json["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2);
+        // 第一个 block 保留 cache_control
+        assert!(sys[0].get("cache_control").is_some());
+        assert_eq!(sys[0]["cache_control"]["type"].as_str().unwrap(), "ephemeral");
+        // 第二个 block（搜索结果）无 cache_control
+        assert!(sys[1].get("cache_control").is_none());
+    }
+
+    /// 管道边界: 无 system 时注入搜索结果应正常工作
+    #[test]
+    fn test_e2e_no_existing_system() {
+        let mut ir = IrRequest {
+            model: "test".to_string(),
+            system: None,
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text { text: "search query".to_string(), cache_control: None }],
+            }],
+            tools: vec![IrTool {
+                name: "web_search".to_string(),
+                description: None,
+                input_schema: json!({}),
+            }],
+            tool_choice: None,
+            max_tokens: None, temperature: None, top_p: None, thinking: None, stream: false,
+        };
+
+        let search_block = IrSystemBlock {
+            text: "[Web Search Results for: search query]\nfake results".to_string(),
+            cache_control: None,
+        };
+        ir.system = Some(IrSystemContent::Blocks(vec![search_block]));
+        ir.tools = Vec::new();
+
+        let json = crate::api::proxy::ir::to_messages::ir_req_to_messages(&ir);
+        let sys = json["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert!(sys[0]["text"].as_str().unwrap().contains("[Web Search Results"));
+    }
+
+    // ── 辅助函数 ──────────────────────────────────────────────
+
+    /// 构造一个已注入搜索结果的 IR（模拟 enrich_ir_with_search 的输出）
+    fn build_enriched_ir() -> IrRequest {
+        let fake_results = vec![
+            crate::search::SearchResult {
+                title: "41岁张雪峰去世，死因曝光".to_string(),
+                url: "https://www.sohu.com/a/1001465544".to_string(),
+                snippet: "医院随后公布死因——心源性猝死".to_string(),
+            },
+            crate::search::SearchResult {
+                title: "张雪峰离世细节曝光".to_string(),
+                url: "https://zhuanlan.zhihu.com/p/202025575".to_string(),
+                snippet: "因心源性猝死永远停在了41岁".to_string(),
+            },
+        ];
+
+        let search_text = format_search_text(&fake_results);
+        let search_block = IrSystemBlock {
+            text: format!(
+                "[Web Search Results for: {}]\n{}\n\nUse the above search results to answer the user's question. Cite sources using [N] notation.",
+                "张雪峰的死因", search_text
+            ),
+            cache_control: None,
+        };
+
+        IrRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            system: Some(IrSystemContent::Blocks(vec![
+                IrSystemBlock { text: "You are a helpful assistant.".to_string(), cache_control: None },
+                search_block,
+            ])),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text {
+                    text: "张雪峰的死因".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            tools: vec![],  // 已清除
+            tool_choice: None,  // 已清除
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            stream: true,
+        }
     }
 }

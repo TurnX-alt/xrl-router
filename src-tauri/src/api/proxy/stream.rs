@@ -29,7 +29,7 @@ use super::ir;
 use super::ir::types::IrRequest;
 use super::key_rotation::{pick_key_for, update_key_health};
 use super::route::{resolve_route, ResolvedRoute};
-use super::websearch::{has_websearch_tool_ir, run_websearch_loop};
+use super::websearch::{enrich_ir_with_search, has_websearch_tool_ir};
 
 /// HTTP error tuple returned by proxy handlers.
 pub type ErrorTuple = (StatusCode, HeaderMap, Json<Value>);
@@ -95,8 +95,17 @@ pub(super) const SSE_KEEPALIVE_SECS: u64 = 15;
 /// 不阻塞 HTTP Response 返回。客户端在毫秒级内收到 `:keepalive` 首字节。
 pub async fn proxy_stream(
     state: Arc<AppState>,
-    ctx: StreamContext,
+    mut ctx: StreamContext,
 ) -> Result<Response, ErrorTuple> {
+    // ── 0. WebSearch 劫持：本地搜索 + 单次上游调用（在借用 ctx 之前） ──
+    if state.websearch_hijack.load(std::sync::atomic::Ordering::Relaxed)
+        && has_websearch_tool_ir(&ctx.ir_request)
+    {
+        info!(trace_id = %ctx.trace_id, "web_search: enriching IR with local Bing search");
+        ctx.ir_request = enrich_ir_with_search(ctx.ir_request).await;
+        // 清除工具后继续走正常流式路径（key failover 由 proxy_stream 天然支持）
+    }
+
     let trace_id = &ctx.trace_id;
     let model_name = &ctx.model_name;
     let header_timeout_secs = ctx.header_timeout_secs;
@@ -131,41 +140,23 @@ pub async fn proxy_stream(
         }
     };
 
-    // ── 2. 上下文超限预检（同步段，纯内存判断） ────────────────────
-    // 估算输入 token 超过模型 context_window 时提前拒绝，避免发上游
-    // 白等一轮后拿到超限错误。估算口径保守（chars/4），多数情况下
-    // 真实 token 数 ≤ 估算，误杀概率低。
+    // ── 2. 上下文超限预警（同步段，纯内存判断） ────────────────────
+    // 估算输入 token 超过模型 context_window 时仅记 warn，不阻断请求。
+    // 原因：
+    //   1. chars/4 估算口径偏保守，中文/代码实际 token 数通常低于估算；
+    //   2. 硬拒绝会阻断客户端 auto-compact（/compact 自身也需走代理），
+    //      形成死锁——客户端永远无法拿到真实 usage 来触发压缩。
+    // 让上游自行判断是否超限并返回准确错误，客户端可据此 auto-compact。
     let est_input = ctx.est_input;
     let max_input = candidates.iter().map(|c| c.context_window).max().unwrap_or(0);
     if max_input > 0 && est_input as usize > max_input {
-        let msg = format!(
-            "estimated input tokens ({}) exceed context window ({}) of model '{}'",
-            est_input, max_input, model_name
+        warn!(
+            trace_id = %trace_id,
+            est_input,
+            max_input,
+            model = %model_name,
+            "Estimated input tokens exceed context window (soft warning, forwarding to upstream)"
         );
-        warn!(trace_id = %trace_id, est_input, max_input, "{}", msg);
-        return Err((
-            StatusCode::BAD_REQUEST,
-            HeaderMap::new(),
-            Json(json!({"error": {"type": "invalid_request_error", "message": msg}})),
-        ));
-    }
-
-    // ── 3. WebSearch 劫持（同步段，纯内存判断） ─────────────────────
-    let resolved = candidates[0].clone();
-
-    if state.websearch_hijack.load(std::sync::atomic::Ordering::Relaxed)
-        && has_websearch_tool_ir(&ctx.ir_request)
-    {
-        info!(trace_id = %trace_id, provider_kind = %resolved.provider_kind, "web_search hijacked → local Bing loop");
-        return run_websearch_loop(
-            state.clone(),
-            ctx.ir_request.clone(),
-            resolved.clone(),
-            ctx.client_format,
-            trace_id.clone(),
-            ctx.service_key,
-        )
-        .await;
     }
 
     // ── 3. 预构造请求体（同步段，纯内存操作） ───────────────────────
