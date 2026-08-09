@@ -29,9 +29,17 @@ src-tauri/src/                 后端 Rust
 │       ├── route.rs           模型别名→上游 URL 解析
 │       ├── failover.rs        provider 级冷却表
 │       ├── key_rotation.rs    密钥选取 + 健康反馈
-│       ├── websearch.rs       Bing 劫持 loop
+│       ├── websearch.rs       本地 Bing 搜索 → 注入 IR system → 清除 tools（不再 tool-calling loop）
 │       ├── sniff.rs           SniffStream (透传+嗅探)
-│       └── translate/         协议转换
+│       └── ir/                IR 中间表示层（三种协议统一抽象）
+│            ├── types.rs          IrRequest / IrMessage / IrContentBlock / IrStreamEvent / IrUsage
+│            ├── from_messages.rs      Anthropic Messages → IR
+│            ├── from_chat_completions.rs  OpenAI Chat Completions → IR
+│            ├── from_responses.rs     OpenAI Responses API → IR
+│            ├── to_messages.rs          IR → Anthropic Messages
+│            ├── to_chat_completions.rs  IR → OpenAI Chat Completions
+│            ├── to_responses.rs       IR → OpenAI Responses API
+│            └── usage.rs          Token usage 提取（三种格式）
 ├── db/*                       SQLite 封装（mod.rs + schema.rs + 按实体分文件）
 ├── types/*                    数据结构定义（Provider/Model/ApiKey/Chat/Route/...）
 ├── providers/                 Provider 适配器（proxy 不经过它）
@@ -43,7 +51,7 @@ src-tauri/src/                 后端 Rust
 ├── models/mod.rs              ModelRegistry
 ├── middleware/rate_limit.rs   令牌桶限流
 ├── middleware/admin_guard.rs  IP 限制中间件（/api/* 仅 loopback）
-├── search/bing.rs             Bing 搜索（WebSearch 劫持用）
+├── search/bing.rs             Bing 搜索（cn.bing.com，绕过代理直连，独立 cookie 会话）
 
 > **HTTP 客户端**：所有出站 HTTP 请求**必须**使用 `http::build_http_client()` 或 `http::http_client()`，**不要**直接 `reqwest::Client::new()` 或 `reqwest::Client::builder()`。统一工厂自动继承系统代理（环境变量 → Windows 注册表），`localhost`/`127.0.0.1` 自动豁免直连。
 
@@ -93,14 +101,20 @@ docs/                          文档（本目录）
 ### 代理代码组织
 
 - **handler.rs** 是薄入口层（~250 行）：提取 API key → authenticate_and_stream() → 委托 stream.rs
-- **stream.rs** 是流式引擎核心（~550 行）：路由解析 → 立即返回 Response（含 keepalive）→ 后台 spawn 双循环重试 + 流式转发
+- **stream.rs** 是流式引擎核心（~550 行）：路由解析 → WebSearch 劫持（enrich_ir_with_search）→ 立即返回 Response（含 keepalive）→ 后台 spawn 双循环重试 + 流式转发
 - **forward.rs** 是流式转发分支（~350 行）：passthrough / O→A / A→O 三种流转发模式
-- 新增代理逻辑时，应修改 stream.rs（路由/重试）或 forward.rs（流转发）而非 handler.rs
+- **ir/** 是协议转换核心：三种客户端格式（Anthropic Messages / OpenAI Chat Completions / OpenAI Responses）统一转换为 IR 再渲染回目标格式
+- 新增代理逻辑时，应修改 stream.rs（路由/重试）、forward.rs（流转发）或 ir/（协议转换）而非 handler.rs
 - 修改认证/配额/请求体准备时，修改 handler.rs 的 authenticate_and_stream()
 
-### 协议转换
+### IR 中间表示层
 
-- 实现在 `api/proxy/translate/`，按方向分 `to_openai.rs` / `to_anthropic.rs`，共享类型在 `common.rs`
+- 实现在 `api/proxy/ir/`，按方向分 `from_*.rs`（3 种客户端格式 → IR）和 `to_*.rs`（IR → 3 种客户端格式）
+- IR 以 Anthropic Messages 为骨架（`IrContentBlock` 覆盖 Text/Image/Thinking/ToolUse/ToolResult），并集覆盖三种格式字段
+- `IrStreamEvent` 6 种变体：MessageStart → ContentBlockStart → ContentBlockDelta → ContentBlockStop → MessageDelta → MessageStop
+- `IrUsage` 字段：input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens / output_chars
+- usage 合并策略：**真实值覆盖估算值**（不用 max——`forward.rs` 预填的 `chars/4` 估算值偏大，max 会永久压住真实值）
+- Responses `input_tokens` 需减去 `cached_tokens`，保持增量口径（与 Chat Completions 一致）
 - 不兼容特性（thinking、tool_choice 等）要显式转换并记 warn 日志，不要静默丢弃
 
 ### 密钥池
@@ -156,7 +170,7 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 - ❌ **不支持非流式响应**。已在代码层强制 `stream: true`
 - ❌ **不做模型路由规则引擎**。`routes` 表是预留设计，目前撞名按 `sort_order` + `created_at` 取第一条就够了
 - ❌ **不做 Prometheus / OTLP 导出**。本地桌面应用不需要
-- ❌ **不支持 Google Gemini / 其他新协议**。目前只内置 Anthropic 和 OpenAI 两种，新协议走插件系统
+- ❌ **不支持 Google Gemini / 其他新协议**。目前内置 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses API 三种格式（IR 层统一抽象），新协议走插件系统
 
 ### 安全层面
 
@@ -193,9 +207,9 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 | 修改 install 页面 | `src-tauri/assets/install.html`（include_str! 编译进二进制）+ `docs/specs/spec-lan-deploy.md` 契约 |
 | 修改网关启动/监听 | `gateway/server.rs`（单 listener + ConnectInfo）+ `config.rs` + `middleware/admin_guard.rs` |
 | 新增 DB 表/列 | `db/schema.rs`（追加迁移）、`db/mod.rs`（UPSERT 测试） |
-| 修改代理逻辑 | `api/proxy/stream.rs`（流式引擎核心）、`api/proxy/handler.rs`（薄入口）、`api/proxy/translate/`、`http.rs`（代理配置） |
+| 修改代理逻辑 | `api/proxy/stream.rs`（流式引擎核心）、`api/proxy/handler.rs`（薄入口）、`api/proxy/ir/`（IR 中间表示层）、`http.rs`（代理配置） |
 | 修改密钥池 | `keys/pool/mod.rs` 注释的锁序规则 |
 | 修改前端 | `src/main.ts`（MD3 导入模式）、`src/styles/global.css`（design tokens） |
 | 修改 Claude FM | `src-tauri/src/api/handlers/fm.rs`（rodio 播放引擎 + souvlaki 媒体控制）、`src/fm/player.ts`（前端纯命令/事件）、`src/views/ClaudeFmView.vue`（UI）、`lib.rs`（托盘 + Tauri commands + souvlaki 初始化） |
 | 新增插件消息 | `plugin/types.rs`、`plugin/registry.rs` |
-| 修改协议转换 | `api/proxy/translate/common.rs`、两个方向文件 |
+| 修改协议转换 | `api/proxy/ir/types.rs`（IR 类型定义）、`from_*.rs`（客户端格式 → IR）、`to_*.rs`（IR → 客户端格式）、`usage.rs`（token 提取） |

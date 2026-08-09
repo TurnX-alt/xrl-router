@@ -4,6 +4,49 @@
 
 记录每次 LLM 请求的用量信息，提供聚合统计查询，支持前端图表展示。
 
+## Usage 语义
+
+### 真实值覆盖估算占位
+
+`forward.rs` 在流式转发开始时预填 `chars/4` 估算值（偏大），上游返回真实 usage 时**直接覆盖**（不用 `max()`）：
+
+```rust
+// from_chat_completions.rs / from_responses.rs
+if usage.input_tokens > 0 {
+    state.usage.input_tokens = usage.input_tokens;  // 覆盖，不用 max()
+}
+if usage.output_tokens > 0 {
+    state.usage.output_tokens = usage.output_tokens;
+}
+if usage.cache_read_input_tokens > 0 {
+    state.usage.cache_read_input_tokens = usage.cache_read_input_tokens;
+}
+```
+
+**为什么不用 max()**：`chars/4` 估算偏保守（中文/代码实际 token 通常低于估算），`max()` 会让估算值永久压住真实值，污染 usage_log 与客户端上下文条。
+
+### Responses 增量口径
+
+Responses API 的 `input_tokens` 包含缓存命中部分，需减去以保持增量口径：
+
+```rust
+// usage.rs (extract_responses_usage)
+let cached = usage.input_tokens_details.cached_tokens.unwrap_or(0);
+usage.input_tokens = usage.input_tokens.saturating_sub(cached);
+```
+
+与 Chat Completions 的 `prompt_tokens`（已减去 `cached_tokens`）语义一致。
+
+### message_start 携带 usage
+
+IR → Messages 渲染时：
+- `message_start.usage` 携带 `input_tokens` / `cache_read_input_tokens`（上游真实值或估算占位）
+- `message_delta.usage` 补上 `input_tokens`（此前缺失）
+
+### 上下文超限预警
+
+`stream.rs` 检测到上下文超限时仅记录 warn 日志，**不返回 400**——避免阻断客户端 auto-compact（`/compact` 自身也需走代理，硬拒绝会形成死锁）。
+
 ## 数据结构
 
 ### usage_log 表
@@ -36,6 +79,7 @@ CREATE TABLE usage_log (
 - **自包含快照**: 写入时保存名称，不依赖外键
 - **删除安全**: 删除 Provider/Model/Key 不影响历史统计
 - **缓存追踪**: `cache_read_input_tokens` 记录缓存命中
+- **真实值**: `prompt_tokens` 为上游真实值（覆盖估算占位后）
 
 ## 输入契约
 
@@ -131,6 +175,7 @@ LIMIT 1
 3. **时区处理**: 使用 `tz_offset` 参数调整时区
 4. **粒度支持**: `hour` 和 `day` 两种粒度
 5. **无外键**: 删除 Provider/Model/Key 不影响统计
+6. **真实值覆盖**: `prompt_tokens` 记录上游真实值，不记录偏大的 `chars/4` 估算值
 
 ## 索引
 
@@ -152,7 +197,8 @@ CREATE INDEX idx_usage_service_key ON usage_log(service_key_id);
 
 - `src-tauri/src/db/usage.rs` - 插入和查询逻辑
 - `src-tauri/src/api/handlers/stats.rs` - HTTP API 处理
-- `src-tauri/src/api/proxy/handler.rs` - 异步记录用量
+- `src-tauri/src/api/proxy/stream.rs` - 异步记录用量（真实值覆盖后）
+- `src-tauri/src/api/proxy/ir/usage.rs` - usage 提取 + 增量口径
 
 ## 测试要求
 
@@ -160,6 +206,7 @@ CREATE INDEX idx_usage_service_key ON usage_log(service_key_id);
 2. **集成测试**: 完整统计流程（写入 + 查询）
 3. **性能测试**: 大量数据插入和查询的性能
 4. **边界测试**: 空数据、时区边界、粒度切换
+5. **usage 语义测试**: 真实值覆盖估算、Responses 增量口径、无缓存/全缓存场景
 
 ## 完成标准
 
@@ -171,4 +218,8 @@ CREATE INDEX idx_usage_service_key ON usage_log(service_key_id);
 - [x] 索引优化查询性能
 - [x] 异步写入（不影响请求延迟）
 - [x] 请求日志分页（`get_usage_log_page` + `GET /api/stats/requests`，含分页单元测试）
+- [x] usage 真实值覆盖估算占位（不用 max）
+- [x] Responses input_tokens 增量口径（减去 cached_tokens）
+- [x] message_delta 补全 input_tokens
+- [x] 上下文超限预警（warn 日志，不阻断）
 - [x] 通过所有单元测试

@@ -1,6 +1,6 @@
 # xrl-router — 产品需求文档
 
-> 版本: CalVer (tauri 26.8.6+1500) · 更新日期: 2026-08-06
+> 版本: CalVer (tauri 26.8.9+1600) · 更新日期: 2026-08-09
 >
 > 📎 [架构文档](./ARCHITECTURE.md) · [决策记录](./DECISIONS.md) · [规格契约](./specs/)
 
@@ -111,7 +111,7 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-02 | **API Key CRUD + 密钥池轮询** | `api/handlers/keys.rs` + `keys/pool/` |
 | F-03 | **Service Key 认证（Argon2）** | `api/proxy/auth.rs` |
 | F-04 | **LLM 流式代理** | `api/proxy/handler.rs`（薄入口）+ `api/proxy/stream.rs`（流式引擎）+ `api/proxy/forward.rs`（流式转发） |
-| F-05 | **Anthropic ↔ OpenAI 协议转换** | `api/proxy/translate/` |
+| F-05 | **Anthropic ↔ OpenAI ↔ Responses 三协议 IR 转换** | `api/proxy/ir/` (from_*.rs / to_*.rs / types.rs / usage.rs) |
 | F-06 | **模型别名** | `api/proxy/route.rs` |
 | F-07 | **密钥健康监控（红绿灯）** | `keys/pool/health.rs` |
 | F-08 | **桌面应用（Tauri 2）** | `src-tauri/` |
@@ -137,7 +137,7 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 
 | ID | 功能 | 实现位置 |
 |----|------|---------|
-| F-21 | **WebSearch 劫持（Bing 搜索）** | `api/proxy/websearch.rs` + `search/bing.rs` |
+| F-21 | **WebSearch 劫持（本地 Bing 搜索 + IR 注入）** | `api/proxy/websearch.rs` (enrich_ir_with_search) + `search/bing.rs` (绕过代理直连 + 独立 cookie) |
 | F-22 | **模型同步（从上游拉取）** | `api/handlers/models.rs` |
 | F-23 | **系统托盘** | `lib.rs` |
 | F-24 | **插件系统（委托供应商）** | `plugin/` |
@@ -159,17 +159,21 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-40 | **主题跟随系统（light/dark/system）** | `theme.ts` |
 | F-41 | **开机静默启动（--minimized 驻留托盘）** | `lib.rs` + `tauri-plugin-autostart` |
 | F-42 | **数据导出/导入/重置** | `api/handlers/data.rs` + `db/settings.rs` + `SettingsView.vue` |
-| F-43 | **Claude FM 播放器（墙钟直播流 + 托盘控制）** | `src/fm/player.ts`（模块级单例）+ `src/views/ClaudeFmView.vue` + `lib.rs`（托盘 `fm`/`fm_ready`/`fm_set_playing` command）+ `src/i18n/*`（`fm.*` key） |
+| F-43 | **Claude FM 播放器（后端引擎 + 系统媒体控制）** | `api/handlers/fm.rs` (rodio + souvlaki, std::thread) + `src/fm/player.ts` + `src/views/ClaudeFmView.vue` + `lib.rs` |
+| F-44 | **OpenAI Responses API 支持（第三协议）** | `api/proxy/ir/from_responses.rs` + `api/proxy/ir/to_responses.rs` + `api/proxy/handler.rs::proxy_responses` |
+| F-45 | **usage 真实值覆盖估算占位** | `api/proxy/ir/from_chat_completions.rs` + `api/proxy/ir/from_responses.rs` (max → 覆盖) + `api/proxy/ir/usage.rs` (Responses 增量口径) |
+| F-46 | **上下文超限预警（软警告）** | `api/proxy/stream.rs` (warn 而非 400，避免阻断 auto-compact) |
+| F-47 | **list_models 扩展（capabilities + max_output_tokens）** | `api/proxy/handler.rs::proxy_list_models` |
 
 ### 4.4 未实现（计划中）
 
 | ID | 功能 | 计划版本 |
 |----|------|---------|
-| F-44 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
-| F-45 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
-| F-46 | 指数退避重试（failover 已实现 provider 级切换 + 60s 冷却，退避算法未做） | v0.3 |
-| F-47 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
-| F-48 | 自动更新机制 | v1.0 |
+| F-48 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
+| F-49 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
+| F-50 | 指数退避重试（failover 已实现 provider 级切换 + 60s 冷却，退避算法未做） | v0.3 |
+| F-51 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
+| F-52 | 自动更新机制 | v1.0 |
 
 ### 4.5 已知断裂（待修复）
 
@@ -186,12 +190,16 @@ _无。前端 `dashboardApi` / `stores/dashboard.ts` 此前指向未注册的后
 
 ## 5. 协议转换规格
 
-下游统一暴露 Anthropic Messages API 和 OpenAI Chat Completions API 双入口。上游按 Provider 类型处理：
+下游统一暴露 Anthropic Messages API、OpenAI Chat Completions API、OpenAI Responses API 三入口。所有客户端格式先经 IR（中间表示层）统一抽象，再渲染为目标上游格式：
+
+```
+客户端 → [Messages | Chat Completions | Responses] → IR (IrRequest / IrStreamEvent / IrUsage) → [上游 Provider]
+```
 
 | 上游类型 | 处理方式 |
 |---------|---------|
 | Anthropic | 直接透传 + SniffStream 嗅探 token |
-| OpenAI / Compatible | 双向协议转换（请求 + 流式响应） |
+| OpenAI / Compatible | IR 渲染为 Chat Completions 或 Responses 格式 |
 | 插件（委托供应商） | 插件负责非标→标准，Router 只管密钥轮换 |
 
 ### 5.1 必须支持的转换特性
@@ -204,8 +212,19 @@ _无。前端 `dashboardApi` / `stores/dashboard.ts` 此前指向未注册的后
 - ✅ 工具选择 (tool_choice: auto/any/none ↔ auto/required/none)
 - ✅ 流式响应 (SSE streaming，逐 chunk 转换)
 - ✅ 缓存 token (cache_read_input_tokens)
+- ✅ OpenAI Responses API (input/output items、response.completed 事件)
+- ✅ server-side web_search 工具归一化 (Messages 客户端 type 前缀匹配)
 
-### 5.2 仅支持流式
+### 5.2 usage 语义
+
+| 项 | 规则 |
+|----|------|
+| 合并策略 | **真实值覆盖估算占位**（不用 max）——`forward.rs` 预填的 `chars/4` 估算值偏大，max 会永久压住真实值，污染 usage_log 与客户端上下文条 |
+| Responses input_tokens | 减去 `cached_tokens`，保持增量口径（与 Chat Completions `prompt_tokens - cached_tokens` 一致） |
+| message_delta 补全 | IR → Messages 渲染时 `message_delta.usage` 补上 `input_tokens`（此前缺失） |
+| 上下文超限预警 | 仅 warn 日志，不阻断请求（避免阻断客户端 auto-compact 死锁） |
+
+### 5.3 仅支持流式
 
 非流式分支已移除。所有代理请求强制 `stream: true`。
 
@@ -350,7 +369,7 @@ _无。前端 `dashboardApi` / `stores/dashboard.ts` 此前指向未注册的后
 | 维度 | 要求 |
 |------|------|
 | Anthropic API | 兼容 `2023-06-01` |
-| OpenAI API | 兼容 Chat Completions v1 |
+| OpenAI API | 兼容 Chat Completions v1 + Responses API |
 | 操作系统 | macOS (primary)、Windows、Linux |
 
 ---

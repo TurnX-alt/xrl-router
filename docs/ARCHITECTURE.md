@@ -25,7 +25,7 @@ xrl-router 是一个 **Tauri 2 桌面应用**，内部跑着一个 Rust axum HTT
 外部 LLM 客户端 (Claude Code / 其他)
     │
     │  x-api-key: xrl-xxxx (Service Key)
-    │  POST /v1/messages 或 /v1/chat/completions
+    │  POST /v1/messages / /v1/chat/completions / /v1/responses
     ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
 │               单 listener 绑 0.0.0.0:19068 (axum)                         │
@@ -40,7 +40,7 @@ xrl-router 是一个 **Tauri 2 桌面应用**，内部跑着一个 Rust axum HTT
 │                                                                           │
 │       ┌──────────────────────────────────────────────────────────┐        │
 │       │ Anthropic 上游: 透传 + SniffStream                       │        │
-│       │ OpenAI 上游:    Anthropic↔OpenAI 双向转换                 │        │
+│       │ OpenAI 上游:    IR → Chat Completions / Responses 转换    │        │
 │       │ 插件上游:       插件自行转换，Router 只管密钥轮换          │        │
 │       └──────────────────────────────────────────────────────────┘        │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -86,12 +86,17 @@ main.rs
                  ├─ route.rs       模型别名→上游 URL 解析 (resolve_route / resolve_route_candidates)
                  ├─ failover.rs    provider 级冷却表 (纯内存, 60s)
                  ├─ key_rotation.rs 密钥选取 + 健康反馈
-                 ├─ websearch.rs   Bing 劫持 loop
+                 ├─ websearch.rs   本地 Bing 搜索 → 注入 IR system → 清除 tools
                  ├─ sniff.rs       SniffStream (透传+嗅探)
-                 └─ translate/     协议转换
-                      ├─ common.rs
-                      ├─ to_openai.rs   (Anthropic → OpenAI)
-                      └─ to_anthropic.rs (OpenAI → Anthropic)
+                 └─ ir/            IR 中间表示层（三种协议统一抽象）
+                      ├─ types.rs                IrRequest / IrMessage / IrContentBlock / IrStreamEvent / IrUsage
+                      ├─ from_messages.rs        Anthropic Messages → IR
+                      ├─ from_chat_completions.rs  OpenAI Chat Completions → IR
+                      ├─ from_responses.rs       OpenAI Responses API → IR
+                      ├─ to_messages.rs              IR → Anthropic Messages
+                      ├─ to_chat_completions.rs  IR → OpenAI Chat Completions
+                      ├─ to_responses.rs         IR → OpenAI Responses API
+                      └─ usage.rs                Token usage 提取（三种格式）
 
 独立模块（被 handler/proxy 使用）：
   ├─ http.rs             统一 HTTP 客户端工厂（系统代理自动继承）
@@ -116,7 +121,7 @@ main.rs
   │    ├─ health.rs       check_heartbeats (30s/90s)
   │    └─ types.rs        消息类型定义
   ├─ middleware/rate_limit.rs  令牌桶 (128 req/min)
-  ├─ search/bing.rs           Bing 搜索 (cn.bing.com)
+  ├─ search/bing.rs           Bing 搜索 (cn.bing.com, 绕过代理直连, 独立 cookie 会话)
   ├─ assets/install.html      局域网 install 静态页 (include_str! 编译进二进制)
   └─ types/                   数据结构定义
        ├─ provider.rs    ProviderKind / ProviderConfig / DelegateKeyConfig
@@ -132,13 +137,13 @@ main.rs
 ## 3. 数据流：一次 LLM 请求的完整生命周期
 
 ```
-客户端 POST /v1/messages
+客户端 POST /v1/messages / /v1/chat/completions / /v1/responses
   │
   ▼
 [1] rate_limit_middleware ──── 令牌桶检查 (per Service Key)
   │
   ▼
-[2] proxy_anthropic_messages / proxy_openai_chat (handler.rs)
+[2] proxy_messages / proxy_chat_completions / proxy_responses (handler.rs)
   │
   ├─ 提取 x-api-key / Authorization: Bearer
   │
@@ -147,7 +152,7 @@ main.rs
   │  verify_service_key → Argon2 逐条校验
   │  check_quota → 5h/7d 滚动窗口用量聚合
   │  allowed_models 白名单检查
-  │  预构造 body_anthropic / body_openai (translate)
+  │  客户端格式 → IR (from_messages / from_chat_completions / from_responses)
   │  失败 → 401/403/429
   │
   ▼
@@ -159,25 +164,32 @@ main.rs
   │  failover_enabled=true  → 全部候选 (同 display_name, 按 sort_order 排序,
   │                           按 provider_id 去重, 跳过离线插件 provider)
   │  失败 → 400
-  │  成功 → ResolvedRoute { upstream_url, provider_kind, real_model_id, ... }
+  │  成功 → ResolvedRoute { upstream_url, provider_kind, real_model_id, context_window, ... }
   │  委托供应商 → 从 PluginManager 取实时 base_url
   │
   ▼
-[4b] WebSearch 劫持判断 ──── websearch_hijack + has_websearch_tool
-  │  命中 → run_websearch_loop (websearch.rs) → 本地 Bing loop → SSE 返回
+[4b] WebSearch 劫持 ──── websearch_hijack + has_websearch_tool_ir
+  │  命中 → enrich_ir_with_search (websearch.rs):
+  │    提取搜索关键词（最后一条 user 消息文本）
+  │    本地 Bing 搜索（绕过代理直连 cn.bing.com，独立 cookie 会话）
+  │    搜索结果注入 IR system block → 清除 tools/tool_choice
+  │    交回 proxy_stream 正常流式转发（key failover 由 proxy_stream 天然支持）
   │
   ▼
-[4c] 协议转换 (translate/) ──── 同协议透传 / 异协议双向转换
-  │  强制 stream=true, model=real_model_id
-  │
-  ▼
-[4c'] 上下文超限预检 ──── 估算输入 token (chars/4) > model.context_window
-  │  超限 → 400 invalid_request_error（不发上游）
+[4c] 上下文超限预警 ──── 估算输入 token (chars/4) > model.context_window
+  │  超限 → warn 日志（不阻断请求）
+  │  原因：chars/4 估算偏保守；硬拒绝会阻断客户端 auto-compact 死锁
   │  message_start 携带 input_tokens / cache_read_input_tokens
   │  （上游真实值或估算值），供客户端上下文条感知
   │
   ▼
-[4d] failover 双层重试循环 (stream.rs + key_rotation.rs + failover.rs)
+[4d] IR → 上游格式渲染 (to_messages / to_chat_completions / to_responses)
+  │  强制 stream=true, model=real_model_id
+  │  同协议: passthrough (IR 渲染结果即上游格式)
+  │  异协议: IR 渲染为目标上游格式
+  │
+  ▼
+[4e] failover 双层重试循环 (stream.rs + key_rotation.rs + failover.rs)
   │  外层: 遍历 provider 候选 (冷却中的直接跳过)
   │  内层: pick_key_for() → round-robin, 跳过 Red/Yellow
   │  http::build_http_client() → 自动继承系统代理
@@ -190,7 +202,7 @@ main.rs
   │  无 winner: key 4xx 耗尽透传最后一次上游失败响应 / 无可用 key → 503
   │
   ▼
-[4e] 流式转发 (stream.rs 的 4 种分支)
+[4f] 流式转发 (stream.rs 的 4 种分支)
   │  同协议: spawn_passthrough() ──── 立即返回 Response + :keepalive 初始字节
   │           └─ 后台 spawn 转发 + 15s keepalive 心跳 (oneshot 取消信号驱动, 见 ADR-021)
   │           └─ 响应头: Cache-Control: no-cache, Connection: keep-alive, X-Accel-Buffering: no
@@ -198,11 +210,13 @@ main.rs
   │           └─ SniffStream (透传字节 + 后台解析 usage)
   │  异协议: spawn_translate_openai_to_anthropic() / spawn_translate_anthropic_to_openai()
   │           └─ 初始 keepalive 事件
-  │           └─ 逐 SSE chunk 解析 + translate_chunk + 重发
+  │           └─ 逐 SSE chunk 解析 + IR chunk 转换 + 重发
   │  120s chunk 间隔超时
   │
   ▼
-[4f] 异步记录 usage_log ──── provider/model/key/service_key + token 用量
+[4g] 异步记录 usage_log ──── provider/model/key/service_key + token 用量
+  │  usage 真实值覆盖估算占位（max → 覆盖，避免 chars/4 估算值偏大压住真实值）
+  │  Responses input_tokens 减去缓存命中部分（增量口径）
   │
   ▼
 SSE 流返回客户端
@@ -297,7 +311,7 @@ src/
             │     (Argon2 哈希验证)     │
             └───────────┼───────────────┘
                         │
-              /v1/messages, /v1/chat/completions, /v1/models, /v1/user/balance
+              /v1/messages, /v1/chat/completions, /v1/responses, /v1/models, /v1/user/balance
               (令牌桶限流 128 req/min + 5h/7d token 配额)
                         │
                         ▼
@@ -340,7 +354,10 @@ src/
 | 轮询指针持久化 | 重启后跳过已失效的 key |
 | usage_log 无 FK | 删除 Provider/Model/Key 不影响历史统计 |
 | 管理 API 无认证 | `admin_ip_guard` IP 中间件限 loopback 是安全模型，本机进程访问是接受的代价；公开路径只暴露需 key 的 `/v1/*` 与无敏感信息的 `/install` |
-| 协议转换不丢特性 | 不兼容的要显式转换 + warn 日志，不静默丢弃 |
+| IR 真实值覆盖估算值 | `forward.rs` 预填的 `chars/4` 估算值偏大，max 合并会永久压住真实值，污染 usage_log 与客户端上下文条 |
+| Responses input_tokens 增量口径 | 减去 `cached_tokens`，与 Chat Completions `prompt_tokens - cached_tokens` 一致 |
+| 上下文超限预警而非硬拒绝 | 估算口径偏保守，硬拒绝会阻断客户端 auto-compact（死锁） |
+| WebSearch 跳过 tool-calling loop | 本地搜索 → 注入 IR → 正常流式转发，省掉一轮非流式上游调用 |
 | failover 冷却纯内存 | 与密钥健康同一哲学，不持久化不广播；开关默认关闭，开启才改变请求行为 |
 | 数据导出用 SQL dump | SQLite 原生语句保真度高，导入即执行，天然支持跨版本迁移 |
 

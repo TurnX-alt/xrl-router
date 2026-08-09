@@ -1,162 +1,127 @@
-# Spec: 协议转换
+# Spec: 协议转换（IR 中间表示层）
 
 ## 目标
 
-实现 Anthropic Messages API ↔ OpenAI Chat Completions API 的双向协议转换。
+通过 IR（Intermediate Representation，中间表示层）实现 Anthropic Messages API、OpenAI Chat Completions API、OpenAI Responses API 三种协议的统一抽象与互转。
 
-## 转换方向
+## 架构
 
-### Anthropic → OpenAI
+```
+客户端格式 → IR (from_*.rs) → 内部处理 → IR (to_*.rs) → 上游/客户端格式
+```
 
-客户端使用 Anthropic 格式，上游是 OpenAI API。
+所有客户端格式先转换为 IR 统一抽象，内部工具（websearch 劫持、usage 追踪、错误构造）只操作 IR 类型，再渲染为目标格式。IR 以 Anthropic Messages 为骨架（内容块模型最丰富），并集覆盖三种格式的全部字段。
 
-**请求转换**:
+## IR 核心类型
 
-| Anthropic 字段 | OpenAI 字段 | 说明 |
-|---|---|---|
-| `messages[].content` | `messages[].content` | 内容块数组转字符串 |
-| `system` (顶层) | `messages[0].role=system` | 系统提示 |
-| `tools[].input_schema` | `tools[].function.parameters` | 工具定义 |
-| `tool_choice: "auto"` | `tool_choice: "auto"` | 直接映射 |
-| `tool_choice: "any"` | `tool_choice: "required"` | 强制调用 |
-| `max_tokens` | `max_tokens` | 直接映射 |
+### IrRequest（统一请求体）
 
-**响应转换**:
-
-| OpenAI 字段 | Anthropic 字段 | 说明 |
-|---|---|---|
-| `choices[].message.content` | `content[].type=text` | 文本内容 |
-| `choices[].message.tool_calls` | `content[].type=tool_use` | 工具调用 |
-| `choices[].finish_reason` | `stop_reason` | 结束原因 |
-| `usage.prompt_tokens` | `usage.input_tokens` | 输入 token |
-| `usage.completion_tokens` | `usage.output_tokens` | 输出 token |
-
-### OpenAI → Anthropic
-
-客户端使用 OpenAI 格式，上游是 Anthropic API。
-
-**请求转换**:
-
-| OpenAI 字段 | Anthropic 字段 | 说明 |
-|---|---|---|
-| `messages[].content` | `messages[].content` | 字符串转内容块 |
-| `messages[0].role=system` | `system` (顶层) | 系统提示 |
-| `tools[].function.parameters` | `tools[].input_schema` | 工具定义 |
-| `tool_choice: "auto"` | `tool_choice: "auto"` | 直接映射 |
-| `tool_choice: "required"` | `tool_choice: "any"` | 强制调用 |
-
-**响应转换**:
-
-| Anthropic 字段 | OpenAI 字段 | 说明 |
-|---|---|---|
-| `content[].type=text` | `choices[].message.content` | 文本内容 |
-| `content[].type=tool_use` | `choices[].message.tool_calls` | 工具调用 |
-| `stop_reason` | `choices[].finish_reason` | 结束原因 |
-| `usage.input_tokens` | `usage.prompt_tokens` | 输入 token |
-| `usage.output_tokens` | `usage.completion_tokens` | 输出 token |
-
-## 输入契约
-
-### Anthropic 请求
-
-```json
-{
-  "model": "claude-opus-4-8",
-  "messages": [
-    {"role": "user", "content": "Hello"}
-  ],
-  "max_tokens": 4096,
-  "system": "You are a helpful assistant",
-  "tools": [
-    {
-      "name": "get_weather",
-      "description": "Get weather info",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "location": {"type": "string"}
-        },
-        "required": ["location"]
-      }
-    }
-  ],
-  "tool_choice": "auto"
+```rust
+pub struct IrRequest {
+    pub model: String,
+    pub system: Option<IrSystemContent>,     // Text | Blocks(Vec<IrSystemBlock>)
+    pub messages: Vec<IrMessage>,
+    pub tools: Vec<IrTool>,
+    pub tool_choice: Option<IrToolChoice>,   // Auto | Any | None | Tool(name)
+    pub max_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub thinking: Option<IrThinkingConfig>,
+    pub stream: bool,
 }
 ```
 
-### OpenAI 请求
+### IrContentBlock（统一内容块）
 
-```json
-{
-  "model": "gpt-4o",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant"},
-    {"role": "user", "content": "Hello"}
-  ],
-  "max_tokens": 4096,
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get weather info",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "location": {"type": "string"}
-          },
-          "required": ["location"]
-        }
-      }
-    }
-  ],
-  "tool_choice": "auto"
+```rust
+pub enum IrContentBlock {
+    Text { text, cache_control },
+    Image { source, cache_control },
+    Thinking { thinking, signature },
+    ToolUse { id, name, input },
+    ToolResult { tool_use_id, content, is_error },
 }
 ```
 
-## 输出契约
+### IrStreamEvent（统一流式事件，6 种变体）
 
-### Anthropic 响应（流式）
-
-```
-event: message_start
-data: {"type":"message_start","message":{"id":"msg_xxx","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"usage":{"input_tokens":25,"output_tokens":1}}}
-
-event: content_block_start
-data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
-
-event: content_block_stop
-data: {"type":"content_block_stop","index":0}
-
-event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}
-
-event: message_stop
-data: {"type":"message_stop"}
+```rust
+pub enum IrStreamEvent {
+    MessageStart { id, model, usage },
+    ContentBlockStart { index, content_block },
+    ContentBlockDelta { index, delta },
+    ContentBlockStop { index },
+    MessageDelta { stop_reason, usage },
+    MessageStop,
+}
 ```
 
-### OpenAI 响应（流式）
+### IrUsage（统一 token 统计）
 
+```rust
+pub struct IrUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub output_chars: u64,
+}
 ```
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+## 转换模块
 
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+### from_*.rs（客户端格式 → IR）
 
-data: [DONE]
-```
+| 模块 | 输入 | 特殊处理 |
+|------|------|---------|
+| `from_messages.rs` | Anthropic Messages | server-side `web_search_*` 工具归一化为 `name="web_search"` |
+| `from_chat_completions.rs` | OpenAI Chat Completions | `reasoning_content` → `Thinking` 块 |
+| `from_responses.rs` | OpenAI Responses API | `input` → `messages`，`response.completed` 事件解析 |
+
+### to_*.rs（IR → 客户端格式）
+
+| 模块 | 输出 | 特殊处理 |
+|------|------|---------|
+| `to_messages.rs` | Anthropic Messages | `message_delta.usage` 补上 `input_tokens` |
+| `to_chat_completions.rs` | OpenAI Chat Completions | `Thinking` → `reasoning_content` |
+| `to_responses.rs` | OpenAI Responses API | IR → Responses output items |
+
+### usage.rs（token 提取）
+
+从三种协议格式的响应中提取 `IrUsage`：
+- Anthropic Messages：`usage.input_tokens` / `usage.output_tokens` / `usage.cache_read_input_tokens`
+- OpenAI Chat Completions：`usage.prompt_tokens` / `usage.completion_tokens`
+- OpenAI Responses：`usage.input_tokens` 减去 `input_tokens_details.cached_tokens`（增量口径）
+
+## usage 语义
+
+| 项 | 规则 |
+|----|------|
+| 合并策略 | **真实值覆盖估算占位**（不用 max）——`forward.rs` 预填的 `chars/4` 估算值偏大，max 会永久压住真实值 |
+| Responses input_tokens | 减去 `cached_tokens`，保持增量口径 |
+| message_delta 补全 | IR → Messages 渲染时补上 `input_tokens`（此前缺失） |
+
+## 转换特性矩阵
+
+| 特性 | Anthropic Messages | OpenAI Chat Completions | OpenAI Responses |
+|------|--------------------|-------------------------|-----------------|
+| 文本消息 | ✅ text block | ✅ content string | ✅ input/output text |
+| 系统提示 | ✅ system 顶层 | ✅ role:system | ✅ instructions |
+| 工具调用 | ✅ tool_use block | ✅ tool_calls | ✅ function_call |
+| 工具结果 | ✅ tool_result block | ✅ role:tool | ✅ function_call_output |
+| 思考过程 | ✅ thinking block | ⚠️ reasoning_content | ⚠️ reasoning |
+| 工具选择 | ✅ tool_choice | ✅ tool_choice | ✅ tool_choice |
+| 流式响应 | ✅ SSE 6 事件 | ✅ SSE choices | ✅ SSE response.* |
+| 缓存 token | ✅ cache_read | ❌ | ✅ input_tokens_details |
+| 图片 | ✅ image block | ✅ image_url | ✅ input_image |
 
 ## 关键约束
 
 1. **流式转换**: 逐 chunk 实时转换，不缓冲完整响应
 2. **保留未知字段**: 不删除无法识别的字段，原样传递
 3. **错误容忍**: 单个 chunk 转换失败不影响整个流
-4. **token 统计**: 转换过程中累计 token 使用量
-5. **thinking 字段**: thinking/reasoning_content 双向转换，内容原样传递（无截断）
+4. **thinking 字段**: thinking/reasoning_content 双向转换，内容原样传递（无截断）
+5. **usage 真实值覆盖**: 上游真实 usage 覆盖 `forward.rs` 预填的估算占位
 
 ## 错误处理
 
@@ -169,10 +134,14 @@ data: [DONE]
 
 ## 实现位置
 
-- `src-tauri/src/api/proxy/translate/mod.rs` - 转换入口
-- `src-tauri/src/api/proxy/translate/common.rs` - 公共类型
-- `src-tauri/src/api/proxy/translate/to_openai.rs` - Anthropic → OpenAI
-- `src-tauri/src/api/proxy/translate/to_anthropic.rs` - OpenAI → Anthropic
+- `src-tauri/src/api/proxy/ir/types.rs` — IR 类型定义（IrRequest / IrMessage / IrContentBlock / IrStreamEvent / IrUsage）
+- `src-tauri/src/api/proxy/ir/from_messages.rs` — Anthropic Messages → IR
+- `src-tauri/src/api/proxy/ir/from_chat_completions.rs` — OpenAI Chat Completions → IR
+- `src-tauri/src/api/proxy/ir/from_responses.rs` — OpenAI Responses API → IR
+- `src-tauri/src/api/proxy/ir/to_messages.rs` — IR → Anthropic Messages
+- `src-tauri/src/api/proxy/ir/to_chat_completions.rs` — IR → OpenAI Chat Completions
+- `src-tauri/src/api/proxy/ir/to_responses.rs` — IR → OpenAI Responses API
+- `src-tauri/src/api/proxy/ir/usage.rs` — Token usage 提取（三种格式）
 
 ## 测试要求
 
@@ -180,14 +149,15 @@ data: [DONE]
 2. **集成测试**: 完整请求-响应流程
 3. **边界测试**: 空消息、多工具调用、thinking 双向转换
 4. **流式测试**: 逐 chunk 转换的正确性
+5. **usage 测试**: 真实值覆盖估算、Responses 增量口径、无缓存场景、全缓存场景
 
 ## 完成标准
 
-- [x] Anthropic → OpenAI 请求转换
-- [x] Anthropic → OpenAI 响应转换（流式）
-- [x] OpenAI → Anthropic 请求转换
-- [x] OpenAI → Anthropic 响应转换（流式）
+- [x] Anthropic Messages ↔ IR 双向转换
+- [x] OpenAI Chat Completions ↔ IR 双向转换
+- [x] OpenAI Responses API ↔ IR 双向转换
 - [x] 工具调用转换（tools + tool_choice）
 - [x] thinking 字段处理（双向转换，原样传递）
-- [x] token 统计累计
+- [x] token 统计（真实值覆盖估算 + Responses 增量口径）
+- [x] server-side web_search 工具归一化
 - [x] 通过所有单元测试

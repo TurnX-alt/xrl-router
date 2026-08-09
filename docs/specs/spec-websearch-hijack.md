@@ -2,62 +2,50 @@
 
 ## 目标
 
-拦截包含 `web_search` 工具的 LLM 请求，用本地 Bing 搜索替代上游 API 的搜索功能。
+拦截包含 `web_search` 工具的 LLM 请求，代理自身完成本地 Bing 搜索，将结果注入 IR 后交回正常流式转发路径——跳过 LLM tool-calling loop。
 
 ## 触发条件
 
-1. `settings.websearch_hijack` 为 `true`
-2. 请求的 `tools` 数组包含 `web_search` 工具
+1. `settings.websearch_hijack` 为 `true`（设置页「路由」Tab 开关）
+2. IR 请求的 `tools` 数组包含名称以 `web_search` 开头的工具（覆盖 Anthropic server-side `web_search_20250305` 等变体）
 
 ## 流程
 
 ```
 客户端请求（含 web_search 工具）
     ↓
-检查触发条件
+handler.rs → IR 解析（from_messages / from_chat_completions / from_responses）
     ↓
-进入 tool-calling loop（最多 5 轮）
+stream.rs → 路由解析 → WebSearch 劫持判断
     ↓
-每轮：
-  1. 发送请求到上游（stream=false）
-  2. 检查响应是否包含 tool_use
-  3. 如果有 web_search 调用：
-     - 本地 Bing 搜索
-     - 构造 tool_result
-     - 追加到 messages
-     - 继续下一轮
-  4. 如果无 tool_use：
-     - 返回最终响应
+命中 → enrich_ir_with_search (websearch.rs):
+  1. 提取搜索关键词（最后一条 user 消息文本）
+  2. 本地 Bing 搜索（绕过代理直连 cn.bing.com，独立 cookie 会话）
+  3. 搜索结果注入 IR system block
+  4. 清除 tools / tool_choice
     ↓
-转换响应为 SSE 流
-    ↓
-返回客户端
+交回 proxy_stream 正常流式转发
+（key failover / 双层重试 / SSE 即时响应 由 proxy_stream 天然支持）
 ```
 
 ## 输入契约
 
-### 请求检测
+### IR 层 tool 检测
 
 ```rust
-pub fn has_websearch_tool(body: &Value) -> bool {
-    body.get("tools")
-        .and_then(|t| t.as_array())
-        .map(|tools| {
-            tools.iter().any(|t| {
-                t.get("type")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.starts_with("web_search"))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
+pub(super) fn has_websearch_tool_ir(req: &IrRequest) -> bool {
+    req.tools.iter().any(|t| t.name.starts_with("web_search"))
 }
 ```
+
+### server-side 工具归一化（from_messages.rs）
+
+Anthropic Messages 客户端发送的 server-side 内置工具（如 `web_search_20250305`）可能只有 `type` 没有 `name`。`from_messages.rs` 将其归一化为 `name="web_search"`，保证 websearch 劫持对 Messages 客户端生效。
 
 ### Bing 搜索
 
 ```rust
-pub fn search(query: &str) -> anyhow::Result<Vec<SearchResult>>
+pub async fn search(query: &str) -> anyhow::Result<Vec<SearchResult>>
 ```
 
 **SearchResult**:
@@ -70,123 +58,69 @@ pub struct SearchResult {
 }
 ```
 
+**关键策略**:
+- **绕过代理直连**：cn.bing.com 是国内站点，走代理会导致出口 IP 在海外，Bing 降级为"热门站点推荐"模式（返回今日头条/百度热搜等非相关结果）
+- **独立 cookie 会话**：每次搜索创建新 client + 新 cookie jar，避免全局 cookie 累积污染搜索结果
+- **浏览器指纹**：Chrome User-Agent + Sec-CH-UA + 完整 Accept 头
+- **结果提取**：`li.b_algo` 容器内提取 `h2 a`（链接）和 `.b_caption p`（摘要），排除 bing.com/microsoft.com/msn.com 内部链接，最多 8 条
+
 ## 输出契约
 
-### tool_result 格式
+### system block 注入格式
 
-```json
-{
-  "role": "user",
-  "content": [
-    {
-      "type": "tool_result",
-      "tool_use_id": "toolu_xxx",
-      "content": [
-        {
-          "type": "text",
-          "text": "搜索结果：\n\n1. 标题1\nURL1\n摘要1\n\n2. 标题2\nURL2\n摘要2"
-        }
-      ]
-    }
-  ]
-}
-```
-
-### SSE 响应
-
-将最终响应转换为 Anthropic SSE 格式：
+搜索结果以 `IrSystemBlock` 形式追加到 IR 的 system prompt：
 
 ```
-event: message_start
-data: {"type":"message_start","message":{...}}
+[Web Search Results for: <query>]
+[1] 标题1
+URL1
+摘要1
 
-event: content_block_start
-data: {"type":"content_block_start","index":0,...}
+[2] 标题2
+URL2
+摘要2
 
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,...}
-
-event: message_stop
-data: {"type":"message_stop"}
+Use the above search results to answer the user's question. Cite sources using [N] notation.
 ```
 
-## 关键约束
+### 清除 tools / tool_choice
 
-1. **最多 5 轮**: 防止无限循环
-2. **非流式上游**: tool-calling loop 中 `stream=false`
-3. **本地搜索**: 使用 `cn.bing.com`（反爬较宽松）
-4. **浏览器指纹**: 模拟 Chrome 浏览器请求
-5. **Cookie 复用**: 全局 `reqwest::Client` 复用 cookie
+注入完成后：
+- `ir_request.tools = Vec::new()`
+- `ir_request.tool_choice = None`
 
-## Bing 搜索实现
-
-```rust
-static CLIENT: Lazy<Client> = Lazy::new(|| {
-    Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-        .cookie_store(true)
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap()
-});
-
-pub fn search(query: &str) -> anyhow::Result<Vec<SearchResult>> {
-    let resp = CLIENT.get("https://cn.bing.com/search")
-        .query(&[("q", query), ("ensearch", "0")])
-        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .header("Sec-CH-UA", "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
-        .send()?;
-    
-    let html = resp.text()?;
-    let document = Html::parse_document(&html);
-    
-    // 解析搜索结果
-    let titles = document.select(&Selector::parse("h2 a").unwrap());
-    let snippets = document.select(&Selector::parse(".b_caption .b_lineclamp2, .b_caption p, .b_lineclamp4, .b_lineclamp2").unwrap());
-    
-    // 提取最多 8 条结果（排除 bing.com/microsoft.com/msn.com 内部链接）
-    let mut results = Vec::new();
-    for (title, snippet) in titles.zip(snippets).take(8) {
-        results.push(SearchResult {
-            title: title.text().collect::<String>(),
-            url: extract_url(title),
-            snippet: snippet.text().collect::<String>(),
-        });
-    }
-    
-    Ok(results)
-}
-```
+修改后的 IR 交回 `proxy_stream`，上游 LLM 收到的是带搜索结果 system block 的普通请求，不再触发 tool calling。
 
 ## 错误处理
 
 | 场景 | 行为 |
 |------|------|
-| Bing 搜索失败 | 返回空结果，继续 loop |
-| 上游 API 错误 | 直接返回错误响应 |
-| 超过 5 轮 | 返回最后一次响应 |
-| 无 web_search 调用 | 正常转发，不劫持 |
+| Bing 搜索返回空结果 | 注入 "No web search results found for: {query}" |
+| Bing 搜索失败（网络/反爬） | 注入 "Web search unavailable: {error}. Do NOT make up information." |
+| 反爬检测（captcha/Challenge） | 记录 warn 日志，结果照常解析 |
+| 未命中 web_search 工具 | 正常转发，不劫持 |
 
 ## 实现位置
 
-- `src-tauri/src/api/proxy/websearch.rs` - 劫持逻辑
-- `src-tauri/src/search/bing.rs` - Bing 搜索
-- `src-tauri/src/api/proxy/handler.rs` - 触发检测
+- `src-tauri/src/api/proxy/websearch.rs` — `enrich_ir_with_search()` + `extract_search_query()` + `format_search_text()`
+- `src-tauri/src/search/bing.rs` — Bing 搜索（绕过代理直连 + 独立 cookie + b_algo 解析）
+- `src-tauri/src/api/proxy/stream.rs` — 劫持入口（路由解析后、上下文预警前）
+- `src-tauri/src/api/proxy/ir/from_messages.rs` — server-side 工具归一化
 
 ## 测试要求
 
-1. **单元测试**: tool 检测、Bing 搜索解析
-2. **集成测试**: 完整 tool-calling loop
-3. **边界测试**: 5 轮上限、搜索失败、无 tool 调用
-4. **反爬测试**: 验证 Bing 不会封禁
+1. **单元测试**: tool 检测、Bing HTML 解析（b_algo 容器、内部链接过滤、空 HTML）
+2. **集成测试**: 完整 enrich_ir_with_search 流程
+3. **网络测试**（`#[ignore]`）: 真实搜索、连续搜索验证 cookie 不累积
 
 ## 完成标准
 
-- [x] 检测 `web_search` 工具
-- [x] tool-calling loop（最多 5 轮）
-- [x] 本地 Bing 搜索（cn.bing.com）
-- [x] 浏览器指纹（User-Agent、Sec-CH-UA）
-- [x] Cookie 复用（全局 Client）
-- [x] 结果格式化（最多 8 条）
-- [x] SSE 响应转换
+- [x] 检测 `web_search` 工具（IR 层，覆盖三种客户端格式）
+- [x] 本地 Bing 搜索（cn.bing.com，绕过代理直连）
+- [x] 浏览器指纹（User-Agent、Sec-CH-UA、完整 Accept 头）
+- [x] 独立 cookie 会话（每次搜索新建 client）
+- [x] 搜索结果注入 IR system block
+- [x] 清除 tools / tool_choice
+- [x] 交回 proxy_stream 正常流式转发（key failover 天然支持）
+- [x] b_algo 容器解析（链接 + 摘要同一容器内提取）
 - [x] 通过所有单元测试

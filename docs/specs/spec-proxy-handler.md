@@ -2,11 +2,11 @@
 
 ## 目标
 
-实现 `/v1/messages` 和 `/v1/chat/completions` 的代理转发，支持密钥轮换、协议转换、流式响应。
+实现 `/v1/messages`、`/v1/chat/completions` 和 `/v1/responses` 三种端点的代理转发，经 IR 中间表示层统一协议转换，支持密钥轮换、流式响应。
 
 ## 输入契约
 
-### POST /v1/messages
+### POST /v1/messages（Anthropic Messages）
 
 ```json
 {
@@ -17,11 +17,7 @@
 }
 ```
 
-**必需头**:
-- `x-api-key: sk-xxx` 或 `Authorization: Bearer sk-xxx`
-- `Content-Type: application/json`
-
-### POST /v1/chat/completions
+### POST /v1/chat/completions（OpenAI Chat Completions）
 
 ```json
 {
@@ -31,6 +27,24 @@
 }
 ```
 
+### POST /v1/responses（OpenAI Responses API）
+
+```json
+{
+  "model": "o1",
+  "input": [{"role": "user", "content": "Hello"}],
+  "stream": true
+}
+```
+
+### GET /v1/models
+
+返回可用模型列表，包含 `id`、`display_name`、`tier`、`context_window`、`max_output_tokens`、`capabilities` 字段。
+
+**必需头**:
+- `x-api-key: sk-xxx` 或 `Authorization: Bearer sk-xxx`
+- `Content-Type: application/json`
+
 ## 输出契约
 
 ### 成功响应（流式）
@@ -39,9 +53,11 @@
 
 **Anthropic 格式**:
 ```
-data: {"type":"message_start","message":{"id":"msg_xxx",...}}
+data: {"type":"message_start","message":{"id":"msg_xxx","usage":{"input_tokens":25,...}}}
 
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15,"input_tokens":25}}
 
 data: {"type":"message_stop"}
 ```
@@ -85,6 +101,18 @@ data: [DONE]
 - `503` 无可用密钥
 - `504` 响应头超时（全部候选失败）
 
+## 请求生命周期
+
+```
+handler.rs (薄入口) → authenticate_and_stream() → stream.rs::proxy_stream()
+  → 路由解析 → WebSearch 劫持 → 上下文超限预警 → IR → 上游格式渲染
+  → failover 双层重试 → 流式转发 → usage_log 记录
+```
+
+1. **handler.rs**：提取 API key → 认证 → 配额检查 → 客户端格式 → IR 解析
+2. **stream.rs**：路由解析 → WebSearch 劫持（enrich_ir_with_search）→ 上下文超限预警（warn 日志，不阻断）→ IR → 上游格式渲染 → 立即返回 Response（含 keepalive）→ 后台 spawn 双循环重试 + 流式转发
+3. **forward.rs**：passthrough / O→A / A→O 三种流转发模式
+
 ## 故障转移（Provider Failover）
 
 `failover_enabled` 开关（设置页「路由」Tab，默认关闭）开启时，同一 `display_name` 下的全部 Provider 候选按序尝试：
@@ -92,7 +120,13 @@ data: [DONE]
 - **候选来源**：`route.rs::resolve_route_candidates()`——同 display_name 全部 models JOIN providers 行，按 `sort_order ASC, created_at ASC` 排序、按 provider_id 去重、跳过插件离线的委托 provider；关闭时仅主 provider（`resolve_route`，行为与单 Provider 一致）
 - **双层循环**：外层 provider 候选（冷却中直接跳过），内层 key 轮换；key 级 4xx 先耗尽当前 provider 的 key 才切 provider
 - **冷却**：`failover.rs` 纯内存冷却表，provider 级失败（5xx/网络错误/响应头超时）标记 60s 冷却，2xx 成功立即清除
-- **请求体**：Anthropic/OpenAI 两种骨架循环外预构造，循环内按候选类型选用并覆写 `model`（候选可混合协议类型）
+- **请求体**：IR 渲染为上游格式在循环外预构建，循环内按候选类型覆写 `model`（候选可混合协议类型）
+
+## usage 语义
+
+- **真实值覆盖估算占位**：上游返回真实 usage 时直接覆盖 `forward.rs` 预填的 `chars/4` 估算值（不用 max）
+- **Responses 增量口径**：`input_tokens` 减去 `cached_tokens`，与 Chat Completions 一致
+- **message_delta 补全**：IR → Messages 渲染时 `message_delta.usage` 补上 `input_tokens`
 
 ## 关键约束
 
@@ -117,18 +151,20 @@ data: [DONE]
 | 响应头超时 | 有后续候选 → 切 provider；无后续候选 → 返回 504 |
 | 全部 key 4xx 耗尽 | 透传最后一次上游失败响应 |
 | 无可用 key | 返回 503 |
+| 上下文超限 | warn 日志，转发给上游（不阻断，避免 auto-compact 死锁） |
 
 ## 实现位置
 
-- `src-tauri/src/api/proxy/handler.rs` - 薄入口层（认证 + 请求体准备）
-- `src-tauri/src/api/proxy/stream.rs` - 流式引擎核心（路由解析 → 立即返回 Response → 后台 spawn 双循环）
-- `src-tauri/src/api/proxy/forward.rs` - 流式转发分支（passthrough / O→A / A→O）
-- `src-tauri/src/api/proxy/auth.rs` - 认证
-- `src-tauri/src/api/proxy/quota.rs` - 配额检查
-- `src-tauri/src/api/proxy/route.rs` - 路由解析
-- `src-tauri/src/api/proxy/key_rotation.rs` - 密钥轮换
-- `src-tauri/src/api/proxy/failover.rs` - 故障转移冷却表
-- `src-tauri/src/api/proxy/translate/` - 协议转换
+- `src-tauri/src/api/proxy/handler.rs` — 薄入口层（认证 + 请求体准备 + proxy_list_models）
+- `src-tauri/src/api/proxy/stream.rs` — 流式引擎核心（路由解析 → 立即返回 Response → 后台 spawn 双循环）
+- `src-tauri/src/api/proxy/forward.rs` — 流式转发分支（passthrough / O→A / A→O）
+- `src-tauri/src/api/proxy/ir/` — IR 中间表示层（三种协议统一抽象）
+- `src-tauri/src/api/proxy/auth.rs` — 认证
+- `src-tauri/src/api/proxy/quota.rs` — 配额检查
+- `src-tauri/src/api/proxy/route.rs` — 路由解析
+- `src-tauri/src/api/proxy/key_rotation.rs` — 密钥轮换
+- `src-tauri/src/api/proxy/failover.rs` — 故障转移冷却表
+- `src-tauri/src/api/proxy/websearch.rs` — WebSearch 劫持（本地搜索 + IR 注入）
 
 ## 测试要求
 
@@ -138,13 +174,14 @@ data: [DONE]
 
 ## 完成标准
 
-- [x] 支持 `/v1/messages` 和 `/v1/chat/completions`
+- [x] 支持 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 三种端点
+- [x] 支持 `GET /v1/models`（含 capabilities + max_output_tokens）
 - [x] 强制流式响应
 - [x] 5h/7d 滚动窗口配额检查（429 `quota_error` + `retry-after`）
 - [x] 密钥轮换（Red/Yellow/Green）
-- [x] 协议转换（Anthropic ↔ OpenAI）
+- [x] IR 三协议转换（Messages ↔ Chat Completions ↔ Responses）
 - [x] 超时控制
 - [x] 错误处理
-- [x] 记录 `usage_log`
+- [x] 记录 `usage_log`（真实值覆盖估算）
 - [x] failover（`resolve_route_candidates` + 双层循环 + 60s 冷却 + 开关）
 - [x] 通过网关冒烟测试（含 failover 双假上游 E2E）

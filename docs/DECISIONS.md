@@ -1166,7 +1166,146 @@ ResolvedRoute { ..., context_window: usize }
 
 // stream.rs（路由解析后）
 if max_input > 0 && est_input as usize > max_input {
-    return Err((StatusCode::BAD_REQUEST, HeaderMap::new(),
-        Json(json!({"error": {"type": "invalid_request_error", "message": ...}}))));
+    warn!(est_input, max_input, "context exceeds window, forwarding to upstream");
+    // 不再返回 400，仅记录 warn 日志
+}
+```
+
+---
+
+## ADR-027: 引入 IR 中间表示层统一三协议转换
+
+**日期**: 2026-08-09  
+**状态**: 已接受
+
+### 背景
+
+项目最初只有 Anthropic Messages ↔ OpenAI Chat Completions 双向转换，实现在 `api/proxy/translate/` 目录（`to_openai.rs` / `to_anthropic.rs` / `common.rs`）。随着 OpenAI Responses API 支持需求出现，三协议互转的组合爆炸问题凸显：N 个协议两两转换需要 N×(N-1) 个转换模块，且每新增一个协议都要修改所有既有转换模块。
+
+### 决策
+
+1. **新建 `api/proxy/ir/` 模块**（Intermediate Representation，中间表示层），替代原 `api/proxy/translate/` 目录
+2. **IR 以 Anthropic Messages 为骨架**：`IrContentBlock` 覆盖 Text/Image/Thinking/ToolUse/ToolResult 五种内容块（Anthropic 最丰富），并集覆盖三种格式的全部字段
+3. **单向转换取代双向转换**：所有客户端格式 → IR（`from_messages.rs` / `from_chat_completions.rs` / `from_responses.rs`），IR → 所有客户端格式（`to_messages.rs` / `to_chat_completions.rs` / `to_responses.rs`）
+4. **`IrStreamEvent` 6 种变体**：MessageStart → ContentBlockStart → ContentBlockDelta → ContentBlockStop → MessageDelta → MessageStop，覆盖所有协议的流式事件
+5. **`IrUsage` 统一 token 统计**：input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens / output_chars，所有协议共用同一结构
+6. **删除 `api/proxy/translate/` 目录**：所有协议转换逻辑迁移到 `api/proxy/ir/`
+
+### 原因
+
+1. **组合爆炸收敛**：N 个协议只需 2N 个转换模块（N 个 `from_*` + N 个 `to_*`），而非 N×(N-1) 个双向模块
+2. **内部工具解耦**：websearch 劫持、usage 追踪、错误构造等内部工具只操作 IR 类型，与具体协议无关
+3. **扩展性**：新增协议只需新增一对 `from_*` / `to_*` 模块，无需修改既有转换
+4. **可维护性**：IR 作为单一事实来源，避免多协议转换中的语义漂移
+
+### 代价
+
+- 转换路径变长：客户端格式 → IR → 客户端格式（两步），而非直接转换（一步）；但性能影响可忽略（微秒级）
+- IR 类型定义需要并集覆盖所有协议字段，部分字段在特定协议中无意义（如 `IrThinkingConfig` 在 OpenAI 中不使用）
+
+---
+
+## ADR-028: WebSearch 劫持重构为本地搜索 + IR 注入
+
+**日期**: 2026-08-09  
+**状态**: 已接受  
+**取代**: ADR-012（WebSearch 劫持使用本地 Bing 搜索，tool-calling loop 模式）
+
+### 背景
+
+ADR-012 的 WebSearch 劫持实现采用 tool-calling loop 模式：拦截包含 `web_search` 工具的请求 → 发送到上游（stream=false）→ 上游返回 tool_use → 本地 Bing 搜索 → 构造 tool_result → 追加到 messages → 继续下一轮（最多 5 轮）。问题：
+
+1. **多一轮上游调用**：每轮都需要发送请求到上游并等待非流式响应，延迟累积
+2. **key failover 不支持**：tool-calling loop 绕过了 `proxy_stream` 的双层重试循环，key 故障时无法自动切换
+3. **Bing 搜索代理问题**：cn.bing.com 走代理会导致出口 IP 在海外，Bing 降级为"热门站点推荐"模式（返回今日头条/百度热搜等非相关结果）
+4. **Cookie 污染**：全局 cookie 累积导致搜索结果质量下降
+
+### 决策
+
+1. **跳过 tool-calling loop**：代理自身提取搜索关键词（取最后一条 user 消息文本），本地 Bing 搜索后将结果作为 system block 注入 IR，清除 tools/tool_choice，交回 `proxy_stream` 正常流式转发给上游 LLM
+2. **`enrich_ir_with_search` 函数**：替代原 `run_websearch_loop`，接收 `IrRequest`，返回修改后的 `IrRequest`（搜索结果注入 system + tools 清除）
+3. **Bing 搜索绕过代理直连**：`search/bing.rs` 的 `build_http_client()` 传入 `no_proxy: true`，cn.bing.com 是国内站点，走代理反而导致结果降级
+4. **独立 cookie 会话**：每次搜索创建新的 `reqwest::Client` + `cookie_store(true)`，避免全局 cookie 累积污染搜索结果
+5. **key failover 由 proxy_stream 天然支持**：搜索结果注入 IR 后，请求走正常的流式转发路径，双层重试循环、key 轮换、故障转移全部生效
+
+### 原因
+
+1. **省掉一轮上游调用**：不再需要发送非流式请求到上游等待 tool_use，直接本地搜索 + 注入 IR + 流式转发
+2. **key failover 支持**：请求走 `proxy_stream` 正常路径，双层重试循环天然支持 key 故障切换
+3. **Bing 搜索质量提升**：绕过代理直连 cn.bing.com，避免出口 IP 在海外导致结果降级；独立 cookie 会话避免累积污染
+4. **代码简化**：`websearch.rs` 从 706 行减至 115 行，删除 tool-calling loop、SSE 转换、多轮状态管理等复杂逻辑
+
+### 代价
+
+- 搜索结果以 system block 形式注入，而非 tool_result 形式；LLM 对搜索结果的引用方式可能略有差异（但实测影响可忽略）
+- 每次搜索创建新的 `reqwest::Client`，无法复用 TCP 连接池（但搜索频率低，影响可忽略）
+
+---
+
+## ADR-029: usage 真实值覆盖估算占位 + Responses 增量口径
+
+**日期**: 2026-08-09  
+**状态**: 已接受
+
+### 背景
+
+`forward.rs` 在流式转发开始时预填估算的 `input_tokens`（基于 `chars/4`），供客户端上下文条感知。后续上游返回真实 usage 时，原实现采用 `max()` 合并策略：
+
+```rust
+state.usage.input_tokens = state.usage.input_tokens.max(usage.input_tokens);
+```
+
+问题：
+
+1. **估算值偏大**：`chars/4` 是保守估算（中文/代码实际 token 数通常低于估算），`max()` 合并导致估算值永久压住真实值
+2. **usage_log 污染**：写入数据库的 `prompt_tokens` 是偏大的估算值，而非真实值，统计数据失真
+3. **客户端上下文条虚高**：客户端收到的 `input_tokens` 偏大，上下文条显示不准确
+4. **Responses API 口径不一致**：Responses API 的 `input_tokens` 包含缓存命中部分，而 Chat Completions 的 `prompt_tokens` 不包含（已减去 `cached_tokens`），导致两种协议的 usage 口径不一致
+
+### 决策
+
+1. **真实值覆盖估算占位**：上游返回真实 usage 时，直接覆盖估算值（不用 `max()`）——估算值是占位符，真实值到位后即替换
+2. **Responses input_tokens 增量口径**：从 `response.usage` 提取 `input_tokens` 后，减去 `input_tokens_details.cached_tokens`，保持增量口径（与 Chat Completions `prompt_tokens - cached_tokens` 一致）
+3. **message_delta 补全 input_tokens**：IR → Messages 渲染时，`message_delta.usage` 补上 `input_tokens`（此前缺失，只输出 `output_tokens` 和 `cache_read_input_tokens`）
+4. **上下文超限预警（软警告）**：`stream.rs` 检测到上下文超限时，仅记录 warn 日志，不返回 400 错误——避免阻断客户端 auto-compact（`/compact` 自身也需走代理，硬拒绝会形成死锁）
+
+### 原因
+
+1. **估算值是占位符**：`chars/4` 是保守估算，真实 token 数通常 ≤ 估算；`max()` 合并导致估算值永久压住真实值，违背占位符语义
+2. **usage_log 准确性**：写入数据库的 `prompt_tokens` 应该是真实值，而非偏大的估算值
+3. **客户端上下文条准确性**：客户端收到的 `input_tokens` 应该是真实值，上下文条显示才准确
+4. **口径一致性**：Responses 和 Chat Completions 的 `input_tokens` 应该采用相同的增量口径（减去缓存命中部分），便于跨协议统计
+5. **避免 auto-compact 死锁**：上下文超限时硬拒绝（400）会阻断客户端 auto-compact（`/compact` 自身也需走代理），形成死锁；软警告让请求继续，由上游返回准确错误，客户端可据此 auto-compact
+
+### 代价
+
+- 估算值与真实值可能有短暂不一致窗口（估算值先输出，真实值后覆盖），但流式响应中客户端会收到多次 usage 更新，最终以真实值为准
+- 上下文超限时不再提前拦截，可能浪费一次上游调用（但上游会返回准确错误，客户端可据此 auto-compact，代价可接受）
+
+### 实现
+
+```rust
+// from_chat_completions.rs / from_responses.rs
+if usage.input_tokens > 0 {
+    state.usage.input_tokens = usage.input_tokens;  // 覆盖，不用 max()
+}
+
+// usage.rs (extract_responses_usage)
+let cached = usage.input_tokens_details.cached_tokens.unwrap_or(0);
+usage.input_tokens = usage.input_tokens.saturating_sub(cached);  // 增量口径
+
+// to_messages.rs
+MessageDelta {
+    usage: IrUsage {
+        input_tokens: state.usage.input_tokens,  // 补全（此前缺失）
+        output_tokens: state.usage.output_tokens,
+        ..
+    },
+}
+
+// stream.rs
+if max_input > 0 && est_input as usize > max_input {
+    warn!(est_input, max_input, "context exceeds window, forwarding to upstream");
+    // 不再返回 400
 }
 ```

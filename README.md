@@ -2,7 +2,7 @@
 
 > 多 Provider AI LLM API 路由网关 — Tauri 2 桌面应用
 
-xrl-router 是一个运行在本地的 LLM API 统一网关。客户端通过一套 Anthropic Messages API 端点访问所有大模型 Provider，网关负责路由解析、协议转换、密钥轮换和用量统计喵～
+xrl-router 是一个运行在本地的 LLM API 统一网关。客户端通过 Anthropic Messages、OpenAI Chat Completions 或 OpenAI Responses API 三种端点访问所有大模型 Provider，网关经 IR 中间表示层统一协议转换，负责路由解析、密钥轮换和用量统计喵～
 
 ## 技术栈
 
@@ -76,7 +76,9 @@ pnpm build
 
 ### LLM 代理
 
-客户端请求 `/v1/messages`（Anthropic 格式）或 `/v1/chat/completions`（OpenAI 格式），网关根据模型别名解析到上游 Provider，进行协议转换后流式转发。仅支持流式响应。
+客户端请求 `/v1/messages`（Anthropic 格式）、`/v1/chat/completions`（OpenAI Chat Completions 格式）或 `/v1/responses`（OpenAI Responses API 格式），网关根据模型别名解析到上游 Provider，经 **IR（中间表示）层** 统一协议转换后流式转发。仅支持流式响应。
+
+**IR 中间表示层**：三种客户端格式（Anthropic Messages / OpenAI Chat Completions / OpenAI Responses）先统一转换为 IR（`IrRequest` / `IrStreamEvent` / `IrUsage`），再渲染为目标上游格式。IR 以 Anthropic Messages 为骨架（内容块模型最丰富），并集覆盖三种格式的全部字段。所有内部工具（websearch 劫持、usage 追踪、错误构造）只操作 IR 类型，与具体协议解耦。实现位于 `api/proxy/ir/`。
 
 **流式引擎架构**：handler.rs 是薄入口层（认证 + 请求体准备），核心逻辑委托给 stream.rs 的 `proxy_stream()` 函数完成路由解析、上游连接、密钥轮换和流式转发。stream.rs 路由解析后立即返回 Response（含 keepalive），上游等待和流式转发在后台 spawn 中完成，客户端毫秒级收到首字节。流式转发分支（passthrough / O→A / A→O）实现在 forward.rs。
 
@@ -84,7 +86,7 @@ pnpm build
 
 **自适应超时 + 请求体放宽**：上游响应头超时不再固定 60s，改为按估算输入 token 自适应（≥100k → 600s、≥50k → 480s、基准 300s），对齐 Claude Code 客户端超时，避免大上下文长排队被误判挂死而断流。请求体上限从 axum 默认 2MiB 放宽到 64MiB，覆盖多轮历史 + 工具结果 + base64 截图的多模态大会话。
 
-**上下文超限预检**：请求路由解析后，按估算输入 token（`chars/4`）与模型 `context_window` 比对，超限直接返回 400（`invalid_request_error`），避免发往上游白等一轮。估算为保守口径，真实 token 数通常 ≤ 估算，误杀概率低。
+**上下文超限预警**：请求路由解析后，按估算输入 token（`chars/4`）与模型 `context_window` 比对，超限时仅记录 warn 日志、不阻断请求。原因：chars/4 估算偏保守（中文/代码实际 token 数通常低于估算），且硬拒绝会阻断客户端 auto-compact（`/compact` 自身也需走代理，形成死锁）。上游自行判断是否超限并返回准确错误，客户端可据此 auto-compact。
 
 > **⚠️ 仅流式 + 客户端回退**：网关只支持流式响应（强制 `stream=true`）。若客户端在流中断后回退为**非流式重试**（例如把 SSE 响应误当成普通 JSON 解析），会看到类似 `API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request` 的报错——这是设计使然（网关对无法恢复的中断以 HTTP 200 + SSE error 事件表达，状态码无法中途改写），并非网络被劫持。遇到此报错请检查上游日志与客户端超时配置。
 
@@ -126,7 +128,7 @@ pnpm build
 
 ### WebSearch 劫持
 
-可选功能：拦截包含 `web_search` 工具的请求，用本地 Bing 搜索替代上游 API 的搜索功能（通过设置页开关控制）。
+可选功能（设置页开关控制）：拦截包含 `web_search` 工具的请求，代理自身提取搜索关键词（取最后一条 user 消息文本），本地 Bing 搜索后将结果作为 system block 注入 IR、清除 tools/tool_choice，交回 `proxy_stream` 正常流式转发给上游 LLM。跳过 LLM tool-calling loop，省掉一轮非流式上游调用，key failover 由 proxy_stream 天然支持。Bing 搜索绕过代理直连 cn.bing.com（避免出口 IP 在海外导致结果降级），每次搜索用独立 cookie 会话。
 
 ### 国际化（i18n）
 
