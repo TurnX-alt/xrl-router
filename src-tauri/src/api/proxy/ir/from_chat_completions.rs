@@ -396,10 +396,18 @@ pub fn chat_completions_chunk_to_ir(chunk: &Value, state: &mut ChatCompletionsPa
         || usage.output_tokens > 0
         || usage.cache_read_input_tokens > 0
     {
-        state.usage.input_tokens = state.usage.input_tokens.max(usage.input_tokens);
-        state.usage.output_tokens = state.usage.output_tokens.max(usage.output_tokens);
-        state.usage.cache_read_input_tokens =
-            state.usage.cache_read_input_tokens.max(usage.cache_read_input_tokens);
+        // 覆盖语义：上游返回的真实 usage 覆盖 forward.rs 预填的估算占位
+        //（不能 max——估算值 chars/4 通常偏大，会永久压住真实值，导致
+        //   usage_log 与客户端上下文条的 input_tokens 虚高）
+        if usage.input_tokens > 0 {
+            state.usage.input_tokens = usage.input_tokens;
+        }
+        if usage.output_tokens > 0 {
+            state.usage.output_tokens = usage.output_tokens;
+        }
+        if usage.cache_read_input_tokens > 0 {
+            state.usage.cache_read_input_tokens = usage.cache_read_input_tokens;
+        }
     }
     state.usage.output_chars += usage.output_chars;
 
@@ -957,6 +965,36 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, IrStreamEvent::MessageDelta { stop_reason: Some(IrStopReason::EndTurn), .. })));
         assert!(events.iter().any(|e| matches!(e, IrStreamEvent::MessageStop)));
         assert_eq!(state.usage.input_tokens, 100);
+        assert_eq!(state.usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn test_real_usage_overrides_estimate() {
+        // forward.rs 会预填 chars/4 的估算值（通常偏大）。
+        // 上游返回真实 usage 时必须以真实值覆盖，不能 max 合并——
+        // 否则估算值永久压住真实值，usage_log 与上下文条虚高。
+        let mut state = ChatCompletionsParseState::new();
+        state.msg_id = "chatcmpl-1".to_string();
+        state.model = "gpt-4o".to_string();
+        state.text_started = true;
+        state.text_index = 0;
+        state.usage.input_tokens = 200_000; // 模拟 est_input 预填（偏大）
+
+        let chunk = json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50
+            }
+        });
+        let _ = chat_completions_chunk_to_ir(&chunk, &mut state);
+        assert_eq!(state.usage.input_tokens, 100, "真实 input_tokens 应覆盖估算值");
         assert_eq!(state.usage.output_tokens, 50);
     }
 }

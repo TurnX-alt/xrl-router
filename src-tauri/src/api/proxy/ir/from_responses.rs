@@ -600,13 +600,19 @@ pub fn responses_chunk_to_ir(
                 events.push(IrStreamEvent::ContentBlockStop { index: block_index });
             }
 
-            // 提取 usage
+            // 提取 usage（覆盖语义：真实值覆盖 forward.rs 预填的估算占位，
+            // 不能 max——估算值偏大会永久压住真实值，污染 usage_log 与上下文条）
             let usage = super::usage::extract_responses_usage(chunk);
             if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                state.usage.input_tokens = state.usage.input_tokens.max(usage.input_tokens);
-                state.usage.output_tokens = state.usage.output_tokens.max(usage.output_tokens);
-                state.usage.cache_read_input_tokens =
-                    state.usage.cache_read_input_tokens.max(usage.cache_read_input_tokens);
+                if usage.input_tokens > 0 {
+                    state.usage.input_tokens = usage.input_tokens;
+                }
+                if usage.output_tokens > 0 {
+                    state.usage.output_tokens = usage.output_tokens;
+                }
+                if usage.cache_read_input_tokens > 0 {
+                    state.usage.cache_read_input_tokens = usage.cache_read_input_tokens;
+                }
             }
 
             // 提取 stop_reason
@@ -917,7 +923,7 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, IrStreamEvent::ContentBlockStop { index: 0 })));
         assert!(events.iter().any(|e| matches!(e, IrStreamEvent::MessageDelta { stop_reason: Some(IrStopReason::EndTurn), .. })));
         assert!(events.iter().any(|e| matches!(e, IrStreamEvent::MessageStop)));
-        assert_eq!(state.usage.input_tokens, 100);
+        assert_eq!(state.usage.input_tokens, 20);
         assert_eq!(state.usage.output_tokens, 50);
         assert_eq!(state.usage.cache_read_input_tokens, 80);
     }

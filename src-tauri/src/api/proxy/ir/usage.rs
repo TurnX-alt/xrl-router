@@ -140,6 +140,11 @@ pub fn extract_responses_usage(chunk: &Value) -> IrUsage {
                     .get("cached_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                // 上游 input_tokens 含缓存命中部分，减去保持增量口径
+                // （与 Chat Completions 的 prompt_tokens - cached_tokens 一致）
+                usage.input_tokens = usage
+                    .input_tokens
+                    .saturating_sub(usage.cache_read_input_tokens);
             }
         }
     }
@@ -320,9 +325,46 @@ mod tests {
             }
         });
         let u = extract_responses_usage(&chunk);
-        assert_eq!(u.input_tokens, 500);
+        // input_tokens 应减去缓存命中部分（500 - 300 = 200），保持增量口径
+        assert_eq!(u.input_tokens, 200);
         assert_eq!(u.output_tokens, 200);
         assert_eq!(u.cache_read_input_tokens, 300);
+    }
+
+    #[test]
+    fn test_extract_responses_usage_no_cache() {
+        let chunk = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 400,
+                    "output_tokens": 100
+                }
+            }
+        });
+        let u = extract_responses_usage(&chunk);
+        // 无缓存详情时 input_tokens 不变
+        assert_eq!(u.input_tokens, 400);
+        assert_eq!(u.output_tokens, 100);
+        assert_eq!(u.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn test_extract_responses_usage_full_cache() {
+        let chunk = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 50,
+                    "input_tokens_details": {"cached_tokens": 1000}
+                }
+            }
+        });
+        let u = extract_responses_usage(&chunk);
+        // 全部命中缓存 → input_tokens = 0（纯增量 = 0）
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 1000);
     }
 
     #[test]

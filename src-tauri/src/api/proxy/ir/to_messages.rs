@@ -318,6 +318,7 @@ impl MessagesRenderState {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": null},
                 "usage": {
+                    "input_tokens": usage.input_tokens,
                     "output_tokens": output_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                 }

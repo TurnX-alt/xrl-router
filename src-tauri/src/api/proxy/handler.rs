@@ -235,7 +235,7 @@ pub async fn proxy_list_models(
 
     let mut stmt = conn
         .prepare(
-            "SELECT m.model_id, m.display_name, m.tier, p.name, m.context_window
+            "SELECT m.model_id, m.display_name, m.tier, p.name, m.context_window, m.max_output_tokens, m.capabilities
              FROM models m
              JOIN providers p ON m.provider_id = p.id
              WHERE m.enabled = 1 AND p.enabled = 1
@@ -251,6 +251,10 @@ pub async fn proxy_list_models(
 
     let models: Vec<Value> = stmt
         .query_map([], |row| {
+            // capabilities 存的是 JSON 数组字符串（如 '["text","tools"]'），
+            // 解析成真实数组；解析失败时回退到空数组，避免破坏模型列表。
+            let caps: String = row.get(6)?;
+            let caps: Vec<String> = serde_json::from_str(&caps).unwrap_or_default();
             Ok(json!({
                 "id": row.get::<_, String>(1)?,
                 "object": "model",
@@ -259,6 +263,8 @@ pub async fn proxy_list_models(
                 "display_name": row.get::<_, String>(1)?,
                 "tier": row.get::<_, String>(2)?,
                 "context_window": row.get::<_, i64>(4)?,
+                "max_output_tokens": row.get::<_, i64>(5)?,
+                "capabilities": caps,
             }))
         })
         .map_err(|e| {
