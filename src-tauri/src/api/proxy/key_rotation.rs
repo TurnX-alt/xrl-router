@@ -24,6 +24,7 @@ pub(super) fn pick_key_for(state: &AppState, provider_id: &str) -> Option<Picked
 /// 401/403 -> red (invalid key), 402/429 -> yellow (quota/rate limit),
 /// 2xx -> green (success). 5xx and other 4xx (400/404…) are NOT key problems,
 /// so they leave the key state untouched.
+/// 5xx 及其他非 key 状态不改变 key 健康度（由上层按通用错误处理）。
 pub(super) fn update_key_health(pool: &KeyPool, provider_id: &str, key: &str, status: u16) {
     match status {
         401 | 403 => { let _ = pool.mark_key_invalid(provider_id, key); }

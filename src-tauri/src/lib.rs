@@ -27,6 +27,12 @@ mod providers;
 mod search;
 mod types;
 
+// SDK 合规验证（fixtures 导出 + Python 官方 SDK 校验脚本）。
+// 本目录仅 test 构建；正式构建不编译任何测试代码。
+#[cfg(test)]
+#[path = "sdk-test/fixtures.rs"]
+mod sdk_fixtures;
+
 use gateway::server::AppState;
 
 /// 开机自启（autostart 登录项）携带的参数：命中时启动不显示窗口，静默驻留托盘。

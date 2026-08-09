@@ -171,6 +171,12 @@ main.rs
   │  强制 stream=true, model=real_model_id
   │
   ▼
+[4c'] 上下文超限预检 ──── 估算输入 token (chars/4) > model.context_window
+  │  超限 → 400 invalid_request_error（不发上游）
+  │  message_start 携带 input_tokens / cache_read_input_tokens
+  │  （上游真实值或估算值），供客户端上下文条感知
+  │
+  ▼
 [4d] failover 双层重试循环 (stream.rs + key_rotation.rs + failover.rs)
   │  外层: 遍历 provider 候选 (冷却中的直接跳过)
   │  内层: pick_key_for() → round-robin, 跳过 Red/Yellow

@@ -246,24 +246,33 @@ pub fn messages_chunk_to_ir(
             let id = msg["id"].as_str().unwrap_or("msg_unknown").to_string();
             let model = msg["model"].as_str().unwrap_or("").to_string();
 
-            // 提取初始 usage
+            // 提取初始 usage。
             let usage = &msg["usage"];
-            let it = usage["input_tokens"].as_u64().unwrap_or(0)
-                + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            // IR 口径：input_tokens 保持「未缓存输入」口径（不含 cache_creation），
+            // 渲染回 Anthropic 客户端时再合并（input_tokens + cache_creation）。
+            let it = usage["input_tokens"].as_u64().unwrap_or(0);
             let cr = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
             state.usage.input_tokens = it;
             state.usage.cache_read_input_tokens = cr;
             state.usage.cache_creation_input_tokens =
                 usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
 
-            events.push(IrStreamEvent::MessageStart { id, model });
+            events.push(IrStreamEvent::MessageStart {
+                id,
+                model,
+                // 上游 message_start 携带的真实 usage（input 侧），
+                // 供客户端上下文条感知；无真实值时由 forward.rs 预填的估算兜底
+                usage: Some(state.usage.clone()),
+            });
         }
         "content_block_start" => {
             let index = chunk["index"].as_u64().unwrap_or(0) as usize;
             let block = &chunk["content_block"];
             let ir_block = match block["type"].as_str().unwrap_or("") {
                 "text" => IrContentBlockStart::Text,
-                "thinking" => IrContentBlockStart::Thinking,
+                "thinking" => IrContentBlockStart::Thinking {
+                    signature: block.get("signature").and_then(|v| v.as_str()).map(String::from),
+                },
                 "tool_use" => IrContentBlockStart::ToolUse {
                     id: block["id"].as_str().unwrap_or("").to_string(),
                     name: block["name"].as_str().unwrap_or("").to_string(),
@@ -494,9 +503,9 @@ mod tests {
         });
         let events = messages_chunk_to_ir(&chunk, &mut state);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], IrStreamEvent::MessageStart { id, model } if id == "msg_123" && model == "claude-opus-4-8"));
-        // input_tokens = 100 + 50 (cache_creation)
-        assert_eq!(state.usage.input_tokens, 150);
+        assert!(matches!(&events[0], IrStreamEvent::MessageStart { id, model, usage: Some(u) } if id == "msg_123" && model == "claude-opus-4-8" && u.input_tokens == 100));
+        // IR 口径：input_tokens 为纯 miss（100），cache_creation 独立存放（50）
+        assert_eq!(state.usage.input_tokens, 100);
         assert_eq!(state.usage.cache_read_input_tokens, 8000);
         assert_eq!(state.usage.cache_creation_input_tokens, 50);
     }
@@ -567,6 +576,6 @@ mod tests {
             "delta": {"type": "thinking_delta", "thinking": "思考中..."}
         });
         messages_chunk_to_ir(&chunk, &mut state);
-        assert_eq!(state.usage.output_chars, 5); // 5 chars in "思考中..."
+        assert_eq!(state.usage.output_chars, 6); // "思考中..." = 3 汉字 + 3 点 = 6 chars
     }
 }

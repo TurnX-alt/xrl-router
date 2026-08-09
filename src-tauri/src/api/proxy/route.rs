@@ -14,6 +14,8 @@ pub(super) struct ResolvedRoute {
     pub(super) real_model_id: String,
     /// models.id (UUID primary key) — needed for usage_log.model_id FK.
     pub(super) model_row_id: String,
+    /// 模型上下文窗口（token），超限预检用。
+    pub(super) context_window: usize,
     /// Plugin ID if this is a delegated provider (None for regular providers).
     pub(super) plugin_id: Option<String>,
 }
@@ -39,7 +41,7 @@ pub(super) async fn resolve_route(state: &AppState, model_name: &str) -> Option<
     // is rejected; clients must use the alias.
     let mut stmt = conn
         .prepare(
-            "SELECT m.id, m.model_id, m.provider_id, p.name, p.base_url, p.api_path, p.kind, p.config_json
+            "SELECT m.id, m.model_id, m.provider_id, p.name, p.base_url, p.api_path, p.kind, p.config_json, m.context_window
              FROM models m
              JOIN providers p ON m.provider_id = p.id
              WHERE m.display_name = ?1
@@ -50,7 +52,7 @@ pub(super) async fn resolve_route(state: &AppState, model_name: &str) -> Option<
         )
         .ok()?;
 
-    let (model_row_id, real_model_id, provider_id, provider_name, base_url, api_path, kind, config_json_str): (
+    let (model_row_id, real_model_id, provider_id, provider_name, base_url, api_path, kind, config_json_str, context_window): (
         String,
         String,
         String,
@@ -59,6 +61,7 @@ pub(super) async fn resolve_route(state: &AppState, model_name: &str) -> Option<
         String,
         String,
         String,
+        usize,
     ) = stmt
         .query_row([&model_name.to_string()], |row| {
             Ok((
@@ -70,6 +73,7 @@ pub(super) async fn resolve_route(state: &AppState, model_name: &str) -> Option<
                 row.get(5)?,
                 row.get(6)?,
                 row.get(7)?,
+                row.get(8)?,
             ))
         })
         .ok()?;
@@ -104,6 +108,7 @@ pub(super) async fn resolve_route(state: &AppState, model_name: &str) -> Option<
         provider_name,
         real_model_id,
         model_row_id,
+        context_window,
         plugin_id,
     })
 }
@@ -121,7 +126,7 @@ pub(super) async fn resolve_route_candidates(
 
     let mut stmt = conn
         .prepare(
-            "SELECT m.id, m.model_id, m.provider_id, p.name, p.base_url, p.api_path, p.kind, p.config_json
+            "SELECT m.id, m.model_id, m.provider_id, p.name, p.base_url, p.api_path, p.kind, p.config_json, m.context_window
              FROM models m
              JOIN providers p ON m.provider_id = p.id
              WHERE m.display_name = ?1
@@ -142,6 +147,7 @@ pub(super) async fn resolve_route_candidates(
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, usize>(8)?,
             ))
         })
         .ok()?;
@@ -158,6 +164,7 @@ pub(super) async fn resolve_route_candidates(
         api_path,
         kind,
         config_json_str,
+        context_window,
     ))) = rows.next()
     {
         // 同一 provider 多行同 display_name 只保留首个（排序靠前的行优先）
@@ -195,6 +202,7 @@ pub(super) async fn resolve_route_candidates(
             provider_name,
             real_model_id,
             model_row_id,
+            context_window,
             plugin_id,
         });
     }

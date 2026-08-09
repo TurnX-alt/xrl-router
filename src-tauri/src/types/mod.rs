@@ -12,7 +12,7 @@ pub use balance::BalanceInfo;
 pub use key::KeyStatus;
 pub use model::{Capability, ModelTier};
 pub use provider::{
-    DelegateKeyConfig, DeapHeaders, HeaderPair, KeySource, ProviderConfig,
+    HeaderPair, KeySource, ProviderConfig,
 };
 pub use route::Route;
 

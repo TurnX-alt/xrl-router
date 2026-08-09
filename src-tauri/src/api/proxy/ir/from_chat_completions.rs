@@ -93,6 +93,21 @@ fn parse_chat_messages(req: &Value) -> (Option<IrSystemContent>, Vec<IrMessage>)
     let mut system_parts: Vec<String> = vec![];
     let mut ir_messages: Vec<IrMessage> = vec![];
 
+    // 顶层 system 字段（OpenAI 标准格式，非 messages[0]）
+    if let Some(content) = req.get("system") {
+        match content {
+            Value::String(s) => system_parts.push(s.clone()),
+            Value::Array(parts) => {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        system_parts.push(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("user");
 
@@ -139,12 +154,14 @@ fn parse_chat_messages(req: &Value) -> (Option<IrSystemContent>, Vec<IrMessage>)
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                // DeepSeek 等上游在 tool 消息里用 is_error 标记工具执行失败
+                let is_error = msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                 ir_messages.push(IrMessage {
                     role: IrRole::User, // Tool result 作为 user 消息
                     content: vec![IrContentBlock::ToolResult {
                         tool_use_id: tool_call_id,
                         content: IrToolResultContent::Text(content),
-                        is_error: false,
+                        is_error,
                     }],
                 });
             }
@@ -417,12 +434,16 @@ pub fn chat_completions_chunk_to_ir(chunk: &Value, state: &mut ChatCompletionsPa
             if !reasoning.is_empty() {
                 if !state.body_started {
                     if !state.thinking_started {
-                        // 发送 thinking block start
+                        // 发送 thinking block start（占用 index 0，推进 next_index
+                        // 避免后续 text block 与 thinking 撞号）
                         events.push(IrStreamEvent::ContentBlockStart {
                             index: 0,
-                            block: IrContentBlockStart::Thinking,
+                            block: IrContentBlockStart::Thinking { signature: None },
                         });
                         state.thinking_started = true;
+                        if state.next_index == 0 {
+                            state.next_index = 1;
+                        }
                     }
                     events.push(IrStreamEvent::ContentBlockDelta {
                         index: 0,
@@ -562,6 +583,9 @@ pub fn chat_completions_chunk_to_ir(chunk: &Value, state: &mut ChatCompletionsPa
             IrStreamEvent::MessageStart {
                 id: state.msg_id.clone(),
                 model: state.model.clone(),
+                // Chat 的 usage 通常在最后一个 chunk，这里先用估算值占位
+                //（forward.rs 已把 est_input 预填进 state.usage.input_tokens）
+                usage: Some(state.usage.clone()),
             },
         );
         state.started = true;
@@ -593,6 +617,43 @@ mod tests {
         assert!(matches!(ir.system, Some(IrSystemContent::Text(ref t)) if t == "You are helpful."));
         assert_eq!(ir.messages.len(), 1);
         assert_eq!(ir.messages[0].role, IrRole::User);
+    }
+
+    #[test]
+    fn test_top_level_system_field() {
+        // OpenAI 标准格式：system 是顶层字段而非 messages[0]
+        let req = json!({
+            "model": "gpt-4o",
+            "system": "Top-level system prompt.",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "stream": true
+        });
+        let ir = chat_completions_req_to_ir(&req);
+        assert!(matches!(ir.system, Some(IrSystemContent::Text(ref t)) if t == "Top-level system prompt."));
+        assert_eq!(ir.messages.len(), 1);
+
+        // 顶层 system + messages 内 system 都应保留
+        let req2 = json!({
+            "model": "gpt-4o",
+            "system": "Top-level.",
+            "messages": [
+                {"role": "system", "content": "In-messages."},
+                {"role": "user", "content": "Hello"}
+            ],
+            "stream": true
+        });
+        let ir2 = chat_completions_req_to_ir(&req2);
+        // 多段 system（顶层 + messages 内）→ Blocks 分支
+        let combined = match ir2.system {
+            Some(IrSystemContent::Text(ref t)) => t.clone(),
+            Some(IrSystemContent::Blocks(ref blocks)) => blocks.iter().map(|b| b.text.clone()).collect::<Vec<_>>().join(" "),
+            None => String::new(),
+        };
+        assert!(combined.contains("Top-level."));
+        assert!(combined.contains("In-messages."));
+        assert_eq!(ir2.messages.len(), 1);
     }
 
     #[test]
@@ -758,7 +819,7 @@ mod tests {
         });
         let events = chat_completions_chunk_to_ir(&chunk, &mut state);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], IrStreamEvent::MessageStart { id, model } if id == "chatcmpl-123" && model == "gpt-4o"));
+        assert!(matches!(&events[0], IrStreamEvent::MessageStart { id, model, usage: Some(_) } if id == "chatcmpl-123" && model == "gpt-4o"));
     }
 
     #[test]
@@ -799,7 +860,7 @@ mod tests {
             }]
         });
         let events1 = chat_completions_chunk_to_ir(&chunk1, &mut state);
-        assert!(events1.iter().any(|e| matches!(e, IrStreamEvent::ContentBlockStart { index: 0, block: IrContentBlockStart::Thinking })));
+        assert!(events1.iter().any(|e| matches!(e, IrStreamEvent::ContentBlockStart { index: 0, block: IrContentBlockStart::Thinking { .. } })));
         assert!(events1.iter().any(|e| matches!(e, IrStreamEvent::ContentBlockDelta { index: 0, delta: IrContentDelta::ThinkingDelta(t) } if t == "thinking...")));
 
         // content chunk (should close thinking first)

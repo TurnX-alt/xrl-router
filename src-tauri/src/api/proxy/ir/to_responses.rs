@@ -86,7 +86,7 @@ pub fn ir_req_to_responses(req: &IrRequest) -> Value {
                 IrContentBlock::ToolResult {
                     tool_use_id,
                     content,
-                    ..
+                    is_error,
                 } => {
                     let output = match content {
                         IrToolResultContent::Text(t) => t.clone(),
@@ -102,11 +102,16 @@ pub fn ir_req_to_responses(req: &IrRequest) -> Value {
                             .collect::<Vec<_>>()
                             .join("\n"),
                     };
-                    function_outputs.push(json!({
+                    // 规范结构：output 是数组（output_text part），错误时 is_error: true
+                    let mut output_obj = json!({
                         "type": "function_call_output",
                         "call_id": tool_use_id,
-                        "output": output
-                    }));
+                        "output": [{"type": "output_text", "text": output}]
+                    });
+                    if *is_error {
+                        output_obj["is_error"] = json!(true);
+                    }
+                    function_outputs.push(output_obj);
                 }
             }
         }
@@ -214,9 +219,17 @@ pub struct ResponsesRenderState {
     current_block: Option<ResponsesBlockKind>,
     /// 当前 block 累积的文本（text / thinking / tool arguments）
     current_text: String,
+    /// thinking block 的 reasoning_summary_part 是否已 added（首个 summary delta 前）
+    summary_part_started: bool,
+    /// 最后一个 MessageDelta 的 stop_reason（finalize 时决定 status）
+    last_stop_reason: Option<IrStopReason>,
     /// 当前 block 的 tool_use id/name（仅 ToolUse 时有效）
     current_tool_id: String,
     current_tool_name: String,
+    /// 当前输出项的 id（content_part / delta / done 事件引用）
+    current_item_id: String,
+    /// 已完成的输出项（完整 item 快照，response.completed 的 output 回填）
+    completed_items: Vec<Value>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -237,8 +250,12 @@ impl ResponsesRenderState {
             response_created: false,
             current_block: None,
             current_text: String::new(),
+            summary_part_started: false,
+            last_stop_reason: None,
             current_tool_id: String::new(),
             current_tool_name: String::new(),
+            current_item_id: String::new(),
+            completed_items: Vec::new(),
         }
     }
 
@@ -250,10 +267,15 @@ impl ResponsesRenderState {
         };
 
         match ev {
-            IrStreamEvent::MessageStart { id, model } => {
+            IrStreamEvent::MessageStart { id, model, usage } => {
                 self.response_id = id.clone();
                 self.model = model.clone();
                 self.response_created = true;
+
+                // 输入侧 usage（上游真实值或估算值），渲染进 response.created
+                let u = usage.as_ref();
+                let input_tokens = u.map(|u| u.input_tokens).unwrap_or(0);
+                let cache_read = u.map(|u| u.cache_read_input_tokens).unwrap_or(0);
 
                 Some(mk(
                     "response.created",
@@ -267,9 +289,12 @@ impl ResponsesRenderState {
                             "status": "in_progress",
                             "output": [],
                             "usage": {
-                                "input_tokens": 0,
+                                "input_tokens": input_tokens,
                                 "output_tokens": 0,
-                                "total_tokens": 0
+                                "total_tokens": input_tokens,
+                                "input_tokens_details": {
+                                    "cached_tokens": cache_read
+                                }
                             }
                         }
                     }),
@@ -291,6 +316,8 @@ impl ResponsesRenderState {
                         self.current_block = Some(ResponsesBlockKind::Text);
                         self.current_text = String::new();
                         let item_id = format!("item_{}", uuid::Uuid::new_v4().simple());
+                        self.current_item_id = item_id.clone();
+                        let part_id = format!("part_{}", uuid::Uuid::new_v4().simple());
 
                         // output_item.added (message type)
                         let item_added = mk(
@@ -315,7 +342,9 @@ impl ResponsesRenderState {
                                 "type": "response.content_part.added",
                                 "output_index": self.output_index,
                                 "content_index": self.content_part_index,
+                                "item_id": self.current_item_id,
                                 "part": {
+                                    "id": part_id,
                                     "type": "output_text",
                                     "text": "",
                                     "annotations": []
@@ -328,12 +357,16 @@ impl ResponsesRenderState {
                         prelude.extend_from_slice(&part_added);
                         Some(Bytes::from(prelude))
                     }
-                    IrContentBlockStart::Thinking => {
+                    IrContentBlockStart::Thinking { .. } => {
                         self.output_index = *index;
                         self.current_block = Some(ResponsesBlockKind::Thinking);
                         self.current_text = String::new();
+                        self.summary_part_started = false;
                         let item_id = format!("item_{}", uuid::Uuid::new_v4().simple());
+                        self.current_item_id = item_id.clone();
 
+                        // reasoning item 带 content（推理过程文本按规范放在
+                        // item.content 的 reasoning parts 中）
                         let added = mk(
                             "response.output_item.added",
                             json!({
@@ -343,6 +376,7 @@ impl ResponsesRenderState {
                                     "id": item_id,
                                     "type": "reasoning",
                                     "status": "in_progress",
+                                    "content": [],
                                     "summary": []
                                 }
                             }),
@@ -356,6 +390,8 @@ impl ResponsesRenderState {
                         self.current_text = String::new();
                         self.current_tool_id = id.clone();
                         self.current_tool_name = name.clone();
+                        let item_id = format!("item_{}", uuid::Uuid::new_v4().simple());
+                        self.current_item_id = item_id.clone();
 
                         let added = mk(
                             "response.output_item.added",
@@ -363,6 +399,7 @@ impl ResponsesRenderState {
                                 "type": "response.output_item.added",
                                 "output_index": self.output_index,
                                 "item": {
+                                    "id": item_id,
                                     "type": "function_call",
                                     "status": "in_progress",
                                     "call_id": id,
@@ -387,20 +424,47 @@ impl ResponsesRenderState {
                                 "type": "response.output_text.delta",
                                 "output_index": *index,
                                 "content_index": self.content_part_index,
+                                "item_id": self.current_item_id,
                                 "delta": text
                             }),
                         ))
                     }
                     IrContentDelta::ThinkingDelta(thinking) => {
                         self.current_text.push_str(thinking);
-                        Some(mk(
-                            "response.reasoning.delta",
+                        let mut prelude: Vec<u8> = Vec::new();
+
+                        // 首个 reasoning delta 前先发 reasoning_summary_part.added
+                        //（推理文本走 summary part 流；part.added 必须紧跟 output_item.added）
+                        if !self.summary_part_started {
+                            let part_added = mk(
+                                "response.reasoning_summary_part.added",
+                                json!({
+                                    "type": "response.reasoning_summary_part.added",
+                                    "output_index": *index,
+                                    "summary_index": 0,
+                                    "item_id": self.current_item_id,
+                                    "part": {
+                                        "type": "reasoning_summary_text",
+                                        "text": ""
+                                    }
+                                }),
+                            );
+                            prelude.extend_from_slice(&part_added);
+                            self.summary_part_started = true;
+                        }
+
+                        let delta_ev = mk(
+                            "response.reasoning_summary_text.delta",
                             json!({
-                                "type": "response.reasoning.delta",
+                                "type": "response.reasoning_summary_text.delta",
                                 "output_index": *index,
+                                "summary_index": 0,
+                                "item_id": self.current_item_id,
                                 "delta": thinking
                             }),
-                        ))
+                        );
+                        prelude.extend_from_slice(&delta_ev);
+                        Some(Bytes::from(prelude))
                     }
                     IrContentDelta::InputJsonDelta(partial) => {
                         self.current_text.push_str(partial);
@@ -409,6 +473,7 @@ impl ResponsesRenderState {
                             json!({
                                 "type": "response.function_call_arguments.delta",
                                 "output_index": *index,
+                                "item_id": self.current_item_id,
                                 "delta": partial
                             }),
                         ))
@@ -427,6 +492,7 @@ impl ResponsesRenderState {
                                 "type": "response.content_part.done",
                                 "output_index": output_index,
                                 "content_index": self.content_part_index,
+                                "item_id": self.current_item_id,
                                 "part": {
                                     "type": "output_text",
                                     "text": text,
@@ -451,22 +517,38 @@ impl ResponsesRenderState {
                                 }
                             }),
                         );
+                        // 记录完整 item（response.completed 的 output 回填）
+                        self.completed_items.push(json!({
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text, "annotations": []}]
+                        }));
                         self.current_block = None;
                         self.current_text.clear();
                         let joined = part_done.iter().chain(item_done.iter()).copied().collect::<Vec<u8>>();
                         Some(Bytes::from(joined))
                     }
                     Some(ResponsesBlockKind::Thinking) => {
-                        let reasoning_done = mk(
-                            "response.reasoning.done",
-                            json!({
-                                "type": "response.reasoning.done",
-                                "output_index": output_index,
-                                "reasoning": {
-                                    "summary": []
-                                }
-                            }),
-                        );
+                        // 规范序列：reasoning_summary_part.done → output_item.done
+                        let mut combined: Vec<u8> = Vec::new();
+                        if self.summary_part_started {
+                            let part_done = mk(
+                                "response.reasoning_summary_part.done",
+                                json!({
+                                    "type": "response.reasoning_summary_part.done",
+                                    "output_index": output_index,
+                                    "summary_index": 0,
+                                    "item_id": self.current_item_id,
+                                    "part": {
+                                        "type": "reasoning_summary_text",
+                                        "text": self.current_text
+                                    }
+                                }),
+                            );
+                            combined.extend_from_slice(&part_done);
+                        }
+                        let reasoning = self.current_text.clone();
                         let item_done = mk(
                             "response.output_item.done",
                             json!({
@@ -475,14 +557,27 @@ impl ResponsesRenderState {
                                 "item": {
                                     "type": "reasoning",
                                     "status": "completed",
+                                    "content": [{
+                                        "type": "reasoning_text",
+                                        "text": reasoning,
+                                        "summary": []
+                                    }],
                                     "summary": []
                                 }
                             }),
                         );
+                        combined.extend_from_slice(&item_done);
+                        // 记录完整 item
+                        self.completed_items.push(json!({
+                            "type": "reasoning",
+                            "status": "completed",
+                            "content": [{"type": "reasoning_text", "text": reasoning, "summary": []}],
+                            "summary": []
+                        }));
                         self.current_block = None;
                         self.current_text.clear();
-                        let joined = reasoning_done.iter().chain(item_done.iter()).copied().collect::<Vec<u8>>();
-                        Some(Bytes::from(joined))
+                        self.summary_part_started = false;
+                        Some(Bytes::from(combined))
                     }
                     Some(ResponsesBlockKind::ToolUse) => {
                         let args = self.current_text.clone();
@@ -491,6 +586,8 @@ impl ResponsesRenderState {
                             json!({
                                 "type": "response.function_call_arguments.done",
                                 "output_index": output_index,
+                                "item_id": self.current_item_id,
+                                "name": self.current_tool_name,
                                 "arguments": args
                             }),
                         );
@@ -508,6 +605,14 @@ impl ResponsesRenderState {
                                 }
                             }),
                         );
+                        // 记录完整 item
+                        self.completed_items.push(json!({
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": self.current_tool_id,
+                            "name": self.current_tool_name,
+                            "arguments": args
+                        }));
                         self.current_block = None;
                         self.current_text.clear();
                         let joined = args_done.iter().chain(item_done.iter()).copied().collect::<Vec<u8>>();
@@ -532,6 +637,11 @@ impl ResponsesRenderState {
                 stop_reason,
                 usage,
             } => {
+                // 暂存 stop_reason（finalize 时决定 status/incomplete_details）；
+                // usage 由 forward.rs 累积后传入 finalize
+                if let Some(sr) = stop_reason {
+                    self.last_stop_reason = Some(*sr);
+                }
                 // 延迟到 finalize
                 None
             }
@@ -560,6 +670,7 @@ impl ResponsesRenderState {
                         "type": "response.content_part.done",
                         "output_index": output_index,
                         "content_index": self.content_part_index,
+                        "item_id": self.current_item_id,
                         "part": {
                             "type": "output_text",
                             "text": self.current_text
@@ -582,18 +693,29 @@ impl ResponsesRenderState {
                         }
                     }),
                 ));
+                self.completed_items.push(json!({
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": self.current_text, "annotations": []}]
+                }));
             }
             Some(ResponsesBlockKind::Thinking) => {
-                combined.push(mk(
-                    "response.reasoning.done",
-                    json!({
-                        "type": "response.reasoning.done",
-                        "output_index": output_index,
-                        "reasoning": {
-                            "summary": []
-                        }
-                    }),
-                ));
+                if self.summary_part_started {
+                    combined.push(mk(
+                        "response.reasoning_summary_part.done",
+                        json!({
+                            "type": "response.reasoning_summary_part.done",
+                            "output_index": output_index,
+                            "summary_index": 0,
+                            "item_id": self.current_item_id,
+                            "part": {
+                                "type": "reasoning_summary_text",
+                                "text": self.current_text
+                            }
+                        }),
+                    ));
+                }
                 combined.push(mk(
                     "response.output_item.done",
                     json!({
@@ -601,10 +723,21 @@ impl ResponsesRenderState {
                         "output_index": output_index,
                         "item": {
                             "type": "reasoning",
+                            "content": [{
+                                "type": "reasoning_text",
+                                "text": self.current_text,
+                                "summary": []
+                            }],
                             "summary": []
                         }
                     }),
                 ));
+                self.completed_items.push(json!({
+                    "type": "reasoning",
+                    "status": "completed",
+                    "content": [{"type": "reasoning_text", "text": self.current_text, "summary": []}],
+                    "summary": []
+                }));
             }
             Some(ResponsesBlockKind::ToolUse) => {
                 combined.push(mk(
@@ -612,6 +745,8 @@ impl ResponsesRenderState {
                     json!({
                         "type": "response.function_call_arguments.done",
                         "output_index": output_index,
+                        "item_id": self.current_item_id,
+                        "name": self.current_tool_name,
                         "arguments": self.current_text
                     }),
                 ));
@@ -628,12 +763,20 @@ impl ResponsesRenderState {
                         }
                     }),
                 ));
+                self.completed_items.push(json!({
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": self.current_tool_id,
+                    "name": self.current_tool_name,
+                    "arguments": self.current_text
+                }));
             }
             None => return None,
         }
 
         self.current_block = None;
         self.current_text.clear();
+        self.summary_part_started = false;
         // 拼接所有事件字节为一个 Bytes
         let joined = combined.iter().flat_map(|b| b.iter().copied()).collect::<Vec<u8>>();
         Some(Bytes::from(joined))
@@ -660,26 +803,39 @@ impl ResponsesRenderState {
             usage.output_chars / 4
         };
 
+        // 截断（max_tokens）时按 Responses 规范标 incomplete
+        let truncated = self.last_stop_reason == Some(IrStopReason::MaxTokens);
+        let status = if truncated { "incomplete" } else { "completed" };
+
+        // output 回填已完成的输出项（官方 response.completed 携带完整 output，
+        // 客户端 SDK 的 get_final_response() 直接消费它）
+        let output = std::mem::take(&mut self.completed_items);
+
+        let mut response_obj = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created,
+            "model": self.model,
+            "status": status,
+            "output": output,
+            "usage": {
+                "input_tokens": usage.input_tokens + usage.cache_read_input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": usage.input_tokens + usage.cache_read_input_tokens + output_tokens,
+                "input_tokens_details": {
+                    "cached_tokens": usage.cache_read_input_tokens
+                }
+            }
+        });
+        if truncated {
+            response_obj["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
+
         events.push(mk(
             "response.completed",
             json!({
                 "type": "response.completed",
-                "response": {
-                    "id": self.response_id,
-                    "object": "response",
-                    "created_at": self.created,
-                    "model": self.model,
-                    "status": "completed",
-                    "output": [],
-                    "usage": {
-                        "input_tokens": usage.input_tokens + usage.cache_read_input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens": usage.input_tokens + usage.cache_read_input_tokens + output_tokens,
-                        "input_tokens_details": {
-                            "cached_tokens": usage.cache_read_input_tokens
-                        }
-                    }
-                }
+                "response": response_obj
             }),
         ));
 
@@ -797,10 +953,40 @@ mod tests {
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_1");
         assert_eq!(input[0]["name"], "search");
-        // function_call_output item
+        // function_call_output item（output 为数组）
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_1");
-        assert_eq!(input[1]["output"], "result text");
+        assert_eq!(input[1]["output"][0]["type"], "output_text");
+        assert_eq!(input[1]["output"][0]["text"], "result text");
+        assert!(input[1].get("is_error").is_none());
+    }
+
+    #[test]
+    fn test_ir_req_to_responses_tool_error_flag() {
+        let req = IrRequest {
+            model: "gpt-4o".to_string(),
+            system: None,
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: IrToolResultContent::Text("boom".to_string()),
+                    is_error: true,
+                }],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            stream: false,
+        };
+        let v = ir_req_to_responses(&req);
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["is_error"], true);
+        assert_eq!(input[0]["output"][0]["text"], "boom");
     }
 
     #[test]
@@ -809,12 +995,16 @@ mod tests {
         let ev = IrStreamEvent::MessageStart {
             id: "resp_123".to_string(),
             model: "gpt-4o".to_string(),
+            usage: Some(IrUsage { input_tokens: 150, cache_read_input_tokens: 80, ..Default::default() }),
         };
         let bytes = state.render_event(&ev).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("event: response.created"));
         assert!(s.contains("\"id\":\"resp_123\""));
         assert!(s.contains("\"model\":\"gpt-4o\""));
+        // usage 渲染（input 侧真实值 + cached_tokens）
+        assert!(s.contains("\"input_tokens\":150"));
+        assert!(s.contains("\"cached_tokens\":80"));
     }
 
     #[test]
@@ -862,8 +1052,46 @@ mod tests {
         };
         let bytes = state.render_event(&ev).unwrap();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("event: response.reasoning.delta"));
+        // 首个 delta 前先发 summary part.added，再发合法的事件
+        assert!(s.contains("event: response.reasoning_summary_part.added"));
+        assert!(s.contains("event: response.reasoning_summary_text.delta"));
         assert!(s.contains("\"delta\":\"thinking...\""));
+    }
+
+    #[test]
+    fn test_render_event_thinking_stop_keeps_text() {
+        let mut state = ResponsesRenderState::new();
+        state.response_id = "resp_1".to_string();
+        state.model = "o1".to_string();
+
+        // 真实事件流：output_item.added(reasoning) 先开 block
+        let start = IrStreamEvent::ContentBlockStart {
+            index: 0,
+            block: IrContentBlockStart::Thinking { signature: None },
+        };
+        assert!(state.render_event(&start).is_some());
+
+        // 累积 thinking 文本
+        let d1 = IrStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: IrContentDelta::ThinkingDelta("step 1".to_string()),
+        };
+        assert!(state.render_event(&d1).is_some());
+        let d2 = IrStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: IrContentDelta::ThinkingDelta(" step 2".to_string()),
+        };
+        assert!(state.render_event(&d2).is_some());
+
+        // 关闭 thinking block：文本应保留在 output_item.done 的 content 中
+        let stop = IrStreamEvent::ContentBlockStop { index: 0 };
+        let bytes = state.render_event(&stop).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("event: response.reasoning_summary_part.done"));
+        assert!(s.contains("event: response.output_item.done"));
+        assert!(s.contains("\"type\":\"reasoning\""));
+        assert!(s.contains("\"text\":\"step 1 step 2\""));
+        assert!(!s.contains("response.reasoning.done"));
     }
 
     #[test]
@@ -939,5 +1167,42 @@ mod tests {
         let events = state.finalize(&usage);
         let s = String::from_utf8_lossy(&events[0]);
         assert!(s.contains("\"output_tokens\":30")); // 120 / 4
+    }
+
+    #[test]
+    fn test_finalize_incomplete_on_max_tokens() {
+        let mut state = ResponsesRenderState::new();
+        state.response_id = "resp_1".to_string();
+        state.model = "gpt-4o".to_string();
+        state.last_stop_reason = Some(IrStopReason::MaxTokens);
+
+        let usage = IrUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        let events = state.finalize(&usage);
+        let s = String::from_utf8_lossy(&events[0]);
+        assert!(s.contains("event: response.completed"));
+        assert!(s.contains("\"status\":\"incomplete\""));
+        assert!(s.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"));
+    }
+
+    #[test]
+    fn test_finalize_completed_on_end_turn() {
+        let mut state = ResponsesRenderState::new();
+        state.response_id = "resp_1".to_string();
+        state.model = "gpt-4o".to_string();
+        state.last_stop_reason = Some(IrStopReason::EndTurn);
+
+        let usage = IrUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        let events = state.finalize(&usage);
+        let s = String::from_utf8_lossy(&events[0]);
+        assert!(s.contains("\"status\":\"completed\""));
+        assert!(!s.contains("incomplete_details"));
     }
 }

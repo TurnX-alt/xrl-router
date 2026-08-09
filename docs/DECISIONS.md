@@ -1123,3 +1123,50 @@ loop {
     // 100ms 轮询 control_rx + sink.empty()
 }
 ```
+
+---
+
+## ADR-026: message_start 携带 usage + 上下文超限预检
+
+**日期**: 2026-08-08  
+**状态**: 已接受  
+**延伸**: ADR-022（自适应超时 + 请求体放宽）
+
+### 背景
+
+长对话场景下客户端（Claude Code）依赖 `message_start` 的 `input_tokens` 判断上下文占用与触发 AutoCompact。网关此前在 IR 渲染端**硬编码 0**：`est_input` 虽已按输入规模估算（handler.rs 注释「translation 路径 message_start 占位用」），但从未真正渲染进 `message_start`——passthrough 路径上游真实 usage 也被丢弃。客户端上下文条失真，AutoCompact 决策缺第一手信息。
+
+另一侧：超长请求（估算输入 > 模型 `context_window`）直接发往上游，白等一轮（可能数分钟）后拿到超限错误，再经 SSE error 事件返回——用户看到「API returned an empty or malformed response (HTTP 200)」的**后半截成因**。
+
+### 决策
+
+1. **IR 层 `MessageStart` 携带 `usage: Option<IrUsage>`**：`from_messages` 带上游真实值（input + cache_read），`from_chat_completions` / `from_responses` 带估算占位（usage 在流末尾才给出）；渲染端（`to_messages` / `to_responses`）输出真实值，缺失时兜底 0
+2. **上下文超限预检**：`route.rs` 的 `ResolvedRoute` 增补 `context_window`（读 `models.context_window` 列），`stream.rs` 路由解析后比对 `est_input > context_window` → 400 `invalid_request_error`（不发上游）
+3. **README 交代仅流式语义**：客户端回退非流式重试会看到该报错，属设计使然
+
+### 原因
+
+1. **usage 是网关能提供给客户端的最关键决策输入**：AutoCompact / 上下文条 / prompt-cache 显示全部依赖它。估算口径（chars/4）保守，真实 token 通常 ≤ 估算，误杀概率低
+2. **预检放同步段**：路由解析（~1ms）后立即判断，与 WebSearch 劫持同位置；成本是一次内存比较
+3. **上游真实值优先**：passthrough 路径 `message_start` 自带真实 usage，直接透传比估算更准
+
+### 代价
+
+- 估算与真实值有偏差（尤其多模态 base64 图片，字符数高估 token），预检可能误拒「实际不超限」的请求——可接受，客户端重试成本低
+- `MessageStart` 事件签名变更，影响 5 处测试构造点（已同步更新）
+
+### 实现
+
+```rust
+// ir/types.rs
+MessageStart { id, model, usage: Option<IrUsage> }
+
+// route.rs
+ResolvedRoute { ..., context_window: usize }
+
+// stream.rs（路由解析后）
+if max_input > 0 && est_input as usize > max_input {
+    return Err((StatusCode::BAD_REQUEST, HeaderMap::new(),
+        Json(json!({"error": {"type": "invalid_request_error", "message": ...}}))));
+}
+```

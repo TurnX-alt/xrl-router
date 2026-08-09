@@ -349,12 +349,13 @@ mod tests {
             axum::serve(listener_a, router_a).await.unwrap();
         });
 
-        // 假上游 B：200 SSE 流
+        // 假上游 B：200 SSE 流（合法 JSON chunk + [DONE]）
         let router_b = axum::Router::new().route(
             "/v1/chat/completions",
             post(|| async {
                 let s = stream::iter(vec![
-                    Ok::<_, Infallible>(Event::default().data("hello from B")),
+                    Ok::<_, Infallible>(Event::default().data(r#"{"id":"chatcmpl-b","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello from B"},"finish_reason":null}]}"#)),
+                    Ok::<_, Infallible>(Event::default().data(r#"{"id":"chatcmpl-b","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#)),
                     Ok::<_, Infallible>(Event::default().data("[DONE]")),
                 ]);
                 Sse::new(s).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(60)))
@@ -471,11 +472,13 @@ mod tests {
         let text = resp.text().await.unwrap();
         assert!(text.contains("hello from B"), "响应应来自备选 provider B: {}", text);
 
-        // 开关关：主 provider A 的 500 直接透传（同时清掉冷却表，避免残留干扰）
+        // 开关关：主 provider A 的 500 → SSE error event（HTTP 200 表达，状态码无法中途改写）
         db.set_setting("failover_enabled", "false").unwrap();
         state.failover_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
         state.provider_cooldowns.write().unwrap().clear();
         let resp = send().send().await.unwrap();
-        assert_eq!(resp.status(), 500, "failover 关闭时 5xx 应透传");
+        assert_eq!(resp.status(), 200, "failover 关闭时 5xx 以 SSE error event 表达（HTTP 200）");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("error"), "应包含 error event: {}", text);
     }
 }

@@ -13,6 +13,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tracing::warn;
 
 use crate::gateway::server::AppState;
 
@@ -146,6 +147,28 @@ pub(super) async fn run_websearch_loop(
         .await;
 
         if let Err((err_type, msg)) = outcome {
+            // 劫持失败也记录 usage_log（此前只记成功，失败完全不可见）
+            let _ = state.database.insert_usage_log(
+                chrono::Utc::now().timestamp(),
+                &resolved.provider_id,
+                resolved.provider_name.as_str(),
+                &resolved.model_row_id,
+                &model_display_name,
+                Some(&picked.id),
+                picked.name.as_str(),
+                picked.key_masked.as_str(),
+                Some(service_key.id.as_str()),
+                service_key.name.as_str(),
+                service_key.key_masked.as_str(),
+                match client_format {
+                    ClientFormat::Messages => "/v1/messages",
+                    ClientFormat::ChatCompletions => "/v1/chat/completions",
+                    ClientFormat::Responses => "/v1/responses",
+                },
+                0, 0, 0, false,
+                Some(&format!("websearch hijack: {}: {}", err_type, msg)),
+                0,
+            );
             send_error_event(&tx, client_format, &err_type, &msg);
             return;
         }
@@ -211,7 +234,9 @@ async fn hijack_upstream(
     // 构建对话消息（可变，每轮追加 tool_result）
     let mut messages = ir_request.messages.clone();
 
+    let mut loop_count = 0u32;
     for _ in 0..5 {
+        loop_count += 1;
         // 从 IR 生成上游请求体
         let mut req_body = match provider_kind {
             "messages" => ir::to_messages::ir_req_to_messages(ir_request),
@@ -238,11 +263,81 @@ async fn hijack_upstream(
                 req_body["max_tokens"] = json!(max_tokens);
             }
             "responses" => {
-                // Responses 格式较复杂，简化处理
+                // Responses 格式：替换 input 为当前对话状态。
+                // function_call / function_call_output 必须是 input 数组的独立 item，
+                // 不能嵌在 message content 里。
                 req_body["stream"] = json!(false);
                 if let Some(mt) = req_body.get_mut("max_output_tokens") {
                     *mt = json!(max_tokens);
                 }
+                let mut input: Vec<Value> = Vec::new();
+                for m in &messages {
+                    let role = match m.role {
+                        IrRole::User => "user",
+                        IrRole::Assistant => "assistant",
+                    };
+                    let mut text_parts: Vec<Value> = Vec::new();
+                    let mut function_calls: Vec<Value> = Vec::new();
+                    let mut function_outputs: Vec<Value> = Vec::new();
+                    for block in &m.content {
+                        match block {
+                            IrContentBlock::Text { text, .. } => {
+                                text_parts.push(json!({"type": "input_text", "text": text}));
+                            }
+                            IrContentBlock::Thinking { thinking, .. } => {
+                                text_parts.push(json!({"type": "reasoning", "text": thinking}));
+                            }
+                            IrContentBlock::ToolUse { id, name, input } => {
+                                function_calls.push(json!({
+                                    "type": "function_call",
+                                    "call_id": id,
+                                    "name": name,
+                                    "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
+                                }));
+                            }
+                            IrContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => {
+                                let output = match content {
+                                    IrToolResultContent::Text(t) => t.clone(),
+                                    IrToolResultContent::Blocks(blocks) => blocks
+                                        .iter()
+                                        .filter_map(|b| {
+                                            if let IrContentBlock::Text { text, .. } = b {
+                                                Some(text.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                };
+                                let mut obj = json!({
+                                    "type": "function_call_output",
+                                    "call_id": tool_use_id,
+                                    "output": [{"type": "input_text", "text": output}]
+                                });
+                                if *is_error {
+                                    obj["output"] = json!([{"type": "input_text", "text": format!("ERROR: {}", output)}]);
+                                }
+                                function_outputs.push(obj);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !text_parts.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": role,
+                            "content": text_parts
+                        }));
+                    }
+                    input.extend(function_calls);
+                    input.extend(function_outputs);
+                }
+                req_body["input"] = json!(input);
             }
             _ => {
                 let msgs: Vec<Value> = ir_messages_to_chat_completions_value(&messages);
@@ -252,22 +347,35 @@ async fn hijack_upstream(
             }
         }
 
-        // 发送请求
-        let mut req_builder = client.post(upstream_url);
-        if provider_kind == "messages" {
-            req_builder = req_builder
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-        }
+        let mut resp = None;
+        for attempt in 0..3 {
+            let mut req_builder = client.post(upstream_url);
+            if provider_kind == "messages" {
+                req_builder = req_builder
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01");
+            } else {
+                req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+            }
 
-        let resp = req_builder
-            .header("Content-Type", "application/json")
-            .json(&req_body)
-            .send()
-            .await
-            .map_err(|e| ("api_error".to_string(), e.to_string()))?;
+            let r = req_builder
+                .header("Content-Type", "application/json")
+                .json(&req_body)
+                .send()
+                .await
+                .map_err(|e| ("api_error".to_string(), e.to_string()))?;
+
+            let status = r.status().as_u16();
+            update_key_health(pool, provider_id, api_key, status);
+            // 5xx 瞬时故障：重试至多 3 次（无固定间隔，等上游恢复）
+            if status >= 500 && attempt < 2 {
+                warn!("websearch hijack upstream {} (5xx), retrying", status);
+                continue;
+            }
+            resp = Some(r);
+            break;
+        }
+        let resp = resp.unwrap();
 
         let status = resp.status().as_u16();
         let msg_val: Value = resp
@@ -276,14 +384,12 @@ async fn hijack_upstream(
             .map_err(|e| ("api_error".to_string(), e.to_string()))?;
 
         if status >= 400 {
-            update_key_health(pool, provider_id, api_key, status);
             let msg = msg_val["error"]["message"]
                 .as_str()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("upstream error {}", status));
             return Err(("api_error".to_string(), msg));
         }
-        update_key_health(pool, provider_id, api_key, status);
 
         // 解析上游响应为 IR content blocks
         let (content_blocks, stop_reason, usage) = match provider_kind {
@@ -356,6 +462,13 @@ async fn hijack_upstream(
             role: IrRole::User,
             content: tool_results,
         });
+
+        // 轮数上限 2：每轮 = 上游往返 + Bing 搜索，多轮会拖到 40s+，
+        // 撞上 Claude Code 的搜索超时窗口。第 2 轮结束都返回当前累积结果，
+        // 保证响应速度。
+        if loop_count >= 2 {
+            break;
+        }
     }
 
     Ok(())
@@ -516,10 +629,20 @@ fn parse_responses_response(msg: &Value) -> (Vec<IrContentBlock>, IrStopReason, 
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("completed");
-    let stop = match status {
-        "completed" => IrStopReason::EndTurn,
-        "incomplete" => IrStopReason::MaxTokens,
-        _ => IrStopReason::EndTurn,
+    // Responses API 没有显式 stop_reason：有 function_call 输出 → ToolUse，
+    // status=incomplete → MaxTokens，否则 EndTurn。
+    let has_function_call = msg
+        .get("output")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().any(|item| item["type"].as_str() == Some("function_call")))
+        .unwrap_or(false);
+    let stop = if has_function_call {
+        IrStopReason::ToolUse
+    } else {
+        match status {
+            "incomplete" => IrStopReason::MaxTokens,
+            _ => IrStopReason::EndTurn,
+        }
     };
 
     let usage = ir::usage::extract_responses_usage(msg);
@@ -588,14 +711,18 @@ fn ir_messages_to_chat_completions_value(messages: &[IrMessage]) -> Vec<Value> {
         let mut tool_calls: Vec<Value> = vec![];
         let mut reasoning_content: Option<String> = None;
         let mut tool_results: Vec<(String, String)> = vec![];
+        // 是否渲染过任何内容块（纯 tool_result 的消息不产生空 user 消息）
+        let mut rendered_any = false;
 
         for block in &msg.content {
             match block {
-                IrContentBlock::Text { text, .. } => text_parts.push(text.clone()),
+                IrContentBlock::Text { text, .. } => { text_parts.push(text.clone()); rendered_any = true; }
                 IrContentBlock::Thinking { thinking, .. } => {
-                    reasoning_content = Some(thinking.clone())
+                    reasoning_content = Some(thinking.clone());
+                    rendered_any = true;
                 }
                 IrContentBlock::ToolUse { id, name, input } => {
+                    rendered_any = true;
                     tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -639,8 +766,8 @@ fn ir_messages_to_chat_completions_value(messages: &[IrMessage]) -> Vec<Value> {
             }));
         }
 
-        // 普通消息
-        if !text_parts.is_empty() || !tool_calls.is_empty() || reasoning_content.is_some() {
+        // 普通消息（纯 tool_result 的消息已被 tool role 消息替代，不产生空 user 消息）
+        if rendered_any {
             let mut msg_obj = json!({"role": role});
             if !text_parts.is_empty() {
                 msg_obj["content"] = json!(text_parts.join("\n"));
@@ -672,15 +799,25 @@ fn render_accumulated_ir(
 ) -> Vec<Bytes> {
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
+    // 过滤中间轮次的 tool_use/tool_result，只向客户端输出最终内容。
+    // web_search 劫持对客户端是透明的：客户端发起的 web_search 调用在
+    // 网关内部完成，不该把工具调用块回传给客户端（客户端无法识别
+    // web_search_tool_result 特殊块，会报 malformed response）。
+    let final_content: Vec<IrContentBlock> = content
+        .iter()
+        .filter(|b| matches!(b, IrContentBlock::Text { .. } | IrContentBlock::Thinking { .. }))
+        .cloned()
+        .collect();
+
     match client_format {
         ClientFormat::Messages => {
-            render_anthropic_sse(&msg_id, content, stop_reason, usage)
+            render_anthropic_sse(&msg_id, &final_content, stop_reason, usage)
         }
         ClientFormat::ChatCompletions => {
-            render_chat_sse(&msg_id, content, stop_reason, usage)
+            render_chat_sse(&msg_id, &final_content, stop_reason, usage)
         }
         ClientFormat::Responses => {
-            render_responses_sse(&msg_id, content, stop_reason, usage)
+            render_responses_sse(&msg_id, &final_content, stop_reason, usage)
         }
     }
 }
@@ -895,6 +1032,46 @@ fn render_responses_sse(
                     "item": {}
                 })));
             }
+            IrContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                // web_search_tool_result → function_call_output item
+                let output = match content {
+                    IrToolResultContent::Text(t) => t.clone(),
+                    IrToolResultContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let IrContentBlock::Text { text, .. } = b {
+                                Some(text.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                // 规范结构：output 是 content parts 数组（input_text），错误时 is_error: true
+                let mut item = json!({
+                    "type": "function_call_output",
+                    "call_id": tool_use_id,
+                    "output": [{"type": "input_text", "text": output}]
+                });
+                if *is_error {
+                    item["output"] = json!([{"type": "input_text", "text": format!("ERROR: {}", output)}]);
+                }
+                out.push(mk("response.output_item.added", json!({
+                    "type": "response.output_item.added",
+                    "output_index": i,
+                    "item": item
+                })));
+                out.push(mk("response.output_item.done", json!({
+                    "type": "response.output_item.done",
+                    "output_index": i,
+                    "item": {}
+                })));
+            }
             _ => {}
         }
     }
@@ -920,4 +1097,49 @@ fn render_responses_sse(
         }
     })));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_responses_stop_reason_function_call() {
+        // Responses 输出含 function_call → ToolUse（websearch loop 需要继续）
+        let msg = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [{
+                "id": "fc_1", "type": "function_call", "call_id": "fc_1",
+                "name": "web_search", "arguments": "{\"query\":\"测试\"}"
+            }]
+        });
+        let (content, stop, _) = parse_responses_response(&msg);
+        assert_eq!(stop, IrStopReason::ToolUse);
+        assert!(content.iter().any(|b| matches!(b, IrContentBlock::ToolUse { name, .. } if name == "web_search")));
+    }
+
+    #[test]
+    fn test_parse_responses_stop_reason_text() {
+        // 纯文本输出 → EndTurn
+        let msg = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [{
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "结果是晴天"}]
+            }]
+        });
+        let (content, stop, _) = parse_responses_response(&msg);
+        assert_eq!(stop, IrStopReason::EndTurn);
+        assert!(content.iter().any(|b| matches!(b, IrContentBlock::Text { text, .. } if text == "结果是晴天")));
+    }
+
+    #[test]
+    fn test_parse_responses_stop_reason_incomplete() {
+        let msg = json!({"id": "resp_1", "status": "incomplete", "output": []});
+        let (_, stop, _) = parse_responses_response(&msg);
+        assert_eq!(stop, IrStopReason::MaxTokens);
+    }
 }

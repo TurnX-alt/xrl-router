@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Key health status (traffic light pattern from wukong-penetrate)
+/// Key health status (traffic light pattern)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyStatus {

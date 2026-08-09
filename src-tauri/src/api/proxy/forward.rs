@@ -129,7 +129,7 @@ pub(super) async fn forward_stream_ir(
                         ir::from_responses::responses_chunk_to_ir(&chunk_json, &mut responses_parse)
                     }
                     _ => {
-                        // "chat_completions" / "deap" / "custom" 都当 Chat Completions 处理
+                        // ChatCompletions 兼容的所有上游格式统一按 Chat Completions 解析
                         ir::from_chat_completions::chat_completions_chunk_to_ir(&chunk_json, &mut chat_parse)
                     }
                 };

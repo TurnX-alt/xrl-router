@@ -131,7 +131,26 @@ pub async fn proxy_stream(
         }
     };
 
-    // ── 2. WebSearch 劫持（同步段，纯内存判断） ─────────────────────
+    // ── 2. 上下文超限预检（同步段，纯内存判断） ────────────────────
+    // 估算输入 token 超过模型 context_window 时提前拒绝，避免发上游
+    // 白等一轮后拿到超限错误。估算口径保守（chars/4），多数情况下
+    // 真实 token 数 ≤ 估算，误杀概率低。
+    let est_input = ctx.est_input;
+    let max_input = candidates.iter().map(|c| c.context_window).max().unwrap_or(0);
+    if max_input > 0 && est_input as usize > max_input {
+        let msg = format!(
+            "estimated input tokens ({}) exceed context window ({}) of model '{}'",
+            est_input, max_input, model_name
+        );
+        warn!(trace_id = %trace_id, est_input, max_input, "{}", msg);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            Json(json!({"error": {"type": "invalid_request_error", "message": msg}})),
+        ));
+    }
+
+    // ── 3. WebSearch 劫持（同步段，纯内存判断） ─────────────────────
     let resolved = candidates[0].clone();
 
     if state.websearch_hijack.load(std::sync::atomic::Ordering::Relaxed)
@@ -208,6 +227,8 @@ pub async fn proxy_stream(
         // ── 双循环：外层 provider 候选，内层 key 轮换 ─────────────
         let ir_request = ir_request;
         let mut last_resp: Option<reqwest::Response> = None;
+        // 400 时响应体（resp 被 text() 消费后无法保留，body 单独存）
+        let mut last_resp_body: Option<String> = None;
         let mut last_key_id: Option<String> = None;
         let mut last_key_name: Option<String> = None;
         let mut last_key_masked: Option<String> = None;
@@ -222,26 +243,6 @@ pub async fn proxy_stream(
                 continue;
             }
             last_candidate = cand.clone();
-
-            // 根据 provider_kind 从 IR 生成上游请求体
-            let mut attempt_body = match cand.provider_kind.as_str() {
-                "messages" => ir::to_messages::ir_req_to_messages(&ir_request),
-                "responses" => ir::to_responses::ir_req_to_responses(&ir_request),
-                _ => ir::to_chat_completions::ir_req_to_chat_completions(&ir_request),
-            };
-
-            // 注入真实 model ID + stream 选项
-            if let Some(obj) = attempt_body.as_object_mut() {
-                obj.insert("model".to_string(), json!(cand.real_model_id));
-                obj.insert("stream".to_string(), json!(true));
-                // Chat Completions 需要 stream_options 才能拿到 usage
-                if cand.provider_kind != "messages" && cand.provider_kind != "responses" {
-                    obj.insert(
-                        "stream_options".to_string(),
-                        json!({"include_usage": true}),
-                    );
-                }
-            }
 
             let max_attempts = state.keys.get_stats(&cand.provider_id).map(|s| s.total as u32).unwrap_or(1);
             let mut attempts: u32 = 0;
@@ -269,6 +270,23 @@ pub async fn proxy_stream(
                 last_key_masked = Some(picked.key_masked.clone());
                 let key_name = picked.name.clone();
                 let key_masked = picked.key_masked.clone();
+
+                let mut attempt_body = match cand.provider_kind.as_str() {
+                    "messages" => ir::to_messages::ir_req_to_messages(&ir_request),
+                    "responses" => ir::to_responses::ir_req_to_responses(&ir_request),
+                    _ => ir::to_chat_completions::ir_req_to_chat_completions(&ir_request),
+                };
+                if let Some(obj) = attempt_body.as_object_mut() {
+                    obj.insert("model".to_string(), json!(cand.real_model_id));
+                    obj.insert("stream".to_string(), json!(true));
+                    // Chat Completions 需要 stream_options 才能拿到 usage
+                    if cand.provider_kind != "messages" && cand.provider_kind != "responses" {
+                        obj.insert(
+                            "stream_options".to_string(),
+                            json!({"include_usage": true}),
+                        );
+                    }
+                }
 
                 let mut req_builder = client.post(&cand.upstream_url);
                 if cand.provider_kind == "messages" {
@@ -348,6 +366,14 @@ pub async fn proxy_stream(
                 let status = resp.status().as_u16();
                 update_key_health(&state.keys, &cand.provider_id, &picked.key_hash, status);
 
+                // 400：透传给客户端（以 SSE error event 表达）
+                if status == 400 {
+                    let body_str = resp.text().await.unwrap_or_default();
+                    warn!(trace_id = %trace_id, status, upstream_body = %body_str, "upstream 400");
+                    last_resp_body = Some(body_str);
+                    break;
+                }
+
                 if matches!(status, 401 | 402 | 403 | 429) {
                     warn!(trace_id = %trace_id, status, key_id = %picked.id, "upstream rejected key, rotating");
                     last_resp = Some(resp);
@@ -421,7 +447,9 @@ pub async fn proxy_stream(
                             Some(&key_id), key_name.as_str(), key_masked.as_str(),
                             Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
                             endpoint,
-                            0, 0, duration_ms, false, Some(&format!("upstream 5xx: {}", msg)), 0,
+                            0, 0, duration_ms, false,
+                            Some(&format!("upstream 5xx: {} | body: {}", msg, body.chars().take(200).collect::<String>())),
+                            0,
                         );
                         send_error_event(&tx, client_format, "api_error", &msg);
                         return;
@@ -441,7 +469,27 @@ pub async fn proxy_stream(
                         last_key_id.as_deref(), last_key_name.as_deref().unwrap_or(""), last_key_masked.as_deref().unwrap_or(""),
                         Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
                         endpoint,
-                        0, 0, duration_ms, false, Some(&format!("upstream status {}", s)), 0,
+                        0, 0, duration_ms, false,
+                        Some(&format!("upstream status {}: {}", s, body_str.chars().take(200).collect::<String>())),
+                        0,
+                    );
+                    send_error_event(&tx, client_format, "api_error", &msg);
+                    return;
+                }
+                if let Some(body_str) = last_resp_body {
+                    let msg = extract_error_message(&body_str);
+                    let duration_ms = start_time.elapsed().as_millis() as i64;
+                    warn!(trace_id = %trace_id, duration_ms, upstream_body = %body_str, "Upstream 400 forwarded (body-only)");
+                    let _ = state.database.insert_usage_log(
+                        chrono::Utc::now().timestamp(),
+                        &last_candidate.provider_id, last_candidate.provider_name.as_str(),
+                        &last_candidate.model_row_id, model_name.as_str(),
+                        last_key_id.as_deref(), last_key_name.as_deref().unwrap_or(""), last_key_masked.as_deref().unwrap_or(""),
+                        Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
+                        endpoint,
+                        0, 0, duration_ms, false,
+                        Some(&format!("upstream status 400: {}", body_str.chars().take(200).collect::<String>())),
+                        0,
                     );
                     send_error_event(&tx, client_format, "api_error", &msg);
                     return;
@@ -467,7 +515,9 @@ pub async fn proxy_stream(
                 last_key_id.as_deref(), last_key_name.as_deref().unwrap_or(""), last_key_masked.as_deref().unwrap_or(""),
                 Some(service_key.id.as_str()), service_key.name.as_str(), service_key.key_masked.as_str(),
                 endpoint,
-                0, 0, duration_ms, false, Some(&format!("upstream status {}", upstream_status)), 0,
+                0, 0, duration_ms, false,
+                Some(&format!("upstream status {}: {}", upstream_status, body_str.chars().take(200).collect::<String>())),
+                0,
             );
             send_error_event(&tx, client_format, "api_error", &msg);
             return;

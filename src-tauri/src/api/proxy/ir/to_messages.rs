@@ -80,25 +80,27 @@ pub fn ir_req_to_messages(req: &IrRequest) -> Value {
     }
 
     // Thinking config
-    if let Some(ref thinking) = req.thinking {
-        if thinking.enabled {
-            let mut t = json!({"type": "enabled"});
-            if let Some(budget) = thinking.budget_tokens {
-                t["budget_tokens"] = json!(budget);
-            }
-            out["thinking"] = t;
+    let thinking_enabled = req.thinking.as_ref().map(|t| t.enabled).unwrap_or(false);
+    if thinking_enabled {
+        let mut t = json!({"type": "enabled"});
+        if let Some(budget) = req.thinking.as_ref().and_then(|t| t.budget_tokens) {
+            t["budget_tokens"] = json!(budget);
         }
+        out["thinking"] = t;
     }
 
     // Pass through scalar params
     if let Some(max_tokens) = req.max_tokens {
         out["max_tokens"] = json!(max_tokens);
     }
-    if let Some(temperature) = req.temperature {
-        out["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        out["top_p"] = json!(top_p);
+    // Anthropic spec：thinking 与 temperature/top_p 互斥，同时给出会 400
+    if !thinking_enabled {
+        if let Some(temperature) = req.temperature {
+            out["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = req.top_p {
+            out["top_p"] = json!(top_p);
+        }
     }
 
     out
@@ -198,10 +200,17 @@ impl MessagesRenderState {
         };
 
         match ev {
-            IrStreamEvent::MessageStart { id, model } => {
+            IrStreamEvent::MessageStart { id, model, usage } => {
                 self.msg_id = id.clone();
                 self.model = model.clone();
                 self.started = true;
+                // 上游真实 usage（translation 路径为估算值），渲染给客户端
+                // 作上下文条 / prompt-cache 感知；缺失时兜底 0
+                // 客户端口径：input_tokens 含 cache_creation（写缓存 = 首次处理输入）
+                let u = usage.as_ref();
+                let input_tokens = u.map(|u| u.input_tokens).unwrap_or(0);
+                let cache_creation = u.map(|u| u.cache_creation_input_tokens).unwrap_or(0);
+                let cache_read = u.map(|u| u.cache_read_input_tokens).unwrap_or(0);
                 Some(mk(
                     "message_start",
                     json!({
@@ -214,7 +223,12 @@ impl MessagesRenderState {
                             "content": [],
                             "stop_reason": null,
                             "stop_sequence": null,
-                            "usage": {"input_tokens": 0, "output_tokens": 0}
+                            "usage": {
+                                "input_tokens": input_tokens + cache_creation,
+                                "output_tokens": 0,
+                                "cache_creation_input_tokens": cache_creation,
+                                "cache_read_input_tokens": cache_read,
+                            }
                         }
                     }),
                 ))
@@ -222,8 +236,13 @@ impl MessagesRenderState {
             IrStreamEvent::ContentBlockStart { index, block } => {
                 let content_block = match block {
                     IrContentBlockStart::Text => json!({"type": "text", "text": ""}),
-                    IrContentBlockStart::Thinking => {
-                        json!({"type": "thinking", "thinking": ""})
+                    IrContentBlockStart::Thinking { signature } => {
+                        let mut block = json!({"type": "thinking", "thinking": ""});
+                        // Anthropic 流式 spec：thinking 块的 content_block_start 携带 signature
+                        if let Some(sig) = signature {
+                            block["signature"] = json!(sig);
+                        }
+                        block
                     }
                     IrContentBlockStart::ToolUse { id, name } => {
                         json!({"type": "tool_use", "id": id, "name": name, "input": {}})
@@ -374,7 +393,50 @@ mod tests {
         assert_eq!(v["tool_choice"]["type"], "any");
         assert_eq!(v["thinking"]["type"], "enabled");
         assert_eq!(v["thinking"]["budget_tokens"], 5000);
+        // thinking 与 temperature 互斥（Anthropic spec），temperature 被剔除
+        assert!(v.get("temperature").is_none());
+    }
+
+    #[test]
+    fn test_ir_req_to_messages_temperature_without_thinking() {
+        let req = IrRequest {
+            model: "claude".to_string(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: Some(1024),
+            temperature: Some(0.7),
+            top_p: None,
+            thinking: None,
+            stream: true,
+        };
+        let v = ir_req_to_messages(&req);
         assert_eq!(v["temperature"], 0.7);
+    }
+
+    #[test]
+    fn test_ir_req_to_messages_thinking_drops_temperature() {
+        let req = IrRequest {
+            model: "claude".to_string(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: Some(1024),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            thinking: Some(IrThinkingConfig {
+                enabled: true,
+                budget_tokens: Some(5000),
+            }),
+            stream: true,
+        };
+        let v = ir_req_to_messages(&req);
+        // Anthropic spec：thinking 与 temperature/top_p 互斥
+        assert_eq!(v["thinking"]["type"], "enabled");
+        assert!(v.get("temperature").is_none());
+        assert!(v.get("top_p").is_none());
     }
 
     #[test]
@@ -419,12 +481,16 @@ mod tests {
         let ev = IrStreamEvent::MessageStart {
             id: "msg_123".to_string(),
             model: "claude-opus-4-8".to_string(),
+            usage: Some(IrUsage { input_tokens: 150, cache_read_input_tokens: 8000, ..Default::default() }),
         };
         let bytes = state.render_event(&ev).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("event: message_start"));
         assert!(s.contains("\"id\":\"msg_123\""));
         assert!(s.contains("\"model\":\"claude-opus-4-8\""));
+        // usage 渲染（input 侧真实值 + cache_read）
+        assert!(s.contains("\"input_tokens\":150"));
+        assert!(s.contains("\"cache_read_input_tokens\":8000"));
     }
 
     #[test]
@@ -438,6 +504,31 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("event: content_block_start"));
         assert!(s.contains("\"type\":\"text\""));
+    }
+
+    #[test]
+    fn test_render_event_content_block_thinking_signature() {
+        let mut state = MessagesRenderState::new();
+        let ev = IrStreamEvent::ContentBlockStart {
+            index: 0,
+            block: IrContentBlockStart::Thinking {
+                signature: Some("sig_abc123".to_string()),
+            },
+        };
+        let bytes = state.render_event(&ev).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("event: content_block_start"));
+        assert!(s.contains("\"type\":\"thinking\""));
+        assert!(s.contains("\"signature\":\"sig_abc123\""));
+
+        // 无签名时不输出 signature 字段
+        let ev2 = IrStreamEvent::ContentBlockStart {
+            index: 0,
+            block: IrContentBlockStart::Thinking { signature: None },
+        };
+        let bytes2 = state.render_event(&ev2).unwrap();
+        let s2 = String::from_utf8_lossy(&bytes2);
+        assert!(!s2.contains("signature"));
     }
 
     #[test]

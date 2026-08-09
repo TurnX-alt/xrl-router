@@ -164,6 +164,9 @@ pub enum IrStreamEvent {
     MessageStart {
         id: String,
         model: String,
+        /// 输入侧 token 用量（message_start 占位）：上游真实值或本地估算值，
+        /// 供客户端上下文条与 prompt-cache 感知。缺失/未知时为空（渲染为 0）。
+        usage: Option<IrUsage>,
     },
     ContentBlockStart {
         index: usize,
@@ -187,7 +190,10 @@ pub enum IrStreamEvent {
 #[derive(Debug, Clone)]
 pub enum IrContentBlockStart {
     Text,
-    Thinking,
+    Thinking {
+        /// thinking 块的签名（Anthropic 流式 content_block_start 携带，客户端做连续性校验）。
+        signature: Option<String>,
+    },
     ToolUse { id: String, name: String },
 }
 
@@ -253,12 +259,13 @@ impl IrStopReason {
 /// 统一 token usage — 覆盖三种格式的所有 token 字段。
 #[derive(Debug, Clone, Default)]
 pub struct IrUsage {
-    /// 未缓存输入 token + 首次写缓存 token（写缓存 = 首次处理输入）。
+    /// 未缓存输入 token（纯 miss，不含 cache_creation）。
+    /// 渲染回 Anthropic 客户端时合并 cache_creation（客户端口径 input_tokens 含写缓存）。
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// 缓存命中读取的 token（真正的「缓存」）。
     pub cache_read_input_tokens: u64,
-    /// 写缓存的 token（首次处理输入，并入 input_tokens 计算）。
+    /// 写缓存的 token（首次处理输入，独立存放；渲染时并入 input_tokens）。
     pub cache_creation_input_tokens: u64,
     /// 输出字符数，用于上游未报 token 时的回退估算（chars / 4）。
     pub output_chars: u64,

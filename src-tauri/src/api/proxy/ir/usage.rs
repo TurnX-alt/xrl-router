@@ -9,7 +9,8 @@ use super::types::{IrRequest, IrSystemContent, IrUsage};
 
 /// 从 Anthropic Messages 流式 chunk 提取 usage 增量。
 ///
-/// - `message_start`: input_tokens + cache_creation（写缓存并入输入）+ cache_read
+/// - `message_start`: input_tokens（未缓存口径，cache_creation 单独存放）
+///   + cache_creation + cache_read
 /// - `message_delta`: output_tokens + cache_read
 /// - `content_block_delta`: output_chars（text/thinking 字符数，回退估算用）
 pub fn extract_messages_usage(chunk: &Value) -> IrUsage {
@@ -19,8 +20,7 @@ pub fn extract_messages_usage(chunk: &Value) -> IrUsage {
     match event_type {
         "message_start" => {
             let u = &chunk["message"]["usage"];
-            usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0)
-                + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
             usage.cache_read_input_tokens =
                 u["cache_read_input_tokens"].as_u64().unwrap_or(0);
             usage.cache_creation_input_tokens =
@@ -219,7 +219,7 @@ mod tests {
             }
         });
         let u = extract_messages_usage(&chunk);
-        assert_eq!(u.input_tokens, 1700); // 200 + 1500
+        assert_eq!(u.input_tokens, 200); // 未缓存口径，不含 cache_creation
         assert_eq!(u.cache_read_input_tokens, 8000);
         assert_eq!(u.cache_creation_input_tokens, 1500);
     }

@@ -84,6 +84,10 @@ pnpm build
 
 **自适应超时 + 请求体放宽**：上游响应头超时不再固定 60s，改为按估算输入 token 自适应（≥100k → 600s、≥50k → 480s、基准 300s），对齐 Claude Code 客户端超时，避免大上下文长排队被误判挂死而断流。请求体上限从 axum 默认 2MiB 放宽到 64MiB，覆盖多轮历史 + 工具结果 + base64 截图的多模态大会话。
 
+**上下文超限预检**：请求路由解析后，按估算输入 token（`chars/4`）与模型 `context_window` 比对，超限直接返回 400（`invalid_request_error`），避免发往上游白等一轮。估算为保守口径，真实 token 数通常 ≤ 估算，误杀概率低。
+
+> **⚠️ 仅流式 + 客户端回退**：网关只支持流式响应（强制 `stream=true`）。若客户端在流中断后回退为**非流式重试**（例如把 SSE 响应误当成普通 JSON 解析），会看到类似 `API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request` 的报错——这是设计使然（网关对无法恢复的中断以 HTTP 200 + SSE error 事件表达，状态码无法中途改写），并非网络被劫持。遇到此报错请检查上游日志与客户端超时配置。
+
 客户端消费端配置见 [接入 CC Switch](#接入-cc-switch)。
 
 ### 密钥池
