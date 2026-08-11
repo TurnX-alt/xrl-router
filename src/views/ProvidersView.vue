@@ -3,7 +3,7 @@
     <div class="page__header">
       <h2 class="md-typescale-headline-medium page__title">{{ t('providers.title') }}</h2>
       <md-filled-button @click="$router.push('/providers/new')">
-        <MdiIcon icon="plus" slot="icon" />
+        <MdiIcon :path="mdiPlus" slot="icon" />
         {{ t('providers.add') }}
       </md-filled-button>
     </div>
@@ -13,7 +13,7 @@
     </div>
 
     <div v-else-if="!providers.length" class="empty-state">
-      <MdiIcon icon="inbox-outline" class="empty-state__icon" />
+      <MdiIcon :path="mdiInboxOutline" class="empty-state__icon" />
       <p class="md-typescale-body-large">{{ t('common.empty') }}</p>
     </div>
 
@@ -25,7 +25,7 @@
         class="card"
         :data-id="p.id"
       >
-        <MdiIcon icon="drag-horizontal-variant" class="card__drag" :title="t('providers.drag_tip')" />
+        <MdiIcon :path="mdiDragHorizontalVariant" class="card__drag" :title="t('providers.drag_tip')" />
         <span class="card__avatar" :class="avatarClass(p)">
             <!-- Official Anthropic logo from simple-icons -->
             <svg v-if="p.kind === 'messages'" viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
@@ -57,7 +57,7 @@
             class="card__more-btn"
             @click="toggleMenu(p)"
           >
-            <MdiIcon icon="dots-vertical" />
+            <MdiIcon :path="mdiDotsVertical" />
           </md-icon-button>
         </div>
       </article>
@@ -72,10 +72,10 @@
       @closed="menuOpen = null"
     >
       <md-menu-item @click="editFromMenu">
-        <MdiIcon icon="pencil-outline" /> {{ t('common.edit') }}
+        <MdiIcon :path="mdiPencilOutline" /> {{ t('common.edit') }}
       </md-menu-item>
       <md-menu-item class="menu-item--danger" @click="deleteFromMenu">
-        <MdiIcon icon="delete-outline" /> {{ t('common.delete') }}
+        <MdiIcon :path="mdiDeleteOutline" /> {{ t('common.delete') }}
       </md-menu-item>
     </md-menu>
 
@@ -94,9 +94,17 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue';
+import '@material/web/iconbutton/icon-button.js';
+import '@material/web/menu/menu.js';
+import '@material/web/menu/menu-item.js';
+import '@material/web/progress/circular-progress.js';
 import { useRouter } from 'vue-router';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import Sortable from 'sortablejs';
+import {
+  mdiPlus, mdiInboxOutline, mdiDragHorizontalVariant, mdiDotsVertical,
+  mdiPencilOutline, mdiDeleteOutline,
+} from '@mdi/js';
 import { providersApi, keysApi, type Provider } from '../api';
 import { wsClient } from '../ws';
 import { useProviderStore } from '../stores/providers';

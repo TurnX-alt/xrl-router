@@ -8,7 +8,7 @@
     >
       <MdiIcon
         class="fm-toggle__icon"
-        :icon="fmState.playing ? 'pause' : 'play'"
+        :path="fmState.playing ? mdiPause : mdiPlay"
       />
     </button>
     <div class="fm-caption">{{ caption }}</div>
@@ -21,6 +21,7 @@
 // 本组件只读共享状态、转发交互；路由切换（组件卸载）不影响播放。
 // 底部等宽字体展示「歌手 - 歌曲名」（由后端 fm-meta 事件驱动更新）。
 import { computed } from 'vue';
+import { mdiPause, mdiPlay } from '@mdi/js';
 import { t } from '../i18n';
 import { fmState, fmPlayer } from '../fm/player';
 import MdiIcon from '../components/MdiIcon.vue';

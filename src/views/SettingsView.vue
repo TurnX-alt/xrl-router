@@ -6,11 +6,11 @@
 
     <md-tabs>
       <md-secondary-tab @click="activeTab = 0" :aria-selected="activeTab === 0"
-        ><MdiIcon icon="cog-outline" class="tab-icon" /> {{ t('settings.tab.general') }}</md-secondary-tab>
+        ><MdiIcon :path="mdiCogOutline" class="tab-icon" /> {{ t('settings.tab.general') }}</md-secondary-tab>
       <md-secondary-tab @click="activeTab = 1" :aria-selected="activeTab === 1"
-        ><MdiIcon icon="directions" class="tab-icon" /> {{ t('settings.tab.routing') }}</md-secondary-tab>
+        ><MdiIcon :path="mdiDirections" class="tab-icon" /> {{ t('settings.tab.routing') }}</md-secondary-tab>
       <md-secondary-tab @click="activeTab = 2" :aria-selected="activeTab === 2"
-        ><MdiIcon icon="database-outline" class="tab-icon" /> {{ t('settings.tab.data') }}</md-secondary-tab>
+        ><MdiIcon :path="mdiDatabaseOutline" class="tab-icon" /> {{ t('settings.tab.data') }}</md-secondary-tab>
     </md-tabs>
 
     <!-- ========== 通用 TAB ========== -->
@@ -18,12 +18,12 @@
       <!-- 关于 -->
       <section class="card section">
         <div class="section__head">
-          <span class="section__icon"><MdiIcon icon="information-outline" /></span>
+          <span class="section__icon"><MdiIcon :path="mdiInformationOutline" /></span>
           <div>
             <h3 class="md-typescale-title-medium">{{ t('settings.about.title', { version: appVersion }) }}</h3>
             <p class="md-typescale-body-medium section__desc">{{ t('settings.about.desc') }}</p>
             <a class="section__link md-typescale-body-medium" :href="GITHUB_URL" @click.prevent="openExternal">
-              <MdiIcon icon="open-in-new" />
+              <MdiIcon :path="mdiOpenInNew" />
               {{ t('settings.about.github') }}
             </a>
           </div>
@@ -33,7 +33,7 @@
       <!-- 语言 -->
       <section class="card section">
         <div class="section__head">
-          <span class="section__icon"><MdiIcon icon="translate" /></span>
+          <span class="section__icon"><MdiIcon :path="mdiTranslate" /></span>
           <div>
             <h3 class="md-typescale-title-medium">{{ t('settings.language.title') }}</h3>
             <p class="md-typescale-body-medium section__desc">{{ t('settings.language.desc') }}</p>
@@ -62,7 +62,7 @@
       <!-- 外观主题 -->
       <section class="card section">
         <div class="section__head">
-          <span class="section__icon"><MdiIcon icon="palette" /></span>
+          <span class="section__icon"><MdiIcon :path="mdiPalette" /></span>
           <div>
             <h3 class="md-typescale-title-medium">{{ t('settings.theme.title') }}</h3>
             <p class="md-typescale-body-medium section__desc">{{ t('settings.theme.desc') }}</p>
@@ -107,7 +107,7 @@
       <!-- 开机静默启动 -->
       <section class="card section">
         <div class="section__head">
-          <span class="section__icon"><MdiIcon icon="power" /></span>
+          <span class="section__icon"><MdiIcon :path="mdiPower" /></span>
           <div>
             <h3 class="md-typescale-title-medium">{{ t('settings.autostart.title') }}</h3>
             <p class="md-typescale-body-medium section__desc">{{ t('settings.autostart.desc') }}</p>
@@ -124,7 +124,7 @@
     <div v-show="activeTab === 1" class="tab-panel">
       <section class="card section">
         <div class="section__head">
-          <span class="section__icon"><MdiIcon icon="magnify" /></span>
+          <span class="section__icon"><MdiIcon :path="mdiMagnify" /></span>
           <div>
             <h3 class="md-typescale-title-medium">{{ t('settings.websearch.title') }}</h3>
             <p class="md-typescale-body-medium section__desc">{{ t('settings.websearch.desc') }}</p>
@@ -139,7 +139,7 @@
       <!-- 故障转移 -->
       <section class="card section">
         <div class="section__head">
-          <span class="section__icon"><MdiIcon icon="swap-horizontal" /></span>
+          <span class="section__icon"><MdiIcon :path="mdiSwapHorizontal" /></span>
           <div>
             <h3 class="md-typescale-title-medium">{{ t('settings.failover.title') }}</h3>
             <p class="md-typescale-body-medium section__desc">{{ t('settings.failover.desc') }}</p>
@@ -157,7 +157,7 @@
       <!-- 用户数据（导出 / 导入） -->
       <section class="card section">
         <div class="section__head">
-          <span class="section__icon"><MdiIcon icon="database-sync-outline" /></span>
+          <span class="section__icon"><MdiIcon :path="mdiDatabaseSyncOutline" /></span>
           <div>
             <h3 class="md-typescale-title-medium">{{ t('settings.data.title') }}</h3>
             <p class="md-typescale-body-medium section__desc">{{ t('settings.data.desc') }}</p>
@@ -165,11 +165,11 @@
         </div>
         <div class="section__body">
           <md-outlined-button @click="exportData" :disabled="dataBusy">
-            <MdiIcon icon="download" slot="icon" />
+            <MdiIcon :path="mdiDownload" slot="icon" />
             {{ t('settings.data.export.button') }}
           </md-outlined-button>
           <md-outlined-button @click="importData" :disabled="dataBusy">
-            <MdiIcon icon="upload" slot="icon" />
+            <MdiIcon :path="mdiUpload" slot="icon" />
             {{ t('settings.data.import.button') }}
           </md-outlined-button>
         </div>
@@ -178,7 +178,7 @@
       <!-- 重置 -->
       <section class="card section section--danger">
         <div class="section__head">
-          <span class="section__icon"><MdiIcon icon="delete-forever" /></span>
+          <span class="section__icon"><MdiIcon :path="mdiDeleteForever" /></span>
           <div>
             <h3 class="md-typescale-title-medium">{{ t('settings.data.reset.title') }}</h3>
             <p class="md-typescale-body-medium section__desc">{{ t('settings.data.reset.desc') }}</p>
@@ -186,7 +186,7 @@
         </div>
         <div class="section__body">
           <md-outlined-button class="danger-btn" @click="destroyOpen = true">
-            <MdiIcon icon="delete-forever" slot="icon" />
+            <MdiIcon :path="mdiDeleteForever" slot="icon" />
             {{ t('settings.data.reset.button') }}
           </md-outlined-button>
         </div>
@@ -221,8 +221,20 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
+import '@material/web/tabs/tabs.js';
+import '@material/web/tabs/secondary-tab.js';
+import '@material/web/switch/switch.js';
+import '@material/web/button/outlined-button.js';
+import '@material/web/labs/segmentedbutton/outlined-segmented-button.js';
+import '@material/web/labs/segmentedbuttonset/outlined-segmented-button-set.js';
 import { useRouter } from 'vue-router';
 import { getVersion } from '@tauri-apps/api/app';
+import {
+  mdiCogOutline, mdiDirections, mdiDatabaseOutline, mdiInformationOutline,
+  mdiOpenInNew, mdiTranslate, mdiPalette, mdiPower, mdiMagnify,
+  mdiSwapHorizontal, mdiDatabaseSyncOutline, mdiDownload, mdiUpload,
+  mdiDeleteForever,
+} from '@mdi/js';
 import { settingsApi, dataApi } from '../api';
 import { getTheme, setTheme, getHue, setHue, type Theme } from '../theme';
 import { open as openUrl } from '@tauri-apps/plugin-shell';

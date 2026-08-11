@@ -1,28 +1,16 @@
 <script setup lang="ts">
-import { computed } from 'vue';
-import * as mdiIcons from '@mdi/js';
-
-const props = defineProps<{
-  icon: string;  // kebab-case, 不含 mdi- 前缀, e.g. "plus"
+defineProps<{
+  path: string;  // SVG path d 属性，由调用者从 @mdi/js 导入
 }>();
-
-const svgPath = computed(() => {
-  const camel = 'mdi' + props.icon
-    .split('-')
-    .map(s => s[0].toUpperCase() + s.slice(1))
-    .join('');
-  return (mdiIcons as Record<string, string>)[camel] || '';
-});
 </script>
 
 <template>
   <svg
-    v-if="svgPath"
     xmlns="http://www.w3.org/2000/svg"
     viewBox="0 0 24 24"
     class="mdi-icon"
   >
-    <path :d="svgPath" />
+    <path :d="path" />
   </svg>
 </template>
 

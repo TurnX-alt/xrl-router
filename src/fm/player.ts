@@ -14,8 +14,6 @@
 // - 窗口关闭只隐藏到托盘，音乐同样持续。
 
 import { reactive, readonly, watch } from 'vue';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 
 interface FmMeta { artist: string; title: string; index: number }
 
@@ -36,6 +34,9 @@ export const fmState = readonly(state);
 /** 启动时调用：获取初始状态 + 监听后端事件 */
 async function init() {
   if (!('__TAURI_INTERNALS__' in window)) return;
+
+  const { invoke } = await import('@tauri-apps/api/core');
+  const { listen } = await import('@tauri-apps/api/event');
 
   // 获取初始播放状态
   try {
@@ -71,15 +72,21 @@ async function init() {
 
 // ── 播放控制 ──
 
-function toggle() {
+async function toggle() {
+  if (!('__TAURI_INTERNALS__' in window)) return;
+  const { invoke } = await import('@tauri-apps/api/core');
   invoke('fm_toggle').catch(() => {});
 }
 
-function play() {
+async function play() {
+  if (!('__TAURI_INTERNALS__' in window)) return;
+  const { invoke } = await import('@tauri-apps/api/core');
   invoke('fm_play').catch(() => {});
 }
 
-function pause() {
+async function pause() {
+  if (!('__TAURI_INTERNALS__' in window)) return;
+  const { invoke } = await import('@tauri-apps/api/core');
   invoke('fm_pause').catch(() => {});
 }
 

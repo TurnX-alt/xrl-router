@@ -8,7 +8,7 @@
         :class="{ 'nav-item--active': isActive(item.path) }"
         @click="navigateTo(item.path)"
       >
-        <span class="nav-item__icon"><MdiIcon :icon="item.icon" /></span>
+        <span class="nav-item__icon"><MdiIcon :path="item.icon" /></span>
         <span class="nav-label">{{ t(item.labelKey) }}</span>
       </button>
     </nav>
@@ -21,6 +21,7 @@
 
 <script setup lang="ts">
 import { useRouter, useRoute } from 'vue-router';
+import { mdiRadio, mdiCloud, mdiKey, mdiChartBar, mdiCog } from '@mdi/js';
 import { t } from '../i18n';
 import MdiIcon from './MdiIcon.vue';
 
@@ -28,11 +29,11 @@ const router = useRouter();
 const route = useRoute();
 
 const navItems: { path: string; labelKey: string; icon: string }[] = [
-  { path: '/fm', labelKey: 'nav.fm', icon: 'radio' },
-  { path: '/providers', labelKey: 'nav.providers', icon: 'cloud' },
-  { path: '/keys', labelKey: 'nav.keys', icon: 'key' },
-  { path: '/stats', labelKey: 'nav.stats', icon: 'chart-bar' },
-  { path: '/settings', labelKey: 'nav.settings', icon: 'cog' },
+  { path: '/fm', labelKey: 'nav.fm', icon: mdiRadio },
+  { path: '/providers', labelKey: 'nav.providers', icon: mdiCloud },
+  { path: '/keys', labelKey: 'nav.keys', icon: mdiKey },
+  { path: '/stats', labelKey: 'nav.stats', icon: mdiChartBar },
+  { path: '/settings', labelKey: 'nav.settings', icon: mdiCog },
 ];
 
 function isActive(path: string) {

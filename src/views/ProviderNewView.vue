@@ -55,7 +55,7 @@
     ></md-outlined-text-field>
 
     <div v-if="isPluginMode && pluginInfo && pluginInfo.key_count > 0" class="keys-info">
-      <MdiIcon icon="key" />
+      <MdiIcon :path="mdiKey" />
       {{ t('providerNew.keys_synced', { count: pluginInfo.key_count }) }}
     </div>
 
@@ -70,7 +70,11 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
+import '@material/web/textfield/outlined-text-field.js';
+import '@material/web/select/outlined-select.js';
+import '@material/web/select/select-option.js';
 import { useRouter, useRoute } from 'vue-router';
+import { mdiKey } from '@mdi/js';
 import { providersApi, keysApi, modelsApi } from '../api';
 import { t } from '../i18n';
 import MdiIcon from '../components/MdiIcon.vue';

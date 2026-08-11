@@ -4,14 +4,14 @@
       <h2 class="md-typescale-headline-medium page__title">{{ t('stats.title') }}</h2>
       <div class="date-picker">
         <button class="date-btn" id="date-btn" @click="showPicker = true">
-          <MdiIcon :icon="rangeIcon" />
+          <MdiIcon :path="rangeIcon" />
           {{ rangeLabel }}
         </button>
         <md-menu :open="showPicker" anchor="date-btn" positioning="fixed" @closed="showPicker = false">
-          <md-menu-item @click="setRange('today')"><MdiIcon icon="calendar-today" /> {{ t('stats.range.today') }}</md-menu-item>
-          <md-menu-item @click="setRange('1d')"><MdiIcon icon="calendar-range" /> {{ t('stats.range.1d') }}</md-menu-item>
-          <md-menu-item @click="setRange('7d')"><MdiIcon icon="calendar-week" /> {{ t('stats.range.7d') }}</md-menu-item>
-          <md-menu-item @click="setRange('30d')"><MdiIcon icon="calendar-month" /> {{ t('stats.range.30d') }}</md-menu-item>
+          <md-menu-item @click="setRange('today')"><MdiIcon :path="mdiCalendarToday" /> {{ t('stats.range.today') }}</md-menu-item>
+          <md-menu-item @click="setRange('1d')"><MdiIcon :path="mdiCalendarRange" /> {{ t('stats.range.1d') }}</md-menu-item>
+          <md-menu-item @click="setRange('7d')"><MdiIcon :path="mdiCalendarWeek" /> {{ t('stats.range.7d') }}</md-menu-item>
+          <md-menu-item @click="setRange('30d')"><MdiIcon :path="mdiCalendarMonth" /> {{ t('stats.range.30d') }}</md-menu-item>
         </md-menu>
       </div>
     </div>
@@ -19,7 +19,7 @@
     <!-- 数据磁贴 -->
     <div class="tiles">
       <div class="tile tile--wide">
-        <div class="tile__icon"><MdiIcon icon="counter" /></div>
+        <div class="tile__icon"><MdiIcon :path="mdiCounter" /></div>
         <div class="tile__content">
           <div class="tile__label">{{ t('stats.tile.total_tokens') }}</div>
           <div class="tile__value tile__value--big">
@@ -28,42 +28,42 @@
         </div>
       </div>
       <div class="tile">
-        <div class="tile__icon"><MdiIcon icon="star" /></div>
+        <div class="tile__icon"><MdiIcon :path="mdiStar" /></div>
         <div class="tile__content">
           <div class="tile__label">{{ t('stats.tile.top_model') }}</div>
           <div class="tile__value">{{ topModelName }}</div>
         </div>
       </div>
       <div class="tile">
-        <div class="tile__icon"><MdiIcon icon="api" /></div>
+        <div class="tile__icon"><MdiIcon :path="mdiApi" /></div>
         <div class="tile__content">
           <div class="tile__label">{{ t('stats.tile.total_requests') }}</div>
           <div class="tile__value">{{ formatTokens(animTotalRequests) }}</div>
         </div>
       </div>
       <div class="tile">
-        <div class="tile__icon"><MdiIcon icon="arrow-down-bold" /></div>
+        <div class="tile__icon"><MdiIcon :path="mdiArrowDownBold" /></div>
         <div class="tile__content">
           <div class="tile__label">{{ t('stats.tile.input_tokens') }}</div>
           <div class="tile__value">{{ formatTokensAuto(animTotalInputTokens) }}</div>
         </div>
       </div>
       <div class="tile">
-        <div class="tile__icon"><MdiIcon icon="arrow-up-bold" /></div>
+        <div class="tile__icon"><MdiIcon :path="mdiArrowUpBold" /></div>
         <div class="tile__content">
           <div class="tile__label">{{ t('stats.tile.output_tokens') }}</div>
           <div class="tile__value">{{ formatTokensAuto(animTotalOutputTokens) }}</div>
         </div>
       </div>
       <div class="tile">
-        <div class="tile__icon"><MdiIcon icon="database-search" /></div>
+        <div class="tile__icon"><MdiIcon :path="mdiDatabaseSearch" /></div>
         <div class="tile__content">
           <div class="tile__label">{{ t('stats.tile.cache_tokens') }}</div>
           <div class="tile__value">{{ formatTokensAuto(animTotalCacheTokens) }}</div>
         </div>
       </div>
       <div class="tile">
-        <div class="tile__icon"><MdiIcon icon="percent" /></div>
+        <div class="tile__icon"><MdiIcon :path="mdiPercent" /></div>
         <div class="tile__content">
           <div class="tile__label">{{ t('stats.tile.cache_hit_rate') }}</div>
           <div class="tile__value">{{ animCacheHitRate }}%</div>
@@ -88,7 +88,7 @@
       </div>
 
       <div v-if="!logRows.length" class="empty-state">
-        <MdiIcon icon="inbox-outline" class="empty-state__icon" />
+        <MdiIcon :path="mdiInboxOutline" class="empty-state__icon" />
         <p class="md-typescale-body-large">{{ t('stats.log.empty') }}</p>
       </div>
 
@@ -129,11 +129,11 @@
 
         <div class="pagination">
           <md-outlined-button :disabled="page <= 1" @click="changePage(page - 1)">
-            <MdiIcon icon="chevron-left" slot="icon" />{{ t('stats.log.prev') }}
+            <MdiIcon :path="mdiChevronLeft" slot="icon" />{{ t('stats.log.prev') }}
           </md-outlined-button>
           <span class="page-indicator md-typescale-body-medium">{{ t('stats.log.page', { current: page, total: totalPages }) }}</span>
           <md-outlined-button :disabled="page >= totalPages" @click="changePage(page + 1)">
-            {{ t('stats.log.next') }}<MdiIcon icon="chevron-right" slot="icon" />
+            {{ t('stats.log.next') }}<MdiIcon :path="mdiChevronRight" slot="icon" />
           </md-outlined-button>
         </div>
       </div>
@@ -143,11 +143,19 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
+import '@material/web/menu/menu.js';
+import '@material/web/menu/menu-item.js';
+import '@material/web/button/outlined-button.js';
 import { Line } from 'vue-chartjs';
 import {
   Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement,
   Title, Tooltip, Legend, Filler
 } from 'chart.js';
+import {
+  mdiCalendarToday, mdiCalendarRange, mdiCalendarWeek, mdiCalendarMonth,
+  mdiCounter, mdiStar, mdiApi, mdiArrowDownBold, mdiArrowUpBold,
+  mdiDatabaseSearch, mdiPercent, mdiInboxOutline, mdiChevronLeft, mdiChevronRight,
+} from '@mdi/js';
 import { statsApi, requestLogApi, type RequestLogRow } from '../api';
 import { wsClient } from '../ws';
 import { t } from '../i18n';
@@ -306,10 +314,10 @@ const range = ref<'today' | '1d' | '7d' | '30d'>('today');
 const showPicker = ref(false);
 
 const rangeIcon = computed(() => {
-  if (range.value === 'today') return 'calendar-today';
-  if (range.value === '1d') return 'calendar-range';
-  if (range.value === '7d') return 'calendar-week';
-  return 'calendar-month';
+  if (range.value === 'today') return mdiCalendarToday;
+  if (range.value === '1d') return mdiCalendarRange;
+  if (range.value === '7d') return mdiCalendarWeek;
+  return mdiCalendarMonth;
 });
 
 const rangeLabel = computed(() => {
