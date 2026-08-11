@@ -24,7 +24,7 @@ mod middleware;
 mod models;
 mod plugin;
 mod providers;
-// pub：MCP 搜索服务器（src/bin/mcp_server.rs）复用 SearchHttp / search()
+// pub：websearch 模块复用 SearchHttp / search()
 pub mod search;
 mod types;
 

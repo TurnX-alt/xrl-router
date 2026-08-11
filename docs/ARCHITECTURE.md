@@ -39,9 +39,9 @@ xrl-router 是一个 **Tauri 2 桌面应用**，内部跑着一个 Rust axum HTT
 │  请求入口 → 认证 → 路由解析 → 密钥选取 → 协议转换 → 上游转发 → 流式回传    │
 │                                                                           │
 │       ┌──────────────────────────────────────────────────────────┐        │
-│       │ Anthropic 上游: 透传 + SniffStream                       │        │
-│       │ OpenAI 上游:    IR → Chat Completions / Responses 转换    │        │
-│       │ 插件上游:       插件自行转换，Router 只管密钥轮换          │        │
+│       │ 所有上游: 统一 IR 转发 (forward_stream_ir)               │        │
+│       │   上游字节 → IR 事件 → 客户端 SSE 字节                    │        │
+│       │ 插件上游: 插件自行转换，Router 只管密钥轮换                │        │
 │       └──────────────────────────────────────────────────────────┘        │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
@@ -59,7 +59,7 @@ main.rs
        ├─ http.rs            统一 HTTP 客户端工厂（系统代理自动继承）
        ├─ db/                SQLite 封装
        │    ├─ mod.rs         Database 结构体 + WAL + migrate()
-       │    ├─ schema.rs      MIGRATIONS 数组 (V1→V14)
+       │    ├─ schema.rs      MIGRATIONS 数组 (V1→V15)
        │    ├─ providers.rs   Provider CRUD
        │    ├─ models.rs      Model CRUD
        │    ├─ api_keys.rs    API Key CRUD
@@ -78,16 +78,16 @@ main.rs
             │    ├─ plugin.rs     (插件 REST + WS)
             │    └─ fm.rs         Claude FM 播放引擎 (rodio + souvlaki, std::thread)
             └─ proxy/         LLM 代理核心
-                 ├─ handler.rs     薄入口层: 认证 + 请求体准备 (~250 行)
-                 ├─ stream.rs      流式引擎核心: 路由解析 → 立即返回 Response → 后台 spawn 双循环 (~550 行)
-                 ├─ forward.rs     流式转发分支: passthrough / O→A / A→O (~350 行)
+                 ├─ handler.rs     薄入口层: 认证 + 请求体准备 (~300 行)
+                 ├─ stream.rs      流式引擎核心: 路由解析 → 立即返回 Response → 后台 spawn 双循环 (~630 行)
+                 ├─ forward.rs     统一 IR 转发: 上游字节 → IR 事件 → 客户端 SSE 字节 (~350 行)
                  ├─ auth.rs        Service Key 验证
                  ├─ quota.rs       5h/7d token 配额检查
                  ├─ route.rs       模型别名→上游 URL 解析 (resolve_route / resolve_route_candidates)
                  ├─ failover.rs    provider 级冷却表 (纯内存, 60s)
                  ├─ key_rotation.rs 密钥选取 + 健康反馈
-                 ├─ websearch.rs   本地 Bing 搜索 → 注入 IR system → 清除 tools
-                 ├─ sniff.rs       SniffStream (透传+嗅探)
+                 ├─ websearch.rs   WebSearch tool-calling loop（最多 10 轮 + 无进展检测 + 耗尽清理工具痕迹）
+                 ├─ sniff.rs       SniffStream (透传+嗅探，保留但当前未被 forward.rs 引用)
                  └─ ir/            IR 中间表示层（三种协议统一抽象）
                       ├─ types.rs                IrRequest / IrMessage / IrContentBlock / IrStreamEvent / IrUsage
                       ├─ from_messages.rs        Anthropic Messages → IR
@@ -100,7 +100,7 @@ main.rs
 
 独立模块（被 handler/proxy 使用）：
   ├─ http.rs             统一 HTTP 客户端工厂（系统代理自动继承）
-  │    ├ system_proxy()  解析环境变量 → Windows 注册表，OnceLock 缓存
+  │    ├ system_proxy()  解析环境变量 → Windows 注册表 → macOS scutil，OnceLock 缓存
   │    ├ build_http_client()  返回带代理的 reqwest ClientBuilder
   │    └ http_client()   便捷方法：默认构建
   ├─ providers/          Provider 适配器
@@ -121,7 +121,7 @@ main.rs
   │    ├─ health.rs       check_heartbeats (30s/90s)
   │    └─ types.rs        消息类型定义
   ├─ middleware/rate_limit.rs  令牌桶 (128 req/min)
-  ├─ search/bing.rs           Bing 搜索 (cn.bing.com, 绕过代理直连, 独立 cookie 会话)
+  ├─ search/bing.rs           Bing 搜索 (HTTP 浏览器头 + cookie 复用 + 懒预热 + 双域名 fallback + ck/a 重定向解码，绕过代理直连)
   ├─ assets/install.html      局域网 install 静态页 (include_str! 编译进二进制)
   └─ types/                   数据结构定义
        ├─ provider.rs    ProviderKind / ProviderConfig / DelegateKeyConfig
@@ -169,11 +169,14 @@ main.rs
   │
   ▼
 [4b] WebSearch 劫持 ──── websearch_hijack + has_websearch_tool_ir
-  │  命中 → enrich_ir_with_search (websearch.rs):
-  │    提取搜索关键词（最后一条 user 消息文本）
-  │    本地 Bing 搜索（绕过代理直连 cn.bing.com，独立 cookie 会话）
-  │    搜索结果注入 IR system block → 清除 tools/tool_choice
-  │    交回 proxy_stream 正常流式转发（key failover 由 proxy_stream 天然支持）
+  │  命中 → execute_websearch_tool_loop (websearch.rs):
+  │    ensure_websearch_tool 替换客户端搜索工具为代理 web_search
+  │    模型通过 tool-calling 自主决定是否搜索、搜索什么、搜索几次
+  │    代理本地 Bing 搜索（SearchHttp: 浏览器头 + cookie 复用 + 绕过代理直连）
+  │    结果作为 tool_result 回传模型 → 继续下一轮
+  │    最多 10 轮 + 无进展检测（连续 2 轮查询词相似度 ≥ 0.6 提前收尾）
+  │    耗尽后清理工具痕迹 + 合并结果为文本指令强制无搜索回答
+  │    Messages 客户端合成 server_tool_use + web_search_tool_result 卡片
   │
   ▼
 [4c] 上下文超限预警 ──── 估算输入 token (chars/4) > model.context_window
@@ -202,15 +205,14 @@ main.rs
   │  无 winner: key 4xx 耗尽透传最后一次上游失败响应 / 无可用 key → 503
   │
   ▼
-[4f] 流式转发 (stream.rs 的 4 种分支)
-  │  同协议: spawn_passthrough() ──── 立即返回 Response + :keepalive 初始字节
+[4f] 流式转发 (forward.rs 统一 IR 路径)
+  │  forward_stream_ir() ──── 单一函数处理所有格式组合
+  │           └─ 上游字节 → 按 provider_kind 解析为 IR 事件 → 按 client_format 渲染为客户端 SSE
+  │           └─ 立即返回 Response + :keepalive 初始字节
   │           └─ 后台 spawn 转发 + 15s keepalive 心跳 (oneshot 取消信号驱动, 见 ADR-021)
   │           └─ 响应头: Cache-Control: no-cache, Connection: keep-alive, X-Accel-Buffering: no
   │           └─ 请求体上限 64MiB (MAX_REQUEST_BODY_BYTES, 覆盖多模态大会话)
-  │           └─ SniffStream (透传字节 + 后台解析 usage)
-  │  异协议: spawn_translate_openai_to_anthropic() / spawn_translate_anthropic_to_openai()
-  │           └─ 初始 keepalive 事件
-  │           └─ 逐 SSE chunk 解析 + IR chunk 转换 + 重发
+  │  WebSearch 路径: execute_websearch_tool_loop() 缓冲中间轮次，仅最终回答流式给客户端
   │  120s chunk 间隔超时
   │
   ▼
@@ -250,9 +252,10 @@ src/
 │    SettingsView.vue     设置 3 Tab: 通用(语言/主题/开机启动) + 路由(websearch/failover) + 数据(导出/导入/重置)
 │
 ├── components/
-│    AppShell.vue              MD3 导航抽屉 (响应式)
+│    AppShell.vue              MD3 导航抽屉 (响应式, 使用 MdiIcon 渲染图标)
 │    ConnectionStatus.vue      离线横幅 + 重试
 │    PluginRegisterDialog.vue  插件注册确认对话框
+│    MdiIcon.vue               动态 MDI 图标 (@mdi/js SVG path, kebab-case icon name)
 │
 └── stores/ (Pinia)
      providers.ts    Provider 列表
@@ -296,6 +299,7 @@ src/
 │  PluginManager    插件连接状态                     │
 │  websearch_hijack AtomicBool                      │
 │  http_client      reqwest::Client (共享连接池)     │
+│  search_http      SearchHttp (搜索专用, 直连)       │
 └───────────────────────────────────────────────────┘
 ```
 
@@ -357,7 +361,7 @@ src/
 | IR 真实值覆盖估算值 | `forward.rs` 预填的 `chars/4` 估算值偏大，max 合并会永久压住真实值，污染 usage_log 与客户端上下文条 |
 | Responses input_tokens 增量口径 | 减去 `cached_tokens`，与 Chat Completions `prompt_tokens - cached_tokens` 一致 |
 | 上下文超限预警而非硬拒绝 | 估算口径偏保守，硬拒绝会阻断客户端 auto-compact（死锁） |
-| WebSearch 跳过 tool-calling loop | 本地搜索 → 注入 IR → 正常流式转发，省掉一轮非流式上游调用 |
+| WebSearch 采用 tool-calling loop | 模型自主决定是否搜索、搜索什么；代理本地执行 Bing 搜索回传结果；轮数上限 + 无进展检测兜底防死循环 |
 | failover 冷却纯内存 | 与密钥健康同一哲学，不持久化不广播；开关默认关闭，开启才改变请求行为 |
 | 数据导出用 SQL dump | SQLite 原生语句保真度高，导入即执行，天然支持跨版本迁移 |
 
@@ -383,6 +387,16 @@ xrl-router
   │  网络基础设施
   ├── reqwest 0.12     HTTP 客户端 (流式 SSE, cookie 复用, 系统代理继承)
   ├── scraper 0.20     HTML 解析 (Bing 搜索结果提取)
+  ├── url 2            URL 构造 (Bing 搜索参数)
+  ├── base64 0.22      base64url 解码 (Bing ck/a 重定向链接)
+  │
+  │  序列化 / 工具
+  ├── thiserror 1      错误类型派生
+  ├── anyhow 1         通用错误处理
+  ├── chrono 0.4       时间处理
+  ├── uuid 1           UUID 生成 (v4)
+  ├── once_cell 1      延迟初始化 (system_proxy 缓存)
+  ├── async-trait 0.1  异步 trait 支持
   │
   │  音频 / 媒体控制
   ├── rodio 0.20       音频播放 (MP3 解码 + 系统音频设备输出)
@@ -392,6 +406,7 @@ xrl-router
   ├── Vue 3            UI 框架
   ├── Pinia            状态管理
   ├── @material/web    MD3 组件
+  ├── @mdi/js          MDI 图标 (SVG path, 按需加载)
   ├── Chart.js + vue-chartjs   统计图表
   └── SortableJS       拖拽排序
 ```

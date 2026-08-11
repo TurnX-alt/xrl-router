@@ -65,9 +65,9 @@ pnpm build
 | `API_KEY` | _(无)_ | 预留 API Key 字段（当前未启用认证） |
 | `CORS_ORIGINS` | `localhost:5173/19068,127.0.0.1:5173/19068,tauri://localhost,https://tauri.localhost,http://tauri.localhost` | 允许的跨域来源（共 7 个） |
 
-**代理**：上游请求自动继承系统代理（环境变量 `HTTPS_PROXY`/`HTTP_PROXY` → Windows 注册表系统代理），`localhost`/`127.0.0.1` 自动豁免直连（插件系统上游在本机）。国内网络下钉钉 DEAP 等上游需走 Clash 等代理才能连通。
+**代理**：上游请求自动继承系统代理（环境变量 `HTTPS_PROXY`/`HTTP_PROXY` → Windows 注册表 → macOS scutil），`localhost`/`127.0.0.1` 自动豁免直连（插件系统上游在本机）。国内网络下钉钉 DEAP 等上游需走 Clash 等代理才能连通。
 
-首次启动自动在系统应用数据目录创建数据库（14 版迁移）和主密钥文件：
+首次启动自动在系统应用数据目录创建数据库（15 版迁移）和主密钥文件：
 - macOS: `~/Library/Application Support/im.xrl.router/`
 - Linux: `~/.config/im.xrl.router/`
 - Windows: `C:\Users\<user>\AppData\Roaming\im.xrl.router\`
@@ -120,7 +120,11 @@ pnpm build
 
 ### Claude FM（后端广播电台引擎）
 
-应用内置一台「电台」：所有播放逻辑（歌单管理、墙钟时间轴、音源解析、预加载、切歌）由 Rust 后端 `FmEngine` 完成。引擎以 `tokio::spawn` 后台任务持续运行，通过 `broadcast::channel` 将音频字节推送给所有订阅者。前端输出一条永不关闭的 HTTP chunked 直播流（`GET /fm/live`），前端只需一个 `<audio>` 标签像收音机一样收听——路由切换不销毁 `<audio>`，窗口关闭只隐藏到托盘，音乐持续。音源就绪后托盘菜单加入「Claude FM」勾选项（勾选播放 / 取消暂停）；曲目切换由 `fm-meta` Tauri 事件主动推送给前端。
+应用内置一台「电台」：音频解码与播放由 Rust 后端 `FmEngine` 直接完成，输出到系统音频设备。前端仅负责展示与控制：
+
+- **后端引擎**：`api/handlers/fm.rs`（~630 行），rodio 解码 + 系统音频设备输出，`std::thread::spawn` 运行（rodio 需稳定线程），`mpsc` channel 接收播放控制消息。souvlaki 接入系统媒体控制（macOS Now Playing / Windows SMTC / Linux MPRIS）。双缓冲预加载：当前曲播放时预下载下一曲，切歌零等待。
+- **前端展示**：`src/fm/player.ts`（~110 行）纯命令/事件，通过 `fm_toggle` / `fm_play` / `fm_pause` / `fm_get_state` Tauri command 控制播放，通过 `fm-meta` / `fm-ready` / `fm-state-changed` 事件接收状态更新。
+- **托盘集成**：预热完成后菜单加入「Claude FM」勾选项（勾选播放 / 取消暂停），点击直接调用引擎（不绕前端中转）。窗口关闭只隐藏到托盘，音乐持续。
 
 ### WebSocket 实时推送
 
@@ -128,7 +132,7 @@ pnpm build
 
 ### WebSearch 劫持
 
-可选功能（设置页开关控制）：拦截包含 `web_search` 工具的请求，代理自身提取搜索关键词（取最后一条 user 消息文本），本地 Bing 搜索后将结果作为 system block 注入 IR、清除 tools/tool_choice，交回 `proxy_stream` 正常流式转发给上游 LLM。跳过 LLM tool-calling loop，省掉一轮非流式上游调用，key failover 由 proxy_stream 天然支持。Bing 搜索绕过代理直连 cn.bing.com（避免出口 IP 在海外导致结果降级），每次搜索用独立 cookie 会话。
+可选功能（设置页开关控制）：拦截包含 `web_search` 工具的请求，代理注入自己的 `web_search` 工具定义，模型通过标准 tool-calling 自主决定是否搜索、搜索什么、搜索几次。代理在本地执行 Bing 搜索并将结果回传模型，最多 10 轮 + 无进展检测（连续 2 轮查询词相似度 ≥ 0.6 提前收尾），耗尽后清理工具痕迹合并结果为文本指令强制无搜索回答。Bing 搜索绕过代理直连（完整浏览器头 + cookie 复用 + 懒预热 + 双域名 fallback + ck/a 重定向解码，避免出口 IP 在海外导致结果降级）。Messages 客户端（Claude Code）合成 server_tool_use + web_search_tool_result 卡片。
 
 ### 国际化（i18n）
 

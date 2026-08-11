@@ -110,8 +110,8 @@ handler.rs (薄入口) → authenticate_and_stream() → stream.rs::proxy_stream
 ```
 
 1. **handler.rs**：提取 API key → 认证 → 配额检查 → 客户端格式 → IR 解析
-2. **stream.rs**：路由解析 → WebSearch 劫持（enrich_ir_with_search）→ 上下文超限预警（warn 日志，不阻断）→ IR → 上游格式渲染 → 立即返回 Response（含 keepalive）→ 后台 spawn 双循环重试 + 流式转发
-3. **forward.rs**：passthrough / O→A / A→O 三种流转发模式
+2. **stream.rs**：路由解析 → WebSearch 劫持（ensure_websearch_tool + execute_websearch_tool_loop）→ 上下文超限预警（warn 日志，不阻断）→ IR → 上游格式渲染 → 立即返回 Response（含 keepalive）→ 后台 spawn 双循环重试 + 流式转发
+3. **forward.rs**：统一 IR 转发（forward_stream_ir：上游字节 → IR 事件 → 客户端 SSE 字节）
 
 ## 故障转移（Provider Failover）
 
@@ -157,7 +157,7 @@ handler.rs (薄入口) → authenticate_and_stream() → stream.rs::proxy_stream
 
 - `src-tauri/src/api/proxy/handler.rs` — 薄入口层（认证 + 请求体准备 + proxy_list_models）
 - `src-tauri/src/api/proxy/stream.rs` — 流式引擎核心（路由解析 → 立即返回 Response → 后台 spawn 双循环）
-- `src-tauri/src/api/proxy/forward.rs` — 流式转发分支（passthrough / O→A / A→O）
+- `src-tauri/src/api/proxy/forward.rs` — 统一 IR 转发（上游字节 → IR 事件 → 客户端 SSE 字节）
 - `src-tauri/src/api/proxy/ir/` — IR 中间表示层（三种协议统一抽象）
 - `src-tauri/src/api/proxy/auth.rs` — 认证
 - `src-tauri/src/api/proxy/quota.rs` — 配额检查

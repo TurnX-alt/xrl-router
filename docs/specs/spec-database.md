@@ -6,7 +6,7 @@
 
 ## 迁移架构
 
-所有 DDL 以 Rust 字符串内联在 `schema.rs` 的 `MIGRATIONS` 数组中，**没有**独立的 `.sql` 文件。版本由 `MIGRATIONS.len()` 动态得出，当前为 **14**。
+所有 DDL 以 Rust 字符串内联在 `schema.rs` 的 `MIGRATIONS` 数组中，**没有**独立的 `.sql` 文件。版本由 `MIGRATIONS.len()` 动态得出，当前为 **15**。
 
 ```rust
 // db/schema.rs
@@ -55,8 +55,9 @@ pub fn migrate(db: &Database) -> Result<()> {
 | V12 | usage_log 自包含：添加快照字段（provider_name/model_display_name/key_name/service_key_name/key_masked/service_key_masked），移除所有外键约束（重建表） |
 | V13 | providers 新增 sort_order 列 |
 | V14 | service_keys 新增 quota_5h / quota_7d 列（滚动窗口 token 配额，0 = 不设限） |
+| V15 | 统一 provider kind 命名：`openai` → `chat_completions`、`anthropic` → `messages`、`responses` 保持不变 |
 
-## 当前表结构（V14 最终状态）
+## 当前表结构（V15 最终状态）
 
 ### providers
 
@@ -64,7 +65,7 @@ pub fn migrate(db: &Database) -> Result<()> {
 CREATE TABLE providers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    kind TEXT NOT NULL,               -- "anthropic" | "openai" | "deap" | "custom"
+    kind TEXT NOT NULL,               -- "messages" | "chat_completions" | "responses"
     base_url TEXT NOT NULL,
     api_path TEXT DEFAULT '/chat/completions',
     enabled INTEGER DEFAULT 1,
@@ -314,7 +315,7 @@ db.execute(
 
 ## 完成标准
 
-- [x] 14 版增量迁移（V1→V14）
+- [x] 15 版增量迁移（V1→V15）
 - [x] 迁移按序执行，跳过已应用的版本
 - [x] UPSERT 使用 `ON CONFLICT DO UPDATE`
 - [x] `usage_log` 自包含快照（无外键）

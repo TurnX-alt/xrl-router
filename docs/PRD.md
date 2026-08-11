@@ -1,6 +1,6 @@
 # xrl-router — 产品需求文档
 
-> 版本: CalVer (tauri 26.8.9+1600) · 更新日期: 2026-08-09
+> 版本: CalVer (tauri 26.8.11+1600) · 更新日期: 2026-08-11
 >
 > 📎 [架构文档](./ARCHITECTURE.md) · [决策记录](./DECISIONS.md) · [规格契约](./specs/)
 
@@ -128,7 +128,7 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-14 | **模型注册 + 层级分类** | `api/handlers/models.rs` + `models/mod.rs` |
 | F-15 | **Provider 启用/禁用** | `api/handlers/providers.rs` |
 | F-16 | **健康检查端点** | `api/handlers/health.rs` |
-| F-17 | **缓存追踪（cache_read_input_tokens）** | `api/proxy/sniff.rs` |
+| F-17 | **缓存追踪（cache_read_input_tokens）** | `api/proxy/ir/usage.rs` + `api/proxy/forward.rs`（IR 层统一提取） |
 | F-18 | **WebSocket 实时推送** | `api/handlers/websocket.rs` + `ws.ts` |
 | F-19 | **Service Key 白名单（allowed_models）** | `api/handlers/service_keys.rs` |
 | F-20 | **usage_log 自包含快照** | `db/schema.rs` V12 |
@@ -137,7 +137,7 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 
 | ID | 功能 | 实现位置 |
 |----|------|---------|
-| F-21 | **WebSearch 劫持（本地 Bing 搜索 + IR 注入）** | `api/proxy/websearch.rs` (enrich_ir_with_search) + `search/bing.rs` (绕过代理直连 + 独立 cookie) |
+| F-21 | **WebSearch 劫持（tool-calling loop + 本地 Bing 搜索）** | `api/proxy/websearch.rs` (execute_websearch_tool_loop) + `search/bing.rs` (SearchHttp: 浏览器头 + cookie 复用 + 懒预热 + 双域名 fallback + 绕过代理直连) |
 | F-22 | **模型同步（从上游拉取）** | `api/handlers/models.rs` |
 | F-23 | **系统托盘** | `lib.rs` |
 | F-24 | **插件系统（委托供应商）** | `plugin/` |
@@ -149,7 +149,7 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-30 | **应用设置（websearch 开关）** | `api/handlers/` + `SettingsView.vue` |
 | F-31 | **Token 配额（5h/7d 滚动窗口）** | `api/proxy/quota.rs` + `KeysView.vue` (V14) |
 | F-32 | **余额端点（/v1/user/balance）** | `api/proxy/quota.rs` |
-| F-33 | **系统代理自动继承（http.rs 统一工厂）** | `http.rs` |
+| F-33 | **系统代理自动继承（http.rs 统一工厂 + 多平台支持）** | `http.rs`（环境变量 → Windows 注册表 → macOS scutil，OnceLock 缓存） |
 | F-34 | **ConnectionStatus 绝对路径修复** | `ConnectionStatus.vue` |
 | F-35 | **局域网分发（install 页面 + 分发链接）** | `api/handlers/install.rs` + `assets/install.html` + `KeysView.vue` |
 | F-36 | **单 listener + 路径级 IP 限制** | `gateway/server.rs` + `api/router.rs` + `middleware/admin_guard.rs` + `config.rs` |
@@ -164,16 +164,23 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-45 | **usage 真实值覆盖估算占位** | `api/proxy/ir/from_chat_completions.rs` + `api/proxy/ir/from_responses.rs` (max → 覆盖) + `api/proxy/ir/usage.rs` (Responses 增量口径) |
 | F-46 | **上下文超限预警（软警告）** | `api/proxy/stream.rs` (warn 而非 400，避免阻断 auto-compact) |
 | F-47 | **list_models 扩展（capabilities + max_output_tokens）** | `api/proxy/handler.rs::proxy_list_models` |
+| F-48 | **V15: provider kind 统一命名** | `db/schema.rs`（`openai` → `chat_completions`、`anthropic` → `messages`） |
+| F-49 | **Bing 搜索策略升级（SearchHttp + 浏览器头 + 双域名 fallback）** | `search/bing.rs`（SearchHttp 结构体 + 懒预热 + ck/a 解码 + 降级检测） |
+| F-50 | **WebSearch server-side tool 渲染（Messages 客户端搜索卡片）** | `api/proxy/websearch.rs`（`render_websearch_messages_final`）+ `api/proxy/ir/to_messages.rs` |
+| F-51 | **macOS 系统代理自动检测（scutil --proxy）** | `http.rs`（`resolve_macos_proxy()`） |
+| F-52 | **MdiIcon 组件（@mdi/js SVG 动态图标）** | `src/components/MdiIcon.vue` + `src/components/AppShell.vue` |
+| F-53 | **主题色相滑块（hue slider）** | `src/theme.ts`（`setHue()` 生成 MD3 色阶）+ `SettingsView.vue` |
+| F-54 | **统一 IR 转发（forward_stream_ir 替代三路分支）** | `api/proxy/forward.rs`（单一函数处理所有格式组合） |
 
 ### 4.4 未实现（计划中）
 
 | ID | 功能 | 计划版本 |
 |----|------|---------|
-| F-48 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
-| F-49 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
-| F-50 | 指数退避重试（failover 已实现 provider 级切换 + 60s 冷却，退避算法未做） | v0.3 |
-| F-51 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
-| F-52 | 自动更新机制 | v1.0 |
+| F-55 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
+| F-56 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
+| F-57 | 指数退避重试（failover 已实现 provider 级切换 + 60s 冷却，退避算法未做） | v0.3 |
+| F-58 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
+| F-59 | 自动更新机制 | v1.0 |
 
 ### 4.5 已知断裂（待修复）
 
@@ -198,8 +205,7 @@ _无。前端 `dashboardApi` / `stores/dashboard.ts` 此前指向未注册的后
 
 | 上游类型 | 处理方式 |
 |---------|---------|
-| Anthropic | 直接透传 + SniffStream 嗅探 token |
-| OpenAI / Compatible | IR 渲染为 Chat Completions 或 Responses 格式 |
+| 所有上游 | 统一 IR 转发：上游字节 → IR 事件（按 provider_kind 解析）→ 客户端 SSE 字节（按 client_format 渲染） |
 | 插件（委托供应商） | 插件负责非标→标准，Router 只管密钥轮换 |
 
 ### 5.1 必须支持的转换特性
@@ -279,18 +285,21 @@ _无。前端 `dashboardApi` / `stores/dashboard.ts` 此前指向未注册的后
 
 ---
 
-## 6.3 Claude FM 规格（墙钟直播流播放器）
+## 6.3 Claude FM 规格（后端电台引擎）
 
-应用内置一台「电台」：一张固定歌单循环，时间轴完全由墙钟定义，任何设备任何时刻算出的是同一个直播位置——暂停只是静音，恢复时跳到当前直播点（如 YouTube Live，错过即错过）。
+应用内置一台「电台」：音频解码与播放由 Rust 后端 `FmEngine` 直接完成，输出到系统音频设备。前端仅负责展示与控制。
 
 | 项 | 规则 |
 |----|------|
-| 时间轴 | `pos = (Date.now()/1000) % TOTAL_DURATION`，锚点为 Unix epoch；歌单总时长为取模周期 |
-| 暂停语义 | 暂停 = 静音，时间轴照常推进；恢复时跳到当前直播位置，不续播暂停点 |
-| 生命周期 | 与应用进程绑定，非任何视图：模块首次 import 创建单例 `<audio>`，路由切换（组件卸载）不销毁，窗口关闭只隐藏到托盘（进程 + webview 常驻），音乐持续 |
+| 播放引擎 | `FmEngine`（`api/handlers/fm.rs`），rodio 解码 + 系统音频设备输出，`std::thread::spawn` 运行（rodio 需稳定线程），`mpsc` channel 接收播放控制消息 |
+| 系统媒体控制 | souvlaki 接入 macOS Now Playing / Windows SMTC / Linux MPRIS，主线程初始化 |
+| 预加载 | 双缓冲：当前曲播放时 `tauri::async_runtime::spawn` 预下载下一曲（`tokio::sync::oneshot` 传递结果），切歌零等待 |
+| 暂停语义 | 暂停 = 静音，时间轴照常推进 |
+| 生命周期 | 与应用进程绑定：窗口关闭只隐藏到托盘（进程常驻），音乐持续 |
 | 预热 | 音源就绪后才解锁播放按钮与托盘 FM 项；就绪前菜单项隐藏，避免误操作 |
 | 视图 | `/fm` 路由（`ClaudeFmView.vue`）：大圆形播放/暂停按钮 + 底部等宽字体「标题 - 艺人」（电台语义，不显示时间码） |
-| 托盘 | 预热完成后菜单加入「Claude FM」勾选项：勾选 = 播放，取消 = 暂停；语言随 `settings.locale` |
+| 前端 | `src/fm/player.ts`（~60 行）纯命令/事件：`fm_toggle` / `fm_play` / `fm_pause` / `fm_get_state` Tauri command + `fm-meta` / `fm-ready` / `fm-state-changed` 事件 |
+| 托盘 | 预热完成后菜单加入「Claude FM」勾选项：勾选 = 播放，取消 = 暂停；语言随 `settings.locale`；点击直接调用引擎（不绕前端中转） |
 | i18n | `fm.play` / `fm.pause` / `fm.error`（曲目无法播放自动跳过） |
 
 用途：编码时挂一台低打扰的氛围电台，无需开第三方播放器；托盘勾选即控，与应用窗口解耦。
@@ -361,7 +370,7 @@ _无。前端 `dashboardApi` / `stores/dashboard.ts` 此前指向未注册的后
 
 | 维度 | 要求 |
 |------|------|
-| 系统代理继承 | 出站请求自动继承系统代理（环境变量 → Windows 注册表），`localhost`/`127.0.0.1` 自动豁免直连 |
+| 系统代理继承 | 出站请求自动继承系统代理（环境变量 → Windows 注册表 → macOS scutil），`localhost`/`127.0.0.1` 自动豁免直连 |
 | HTTP 客户端 | 统一工厂（`http.rs`），所有出站请求使用 `build_http_client()` / `http_client()` |
 
 ### 8.4 兼容性

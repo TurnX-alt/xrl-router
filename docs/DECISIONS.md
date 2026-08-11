@@ -467,7 +467,8 @@ pub fn anthropic_req_to_anthropic(req: &AnthropicRequest) -> OpenAIRequest {
 ## ADR-012: WebSearch 劫持使用本地 Bing 搜索
 
 **日期**: 2026-07-28  
-**状态**: 已接受
+**状态**: 已被取代  
+**被取代**: ADR-028（本地搜索 + IR 注入）→ ADR-030（恢复 tool-calling loop + 无进展检测）
 
 ### 背景
 
@@ -815,7 +816,7 @@ AGENTS.md 原 Non-Goal「不做国际化，中文即可」，2026-08 用户主�
 ## ADR-020: handler.rs 拆分 + 流式引擎独立 + SSE 即时响应
 
 **日期**: 2026-08-04  
-**状态**: 已接受
+**状态**: 已接受（部分演进：ADR-027 引入 IR 后 forward.rs 从三路分支统一为单一 `forward_stream_ir`）
 
 ### 背景
 
@@ -1208,8 +1209,9 @@ if max_input > 0 && est_input as usize > max_input {
 ## ADR-028: WebSearch 劫持重构为本地搜索 + IR 注入
 
 **日期**: 2026-08-09  
-**状态**: 已接受  
-**取代**: ADR-012（WebSearch 劫持使用本地 Bing 搜索，tool-calling loop 模式）
+**状态**: 已被取代  
+**取代**: ADR-012（WebSearch 劫持使用本地 Bing 搜索，tool-calling loop 模式）  
+**被取代**: ADR-030（「清除 tools 后注入 IR system」方案在实测中不足，恢复 tool-calling loop + 无进展检测）
 
 ### 背景
 
@@ -1307,5 +1309,139 @@ MessageDelta {
 if max_input > 0 && est_input as usize > max_input {
     warn!(est_input, max_input, "context exceeds window, forwarding to upstream");
     // 不再返回 400
+}
+```
+
+## ADR-030: WebSearch 工具调用循环恢复 + 轮数安全网与无进展检测
+
+**日期**: 2026-08-11
+**状态**: 已接受
+**取代**: ADR-028 的部分决策（「清除 tools 后注入 IR system」方案在实测中不足）
+
+### 背景
+
+ADR-028 把 WebSearch 从 tool-calling loop 改为「本地搜索 + IR system 注入」。实测发现两个问题：
+
+1. **注入式搜索无法应对多轮探索**：模型对争议性问题（如「张雪峰是否去世」）需要多次调整查询词交叉验证，注入式方案只做一次搜索，信息不足
+2. **tool-calling loop 有死循环风险**：恢复 loop 模式后，若模型反复搜索（Bing 持续返回降级/矛盾信息时常见），3 轮硬上限会截断搜索不充分；但完全无上限会死循环，客户端永远等不到回答
+
+### 决策
+
+1. **恢复 tool-calling loop**（`execute_websearch_tool_loop`）：模型通过标准 tool-calling 自主决定搜索次数、查询词、何时收尾（`tool_choice = Auto`）
+2. **轮数上限作为安全网而非默认路径**：`MAX_TOOL_ROUNDS = 10`，正常模型搜索几次就 `end_turn`，上限只防失控
+3. **无进展检测**：连续 2 轮查询词相似（Levenshtein 编辑距离归一化 ≥ 0.6）→ 提前收尾。模型反复搜同一关键词通常意味着搜索结果无新信息（Bing 降级页症状），继续搜只是白耗时间
+4. **耗尽/无进展收尾**：收集全部搜索结果文本 → 移除 messages 中的 tool_use/tool_result 痕迹 → 移除 web_search 工具 + `tool_choice = None` → 搜索结果合并为纯文本指令追加 → 强制一轮无搜索回答
+   - **关键**：不清理工具痕迹的话，`to_chat_completions` 会从历史 tool_calls 补回 web_search 工具定义，上游仍能继续调用，最终轮永远返回 tool_use 而非文本（实测死循环 bug）
+5. **IPC 远程域授权**：隐藏 WebView 搜索（bing.com 远程域）需在 capabilities 配置 `remote` context + app 命令权限（见 `capabilities/webview-search.json`），否则 Tauri 2 默认拒绝远程域调用 Rust 命令，搜索回传超时
+
+### 代价
+
+- 多轮 loop 期间客户端全程缓冲，延迟随轮数增加（每轮 ~10-20s）
+- 查询相似度阈值（0.6）可能误判（部分重叠的查询被当作重复），但收尾逻辑保证结果仍可用
+- Bing 降级页问题仍在（热点人物多词查询返回字典释义），靠模型多轮换查询缓解，非本 ADR 范围
+
+### 实现位置
+
+- `src-tauri/src/api/proxy/websearch.rs` — `MAX_TOOL_ROUNDS` / `NO_PROGRESS_ROUNDS` / `QUERY_SIMILARITY_THRESHOLD` / `query_similarity()` / 收尾清理
+- `src-tauri/capabilities/webview-search.json` — 隐藏 WebView 远程域 IPC 授权（已废弃：ADR-031 的 HTTP 浏览器头方案取代了 WebView 方案）
+- `src-tauri/build.rs` — `AppManifest::commands` 声明 app 命令权限（`search_result_callback` 等，已废弃）
+
+---
+
+## ADR-031: Bing 搜索升级为 HTTP 浏览器头策略 + 双域名 fallback
+
+**日期**: 2026-08-11  
+**状态**: 已接受  
+**关联**: ADR-030（WebSearch tool-calling loop 恢复）
+
+### 背景
+
+ADR-028 时期 Bing 搜索使用 `http::build_http_client()` + `no_proxy: true` 直连 cn.bing.com。实测两个问题：
+
+1. **代理出口 IP 降级**：Bing 对代理出口 IP（通常在海外）返回「热门站点推荐」模式结果（今日头条/百度热搜），而非正常搜索结果
+2. **裸 HTTP 请求降级**：cn.bing.com 把没有浏览器特征头的请求识别为非浏览器请求，对中文查询返回字典释义页（实测查「张雪峰 2026」只返回「张」字的字典释义）
+
+曾尝试用隐藏 WebView（WKWebView）执行搜索并 JS 回传 HTML，但实测发现**关键在完整浏览器头**（尤其 `sec-ch-ua` 系列 + UA + Accept-Language），而非 TLS 指纹或 JS 执行——reqwest 带完整浏览器头 + `cookie_store(true)` + 预热即可拿到与 WebView 完全相同的正常结果。WebView 方案被废弃，`capabilities/webview-search.json` 不再需要。
+
+### 决策
+
+1. **SearchHttp 专用结构体**（`search/bing.rs`）：全局复用的搜索 HTTP 客户端，包含：
+   - 完整浏览器头：`User-Agent`（Chrome 131 on macOS）、`Accept`（含 image/avif）、`Accept-Language`（zh-CN 优先）、`Upgrade-Insecure-Requests`、`sec-ch-ua` 系列 Client Hints
+   - `cookie_store(true)`：cookie 会话持续复用，后续搜索不再降级
+   - `prewarmed: AtomicBool` + `prewarm_lock: Mutex<()>`：懒预热（首次搜索前 GET 主页建 cookie），并发首搜只预热一次
+   - **不走** `http::build_http_client()`——搜索必须直连，系统代理会触发 Bing 降级
+
+2. **双域名 fallback 策略**：`www.bing.com`（国际版，质量更高）优先，空壳/失败/降级时 fallback `cn.bing.com`
+
+3. **降级检测 + 简化重试**：
+   - `is_degraded_results()`：结果标题/摘要中 < 30% 包含查询首词 → 判定降级（字典释义页特征）
+   - `simplify_query()`：降级时取查询首词重搜（实测「张雪峰 高考志愿」降级，「张雪峰」单搜正常）
+
+4. **ck/a 重定向解码**：Bing 结果链接可能是 `www.bing.com/ck/a?u=a1<base64url>`，`decode_ck_href()` 用 base64url 解码还原真实 URL（参考 SearXNG bing.py）
+
+5. **AppState 集成**：`server.rs` 新增 `search_http: SearchHttp` 字段，`websearch.rs` 通过 `state.search_http` 全局复用
+
+### 原因
+
+1. **浏览器头而非 WebView**：Bing 风控靠请求头特征识别浏览器会话，`sec-ch-ua` Client Hints 是关键信号；reqwest + 完整头即可模拟，无需引入 WebView 的 IPC 复杂度
+2. **cookie 会话复用**：首次预热后 cookie 持续有效，后续搜索不降级；独立 cookie 会话（ADR-028）会导致每次都重新预热
+3. **双域名 fallback**：www.bing.com 国际版结果质量更高但可能返回空壳页（代理环境），cn.bing.com 更稳定但质量略低——两者互补
+4. **降级检测兜底**：Bing 对热点人名+附加词的风控不可预测，检测+简化重试覆盖了最常见的降级场景
+5. **SearchHttp 全局复用**：TCP 连接池 + cookie 会话双重收益，搜索频率低但每次复用价值高
+
+### 代价
+
+- SearchHttp 不走统一工厂，是 `http.rs` 规则的唯一例外——但 Bing 对代理出口 IP 的降级是硬约束，不可调和
+- www.bing.com 优先策略增加一次额外请求（空壳时 fallback cn），但预热后 cookie 复用使得两次请求都很快
+- 降级检测阈值（30% 首词命中率）是经验值，可能误判正常结果（但简化重试兜底了大多数情况）
+
+### 实现位置
+
+- `src-tauri/src/search/bing.rs` — `SearchHttp` / `search()` / `search_domain()` / `is_degraded_results()` / `simplify_query()` / `decode_ck_href()` / `parse_results()`（~465 行）
+- `src-tauri/src/gateway/server.rs` — `AppState.search_http: SearchHttp`
+
+---
+
+## ADR-032: macOS 系统代理自动检测（scutil --proxy）
+
+**日期**: 2026-08-11  
+**状态**: 已接受  
+**延伸**: ADR-016（统一 HTTP 客户端工厂 + 系统代理自动继承）
+
+### 背景
+
+ADR-016 的 `http.rs` 统一工厂支持环境变量 + Windows 注册表两种代理来源，但 macOS 用户通过「系统设置 → 网络 → Wi-Fi → 代理」配置的代理既不写环境变量也不写注册表，导致 Clash 等代理工具的 macOS 用户必须手动设置 `HTTPS_PROXY` 环境变量。
+
+### 决策
+
+1. **`resolve_macos_proxy()` 函数**：调用 `scutil --proxy`，解析输出中的 `HTTPEnable` / `HTTPProxy` / `HTTPPort`（或 `HTTPSEnable` / `HTTPSProxy` / `HTTPSPort`）
+2. **跨平台代理解析链**：环境变量（全平台）→ Windows 注册表（`#[cfg(windows)]`）→ macOS scutil（`#[cfg(target_os = "macos")]`）
+3. **scutil 而非 networksetup**：`networksetup -getwebproxy` 需要指定网络接口名（Wi-Fi / Ethernet），猜错就返回 None；`scutil --proxy` 输出**当前生效**的代理配置（系统按优先级自动选择接口），无需猜接口名
+
+### 原因
+
+1. **零配置体验**：macOS 用户在系统设置里配好 Clash 代理后，xrl-router 自动继承，无需额外设置环境变量
+2. **与 ADR-016 哲学一致**：OnceLock 缓存 + 跨平台 fallback 链，只多一个 `#[cfg]` 分支
+3. **scutil 是 macOS 标准工具**：系统自带，输出格式稳定，无需额外依赖
+
+### 代价
+
+- `scutil --proxy` 是子进程调用（~30ms），但 OnceLock 缓存后只调一次
+- 仅支持 HTTP/HTTPS 代理，不支持 SOCKS 或 PAC（AutoConfigURL）——与 Windows 分支限制一致
+
+### 实现
+
+```rust
+// http.rs
+#[cfg(target_os = "macos")]
+fn resolve_macos_proxy() -> Option<String> {
+    let output = std::process::Command::new("scutil")
+        .arg("--proxy")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // 解析 HTTPEnable=1 + HTTPProxy + HTTPPort
+    // 或 HTTPSEnable=1 + HTTPSProxy + HTTPSPort
+    // 返回 "http://proxy:port" 格式
 }
 ```

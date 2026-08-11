@@ -10,10 +10,10 @@
 
 ```rust
 pub struct KeyPool {
-    keys: Arc<RwLock<HashMap<provider_id, Vec<KeyEntry>>>>,
-    current_index: Arc<RwLock<HashMap<provider_id, usize>>>,
+    keys: Arc<RwLock<HashMap<String, Vec<KeyEntry>>>>,
+    current_index: Arc<RwLock<HashMap<String, usize>>>,
     database: Arc<RwLock<Option<Database>>>,
-    key_stats_tx: Arc<broadcast::Sender<KeyPoolStats>>,
+    key_stats_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 ```
 

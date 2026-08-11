@@ -23,14 +23,14 @@ src-tauri/src/                 后端 Rust
 │   └── proxy/*                LLM 代理核心
 │       ├── handler.rs         薄入口层：认证 + 请求体准备，委托 stream::proxy_stream()
 │       ├── stream.rs          流式引擎核心：路由解析 → 立即返回 Response → 后台 spawn 双循环
-│       ├── forward.rs         流式转发分支：passthrough / O→A / A→O
+│       ├── forward.rs         统一 IR 转发：上游字节 → IR 事件 → 客户端 SSE 字节（~350 行）
 │       ├── auth.rs            Service Key 验证
 │       ├── quota.rs           5h/7d token 配额检查
 │       ├── route.rs           模型别名→上游 URL 解析
 │       ├── failover.rs        provider 级冷却表
 │       ├── key_rotation.rs    密钥选取 + 健康反馈
-│       ├── websearch.rs       本地 Bing 搜索 → 注入 IR system → 清除 tools（不再 tool-calling loop）
-│       ├── sniff.rs           SniffStream (透传+嗅探)
+│       ├── websearch.rs       WebSearch tool-calling loop（最多 10 轮 + 无进展检测，耗尽后清理工具痕迹合并结果为文本指令收尾）
+│       ├── sniff.rs           SniffStream (透传+嗅探，保留但当前未被 forward.rs 引用)
 │       └── ir/                IR 中间表示层（三种协议统一抽象）
 │            ├── types.rs          IrRequest / IrMessage / IrContentBlock / IrStreamEvent / IrUsage
 │            ├── from_messages.rs      Anthropic Messages → IR
@@ -51,9 +51,14 @@ src-tauri/src/                 后端 Rust
 ├── models/mod.rs              ModelRegistry
 ├── middleware/rate_limit.rs   令牌桶限流
 ├── middleware/admin_guard.rs  IP 限制中间件（/api/* 仅 loopback）
-├── search/bing.rs             Bing 搜索（cn.bing.com，绕过代理直连，独立 cookie 会话）
+├── search/bing.rs             Bing 搜索（HTTP 浏览器头 + cookie 复用 + 懒预热 + 双域名 fallback + ck/a 重定向解码，绕过代理直连）
+├── sdk-test/                  SDK 合规验证（仅 #[cfg(test)] 编译）
+│    ├── fixtures.rs           IR 转换测试 fixtures
+│    ├── ir_sdk_verify.py      Python SDK 验证脚本
+│    └── README.md
+└── capabilities/default.json  Tauri 权限配置（shell/dialog/fs/autostart/window）
 
-> **HTTP 客户端**：所有出站 HTTP 请求**必须**使用 `http::build_http_client()` 或 `http::http_client()`，**不要**直接 `reqwest::Client::new()` 或 `reqwest::Client::builder()`。统一工厂自动继承系统代理（环境变量 → Windows 注册表），`localhost`/`127.0.0.1` 自动豁免直连。
+> **HTTP 客户端**：所有出站 HTTP 请求**必须**使用 `http::build_http_client()` 或 `http::http_client()`，**不要**直接 `reqwest::Client::new()` 或 `reqwest::Client::builder()`。统一工厂自动继承系统代理（环境变量 → Windows 注册表 → macOS scutil），`localhost`/`127.0.0.1` 自动豁免直连。**唯一例外**：`search/bing.rs` 的 `SearchHttp` **不**走统一工厂——Bing 对代理出口 IP（海外）返回降级结果，搜索必须直连。
 
 src/                           前端 Vue 3
 ├── main.ts / App.vue / router.ts
@@ -64,7 +69,7 @@ src/                           前端 Vue 3
 ├── styles/global.css          全局样式（MD3 design tokens + [data-theme="dark"]）
 ├── fm/                        Claude FM 播放器（极简前端：~60 行纯命令/事件）
 ├── views/*                    6 个页面（ClaudeFm/Providers/ProviderNew/Keys/Stats/Settings）
-├── components/*               AppShell / ConnectionStatus / PluginRegisterDialog
+├── components/*               AppShell / ConnectionStatus / PluginRegisterDialog / MdiIcon（动态 MDI 图标，@mdi/js SVG path）
 └── stores/*                   3 个 Pinia stores（providers/keys/models）
 
 > **Claude FM**：音频解码与播放由 Rust 后端 `FmEngine`（`api/handlers/fm.rs`）直接完成——rodio 输出到系统音频设备，souvlaki 接入系统媒体控制（macOS Now Playing / Windows SMTC / Linux MPRIS）。引擎以 `std::thread::spawn` 运行（rodio 需要稳定线程），通过 `mpsc` channel 接收播放控制消息。前端 `src/fm/player.ts`（~60 行）仅负责展示元信息（通过 `fm-meta` 事件）和控制播放暂停（通过 `fm_toggle` / `fm_play` / `fm_pause` Tauri command）。托盘 FM 菜单点击直接调用引擎（不再绕前端中转）。改 FM 逻辑改 `api/handlers/fm.rs`，改播放器 UI 改 `ClaudeFmView.vue`。
@@ -84,7 +89,7 @@ docs/                          文档（本目录）
 
 - 迁移定义在 `src-tauri/src/db/schema.rs` 的 `MIGRATIONS` 数组
 - 每个元素是一条完整 SQL，启动时按序执行
-- 当前版本：**V14**（`service_keys` 增加 `quota_5h` / `quota_7d`）
+- 当前版本：**V15**（统一 provider kind 命名：`openai` → `chat_completions`、`anthropic` → `messages`）
 - 新增迁移：追加到数组末尾，**不要**修改已有迁移
 - 用 `ON CONFLICT DO UPDATE`（UPSERT），**不要用** `INSERT OR REPLACE`（会触发 `ON DELETE CASCADE` 清空子表，`db/mod.rs` 有回归测试）
 
@@ -100,9 +105,10 @@ docs/                          文档（本目录）
 
 ### 代理代码组织
 
-- **handler.rs** 是薄入口层（~250 行）：提取 API key → authenticate_and_stream() → 委托 stream.rs
-- **stream.rs** 是流式引擎核心（~550 行）：路由解析 → WebSearch 劫持（enrich_ir_with_search）→ 立即返回 Response（含 keepalive）→ 后台 spawn 双循环重试 + 流式转发
-- **forward.rs** 是流式转发分支（~350 行）：passthrough / O→A / A→O 三种流转发模式
+- **handler.rs** 是薄入口层（~300 行）：提取 API key → authenticate_and_stream() → 委托 stream.rs
+- **stream.rs** 是流式引擎核心（~630 行）：路由解析 → WebSearch 劫持（ensure_websearch_tool 替换客户端搜索工具）→ 立即返回 Response（含 keepalive）→ 后台 spawn 双循环重试 + 流式转发
+- **forward.rs** 是统一 IR 转发层（~350 行）：单一 `forward_stream_ir` 函数处理所有格式组合（上游字节 → IR 事件 → 客户端 SSE 字节），不再有 passthrough / O→A / A→O 三路分支
+- **websearch.rs** 是 WebSearch 工具调用循环（~1630 行）：模型自主决定是否搜索 + 搜索什么 + 搜索几次，代理在本地执行 Bing 搜索并将结果回传，最多 10 轮 + 无进展检测（连续 2 轮查询词相似度 ≥ 0.6 提前收尾），耗尽后清理工具痕迹合并结果为文本指令收尾
 - **ir/** 是协议转换核心：三种客户端格式（Anthropic Messages / OpenAI Chat Completions / OpenAI Responses）统一转换为 IR 再渲染回目标格式
 - 新增代理逻辑时，应修改 stream.rs（路由/重试）、forward.rs（流转发）或 ir/（协议转换）而非 handler.rs
 - 修改认证/配额/请求体准备时，修改 handler.rs 的 authenticate_and_stream()

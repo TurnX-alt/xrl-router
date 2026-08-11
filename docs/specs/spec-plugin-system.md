@@ -29,7 +29,7 @@ xrl-router
   "type": "register",
   "plugin_id": "plugin-wukong",
   "provider": {
-    "kind": "deap",
+    "kind": "chat_completions",
     "base_url": "http://localhost:19067",
     "api_path": "/v1/chat/completions"
   },
