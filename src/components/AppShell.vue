@@ -1,19 +1,17 @@
 <template>
   <div class="app-shell">
-    <aside class="nav-drawer">
-      <nav class="nav-drawer__items">
-        <button
-          v-for="item in navItems"
-          :key="item.path"
-          class="nav-item"
-          :class="{ 'nav-item--active': isActive(item.path) }"
-          @click="navigateTo(item.path)"
-        >
-          <span class="nav-item__icon mdi" :class="item.icon"></span>
-          <span class="nav-item__label md-typescale-label-large">{{ t(item.labelKey) }}</span>
-        </button>
-      </nav>
-    </aside>
+    <nav class="nav-rail">
+      <button
+        v-for="item in navItems"
+        :key="item.path"
+        class="nav-item"
+        :class="{ 'nav-item--active': isActive(item.path) }"
+        @click="navigateTo(item.path)"
+      >
+        <span class="nav-item__icon"><MdiIcon :icon="item.icon" /></span>
+        <span class="nav-label">{{ t(item.labelKey) }}</span>
+      </button>
+    </nav>
 
     <main class="app-main">
       <slot />
@@ -24,16 +22,17 @@
 <script setup lang="ts">
 import { useRouter, useRoute } from 'vue-router';
 import { t } from '../i18n';
+import MdiIcon from './MdiIcon.vue';
 
 const router = useRouter();
 const route = useRoute();
 
 const navItems: { path: string; labelKey: string; icon: string }[] = [
-  { path: '/fm', labelKey: 'nav.fm', icon: 'mdi-radio' },
-  { path: '/providers', labelKey: 'nav.providers', icon: 'mdi-cloud' },
-  { path: '/keys', labelKey: 'nav.keys', icon: 'mdi-key' },
-  { path: '/stats', labelKey: 'nav.stats', icon: 'mdi-chart-bar' },
-  { path: '/settings', labelKey: 'nav.settings', icon: 'mdi-cog' },
+  { path: '/fm', labelKey: 'nav.fm', icon: 'radio' },
+  { path: '/providers', labelKey: 'nav.providers', icon: 'cloud' },
+  { path: '/keys', labelKey: 'nav.keys', icon: 'key' },
+  { path: '/stats', labelKey: 'nav.stats', icon: 'chart-bar' },
+  { path: '/settings', labelKey: 'nav.settings', icon: 'cog' },
 ];
 
 function isActive(path: string) {
@@ -47,64 +46,81 @@ function navigateTo(path: string) {
 
 <style scoped>
 .app-shell {
-  display: grid;
-  grid-template-columns: 280px 1fr;
-  grid-template-rows: 1fr;
+  display: flex;
   min-height: 100vh;
   background: var(--md-sys-color-surface);
   color: var(--md-sys-color-on-surface);
 }
 
-.nav-drawer {
-  background: var(--md-sys-color-surface-container-low);
-  border-right: 1px solid var(--md-sys-color-outline-variant);
-  padding: 32px 12px 16px;
+.nav-rail {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  align-items: center;
+  flex-shrink: 0;
+  width: 84px;
+  height: 100vh;
   position: sticky;
   top: 0;
-  height: 100vh;
-  overflow-y: auto;
+  padding-top: 24px;
+  background: var(--md-sys-color-surface);
+  border-right: 1px solid var(--md-sys-color-outline-variant);
   box-sizing: border-box;
-}
-
-.nav-drawer__items {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  overflow-y: auto;
 }
 
 .nav-item {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 12px;
+  justify-content: center;
+  gap: 4px;
   width: 100%;
-  padding: 0 16px;
-  height: 56px;
+  padding: 4px 0;
   border: none;
   background: transparent;
-  color: var(--md-sys-color-on-surface-variant);
-  border-radius: var(--md-sys-shape-corner-full);
-  cursor: pointer;
   font-family: inherit;
-  font-size: inherit;
-  transition: background 200ms cubic-bezier(0.2, 0, 0, 1), color 200ms;
+  cursor: pointer;
 }
 
-.nav-item:hover {
-  background: var(--md-sys-color-surface-container-high);
+.nav-item__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--md-sys-shape-corner-full);
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 24px;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
 }
 
-.nav-item--active {
+.nav-item--active .nav-item__icon {
   background: var(--md-sys-color-secondary-container);
   color: var(--md-sys-color-on-secondary-container);
-  font-weight: 500;
 }
 
-.nav-item__icon { font-size: 24px; }
+.nav-item:hover:not(.nav-item--active) .nav-item__icon {
+  background: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
+}
+
+.nav-label {
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1rem;
+  letter-spacing: 0.03125rem;
+  text-align: center;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.nav-item--active .nav-label {
+  color: var(--md-sys-color-on-secondary-container);
+}
 
 .app-main {
+  flex: 1;
+  min-width: 0;
   padding: 32px;
   box-sizing: border-box;
   display: grid;
@@ -115,29 +131,11 @@ function navigateTo(path: string) {
   grid-column: 2;
 }
 
-@media (max-width: 840px) {
-  .app-shell {
-    grid-template-columns: 76px 1fr;
-  }
-  .app-main {
-    display: block;
-  }
-  .nav-drawer {
-    padding: 20px 6px 12px;
-  }
-  .nav-item__label { display: none; }
-  .nav-item { justify-content: center; padding: 0; }
-  .app-main {
-    padding: 24px 16px;
-  }
-}
-
 @media (max-width: 480px) {
   .app-shell {
-    grid-template-columns: 1fr;
-    grid-template-rows: 1fr auto;
+    flex-direction: column;
   }
-  .nav-drawer {
+  .nav-rail {
     position: fixed;
     bottom: 0;
     left: 0;
@@ -147,31 +145,15 @@ function navigateTo(path: string) {
     height: auto;
     flex-direction: row;
     justify-content: space-around;
-    padding: 8px 4px;
+    padding: 4px 4px 8px;
     border-right: none;
     border-top: 1px solid var(--md-sys-color-outline-variant);
     z-index: 100;
   }
-  .nav-drawer__items {
-    flex-direction: row;
-    width: 100%;
-    justify-content: space-around;
-  }
-  .nav-item {
-    flex-direction: column;
-    width: auto;
-    height: 56px;
-    padding: 4px 12px;
-    gap: 2px;
-    font-size: 10px;
-  }
-  .nav-item__label {
-    display: block;
-    font-size: 11px;
-  }
   .app-main {
     padding: 16px;
-    padding-bottom: 80px;
+    padding-bottom: 84px;
+    display: block;
   }
 }
 </style>

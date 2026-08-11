@@ -3,7 +3,7 @@
     <div class="page__header">
       <h2 class="md-typescale-headline-medium page__title">{{ t('keys.title') }}</h2>
       <md-filled-button @click="openCreate">
-        <span slot="icon" class="mdi mdi-plus"></span>
+        <MdiIcon icon="plus" slot="icon" />
         {{ t('keys.create') }}
       </md-filled-button>
     </div>
@@ -11,7 +11,7 @@
     <div v-if="loading" class="empty-state"><md-circular-progress indeterminate></md-circular-progress></div>
 
     <div v-else-if="!keys.length" class="empty-state">
-      <span class="mdi mdi-inbox-outline empty-state__icon"></span>
+      <MdiIcon icon="inbox-outline" class="empty-state__icon" />
       <p class="md-typescale-body-large">{{ t('common.empty') }}</p>
     </div>
 
@@ -43,7 +43,7 @@
             <td class="time-cell">{{ formatTime(k.updated_at) }}</td>
             <td class="actions-cell">
               <md-icon-button :id="'key-btn-' + k.id" @click="toggleMenu(k)">
-                <span class="mdi mdi-dots-vertical"></span>
+                <MdiIcon icon="dots-vertical" />
               </md-icon-button>
             </td>
           </tr>
@@ -59,16 +59,16 @@
       @closed="menuOpen = null"
     >
       <md-menu-item @click="renameFromMenu">
-        <span class="mdi mdi-pencil-outline"></span> {{ t('keys.rename') }}
+        <MdiIcon icon="pencil-outline" /> {{ t('keys.rename') }}
       </md-menu-item>
       <md-menu-item @click="permFromMenu">
-        <span class="mdi mdi-shield-outline"></span> {{ t('keys.edit_perm') }}
+        <MdiIcon icon="shield-outline" /> {{ t('keys.edit_perm') }}
       </md-menu-item>
       <md-menu-item @click="quotaFromMenu">
-        <span class="mdi mdi-tune-variant"></span> {{ t('keys.config_quota') }}
+        <MdiIcon icon="tune-variant" /> {{ t('keys.config_quota') }}
       </md-menu-item>
       <md-menu-item class="menu-item--danger" @click="deleteFromMenu">
-        <span class="mdi mdi-delete-outline"></span> {{ t('common.delete') }}
+        <MdiIcon icon="delete-outline" /> {{ t('common.delete') }}
       </md-menu-item>
     </md-menu>
 
@@ -97,7 +97,7 @@
     <md-dialog :open="!!newKeyPlain" @close="newKeyPlain = ''">
       <div slot="headline">{{ t('keys.created_once') }}</div>
       <div slot="content" class="form">
-        <p class="warn md-typescale-body-medium"><span class="mdi mdi-alert"></span>{{ t('keys.save_warning') }}</p>
+        <p class="warn md-typescale-body-medium"><MdiIcon icon="alert" />{{ t('keys.save_warning') }}</p>
         <p class="md-typescale-body-medium deploy-label">{{ t('keys.plain_key') }}</p>
         <div class="key-box mono md-typescale-body-large">{{ newKeyPlain }}</div>
         <template v-if="deployLink">
@@ -106,9 +106,9 @@
         </template>
       </div>
       <div slot="actions">
-        <md-text-button @click="copyKey"><span slot="icon" class="mdi mdi-content-copy"></span>{{ t('common.copy') }}</md-text-button>
-        <md-filled-button :disabled="!deployLink" @click="copyDeployLink"><span slot="icon" class="mdi mdi-link-variant"></span>{{ t('keys.copy_deploy') }}</md-filled-button>
-        <md-text-button @click="newKeyPlain = ''">{{ t('common.done') }}</md-text-button>
+        <md-text-button @click="copyKey"><MdiIcon icon="content-copy" slot="icon" />{{ t('keys.copy_key') }}</md-text-button>
+        <md-text-button :disabled="!deployLink" @click="copyDeployLink"><MdiIcon icon="link-variant" slot="icon" />{{ t('keys.copy_deploy') }}</md-text-button>
+        <md-filled-button @click="newKeyPlain = ''">{{ t('common.done') }}</md-filled-button>
       </div>
     </md-dialog>
 
@@ -171,6 +171,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { serviceKeysApi, providersApi, modelsApi, installApi, type ServiceKey } from '../api';
 import { wsClient } from '../ws';
 import { t } from '../i18n';
+import MdiIcon from '../components/MdiIcon.vue';
 
 type KeyRow = ServiceKey & { used_5h?: number; used_7d?: number };
 

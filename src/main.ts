@@ -45,9 +45,6 @@ import '@material/web/tabs/secondary-tab.js';
 import '@material/web/labs/segmentedbutton/outlined-segmented-button.js';
 import '@material/web/labs/segmentedbuttonset/outlined-segmented-button-set.js';
 
-// Material Design Icons (MDI)
-import '@mdi/font/css/materialdesignicons.min.css';
-
 const app = createApp(App);
 const pinia = createPinia();
 const router = createRouter({

@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@material/web": "^2.2.0",
-    "@mdi/font": "^7.4.47",
+    "@mdi/js": "^7.4.47",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-autostart": "^2.5.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",

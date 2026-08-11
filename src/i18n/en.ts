@@ -1,6 +1,6 @@
 export default {
   // ── Navigation ──
-  'nav.fm': 'Claude FM',
+  'nav.fm': 'FM',
   'nav.providers': 'Providers',
   'nav.keys': 'Keys',
   'nav.stats': 'Stats',
@@ -141,6 +141,7 @@ export default {
   'keys.save_warning': 'Save it now. It cannot be viewed again after closing.',
   'keys.plain_key': 'Plaintext Key',
   'keys.deploy_link': 'Deploy link (contains plaintext key, do not share)',
+  'keys.copy_key': 'Copy Key',
   'keys.copy_deploy': 'Copy Deploy Link',
   'keys.unlimited': 'Unlimited',
   'keys.unit_wan': 'K',

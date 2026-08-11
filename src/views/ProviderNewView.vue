@@ -55,7 +55,7 @@
     ></md-outlined-text-field>
 
     <div v-if="isPluginMode && pluginInfo && pluginInfo.key_count > 0" class="keys-info">
-      <span class="mdi mdi-key"></span>
+      <MdiIcon icon="key" />
       {{ t('providerNew.keys_synced', { count: pluginInfo.key_count }) }}
     </div>
 
@@ -73,6 +73,7 @@ import { ref, computed, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { providersApi, keysApi, modelsApi } from '../api';
 import { t } from '../i18n';
+import MdiIcon from '../components/MdiIcon.vue';
 
 const router = useRouter();
 const route = useRoute();

@@ -1,6 +1,6 @@
 export default {
   // ── 导航 ──
-  'nav.fm': 'Claude FM',
+  'nav.fm': 'FM',
   'nav.providers': '供应商',
   'nav.keys': '密钥',
   'nav.stats': '统计',
@@ -141,6 +141,7 @@ export default {
   'keys.save_warning': '请妥善保存，关闭后无法再次查看',
   'keys.plain_key': '明文密钥',
   'keys.deploy_link': '分发链接（含明文密钥，勿公开）',
+  'keys.copy_key': '复制密钥',
   'keys.copy_deploy': '复制分发链接',
   'keys.unlimited': '不设限',
   'keys.unit_wan': '万',

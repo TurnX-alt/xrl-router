@@ -6,10 +6,10 @@
       :aria-label="fmState.playing ? t('fm.pause') : t('fm.play')"
       @click="fmPlayer.toggle"
     >
-      <span
-        class="mdi fm-toggle__icon"
-        :class="fmState.playing ? 'mdi-pause' : 'mdi-play'"
-      ></span>
+      <MdiIcon
+        class="fm-toggle__icon"
+        :icon="fmState.playing ? 'pause' : 'play'"
+      />
     </button>
     <div class="fm-caption">{{ caption }}</div>
   </div>
@@ -23,6 +23,7 @@
 import { computed } from 'vue';
 import { t } from '../i18n';
 import { fmState, fmPlayer } from '../fm/player';
+import MdiIcon from '../components/MdiIcon.vue';
 
 const caption = computed(() => {
   // 始终显示当前曲目（暂停不清空，避免暂停/播放闪烁）。
