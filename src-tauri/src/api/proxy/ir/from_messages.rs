@@ -37,12 +37,12 @@ pub fn messages_req_to_ir(req: &Value) -> IrRequest {
                 .filter_map(|t| {
                     // server-side 内置工具（web_search_20250305 等）：可能只有 type 没有 name，
                     // 归一化为 name="web_search"，保证 websearch 劫持对 Messages 客户端生效
-                    let name = match t["name"].as_str() {
-                        Some(n) => n.to_string(),
+                    let (name, is_websearch) = match t["name"].as_str() {
+                        Some(n) => (n.to_string(), n.starts_with("web_search")),
                         None => {
                             let ty = t["type"].as_str().unwrap_or("");
                             if ty.starts_with("web_search") {
-                                "web_search".to_string()
+                                ("web_search".to_string(), true)
                             } else {
                                 return None;
                             }
@@ -54,7 +54,23 @@ pub fn messages_req_to_ir(req: &Value) -> IrRequest {
                         input_schema: t
                             .get("input_schema")
                             .cloned()
-                            .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+                            .unwrap_or_else(|| {
+                                if is_websearch {
+                                    // web_search 工具需要合理的 schema，让上游 LLM 知道如何填写 query
+                                    serde_json::json!({
+                                        "type": "object",
+                                        "properties": {
+                                            "query": {
+                                                "type": "string",
+                                                "description": "The search query"
+                                            }
+                                        },
+                                        "required": ["query"]
+                                    })
+                                } else {
+                                    serde_json::json!({"type": "object", "properties": {}})
+                                }
+                            }),
                     })
                 })
                 .collect()

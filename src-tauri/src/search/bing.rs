@@ -1,16 +1,148 @@
-//! Bing 网页搜索包装（cn.bing.com 中国版 + 完整浏览器指纹）。
-//! cn.bing.com 对服务器端反爬比 www.bing.com 宽松。
+//! Bing 搜索引擎（纯 Rust HTTP 请求 + 双域名 fallback）。
 //!
-//! 关键策略：
-//! - **绕过代理直连**：cn.bing.com 是国内站点，走代理会导致出口 IP 在海外，
-//!   Bing 会降级为"热门站点推荐"模式（返回今日头条/百度热搜等非相关结果）。
-//! - **每次搜索用独立 cookie 会话**：避免全局 cookie 累积污染搜索结果。
+//! 背景：早期 HTTP 爬虫（裸 reqwest）被 Bing 识别为非浏览器请求，对中文查询
+//! 返回降级「热门站点推荐」结果（实测查询「张雪峰 2026」只返回「张」字的字典
+//! 释义）。曾改用隐藏 WebView（WKWebView）执行，实测发现**关键在完整浏览器头**
+//! （尤其 `sec-ch-ua` 系列 + UA + Accept-Language），而非 TLS 指纹或 JS 执行——
+//! reqwest 带完整浏览器头 + `cookie_store(true)` + 预热（先 GET 主页建 cookie）
+//! 即可拿到与 WebView 完全相同的正常结果。
+//!
+//! 策略：
+//! - **专用搜索 client**：完整浏览器头 + `cookie_store(true)` + 直连（不走系统
+//!   代理——Bing 对代理出口 IP 会降级）
+//! - **懒预热**：首次搜索前 GET `cn.bing.com/` 建 cookie（复用会话），后续搜索
+//!   直接复用，不再降级
+//! - **www.bing.com 优先**，空壳/失败/降级 → fallback cn.bing.com
+//! - **降级检测 + 简化重试**：结果与查询不相关（字典释义页）时用首词重搜
+//! - **ck/a 重定向解码**：Bing 结果链接可能是 `www.bing.com/ck/a?u=a1<base64url>`，
+//!   base64url 解码还原真实 URL（SearXNG bing.py 同款逻辑）
 
-use scraper::{Html, Selector};
-use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+use base64::Engine as _;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, UPGRADE_INSECURE_REQUESTS, USER_AGENT};
+use scraper::{Html, Selector};
+use serde::Serialize;
+use tokio::sync::Mutex;
+
+/// 单次 HTTP 搜索的超时（秒）。
+const SEARCH_TIMEOUT_SECS: u64 = 20;
+
+/// 搜索 HTTP 客户端：完整浏览器头 + cookie_store 复用 + 懒预热。
+///
+/// 放在 AppState 中全局复用：
+/// - `client` 带 `cookie_store(true)`——cookie 会话持续，后续搜索不降级
+/// - `prewarmed` 标记首次预热（GET 主页建 cookie）是否完成
+/// - `prewarm_lock` 保证并发首搜时只预热一次
+pub struct SearchHttp {
+    client: reqwest::Client,
+    prewarmed: AtomicBool,
+    prewarm_lock: Mutex<()>,
+}
+
+impl SearchHttp {
+    /// 构建搜索专用 client（完整浏览器头 + cookie_store + 直连）。
+    ///
+    /// 注意：**不**用 `http::build_http_client()`——它会继承系统代理，Bing 对
+    /// 代理出口 IP（海外）返回降级结果。搜索必须直连。
+    pub fn new() -> Self {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            ),
+        );
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            ),
+        );
+        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"));
+        headers.insert(UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
+        // Client Hints：真实 Chrome 会发送，Bing 据此识别浏览器会话
+        headers.insert(
+            "sec-ch-ua",
+            HeaderValue::from_static("\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\""),
+        );
+        headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
+        headers.insert("sec-ch-ua-platform", HeaderValue::from_static("\"macOS\""));
+
+        let client = reqwest::Client::builder()
+            .cookie_store(true) // 复用 cookie 会话
+            .default_headers(headers)
+            .build()
+            .expect("failed to build search http client");
+        Self {
+            client,
+            prewarmed: AtomicBool::new(false),
+            prewarm_lock: Mutex::new(()),
+        }
+    }
+
+    /// 确保 cookie 会话已建立（首次搜索前 GET 主页预热）。
+    ///
+    /// 幂等：已预热直接返回；并发首搜由 Mutex 串行化，只预热一次。
+    /// 预热失败不阻断搜索（降级检测兜底），仅记 warn。
+    pub async fn ensure_prewarmed(&self) {
+        if self.prewarmed.load(Ordering::Relaxed) {
+            return;
+        }
+        let _guard = self.prewarm_lock.lock().await;
+        if self.prewarmed.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.client.get("https://cn.bing.com/").send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                tracing::debug!(status, "bing: prewarm page fetched (cookie established)");
+                self.prewarmed.store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "bing: prewarm failed (will retry next search)");
+            }
+        }
+    }
+
+    /// 执行一次搜索请求，返回响应文本。
+    async fn get(&self, url: url::Url) -> anyhow::Result<String> {
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(SEARCH_TIMEOUT_SECS),
+            self.client.get(url).send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("bing: search timed out ({}s)", SEARCH_TIMEOUT_SECS))?
+        .map_err(|e| anyhow::anyhow!("bing: request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("bing: HTTP {}", resp.status().as_u16());
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("bing: read body failed: {}", e))?;
+        Ok(text)
+    }
+}
+
+impl Default for SearchHttp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for SearchHttp {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            prewarmed: AtomicBool::new(self.prewarmed.load(Ordering::Relaxed)),
+            prewarm_lock: Mutex::new(()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
@@ -19,113 +151,103 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
-/// 构建一个带独立 cookie jar 的 client（每次搜索一个干净会话）。
-/// **绕过代理直连**：cn.bing.com 是国内站点，走代理反而会因为出口 IP 在海外
-/// 而被 Bing 降级为"热门站点推荐"模式（返回今日头条/百度热搜等非相关结果）。
-fn build_fresh_client() -> anyhow::Result<reqwest::Client> {
-    let jar = Arc::new(reqwest::cookie::Jar::default());
-    Ok(reqwest::Client::builder()
-        .user_agent(UA)
-        .cookie_provider(jar)
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?)
+/// 构造 Bing 搜索 URL（保留旧 HTTP 版同款参数：q / adlt / mkt）。
+fn build_search_url(domain: &str, query: &str) -> url::Url {
+    url::Url::parse_with_params(
+        &format!("https://{}/search", domain),
+        &[("q", query), ("adlt", "off"), ("mkt", "zh-CN")],
+    )
+    .expect("static URL with params cannot fail")
 }
 
-/// 搜索：每次创建新 client + cookie 会话，避免累积 cookie 污染。
-pub async fn search(query: &str) -> anyhow::Result<Vec<SearchResult>> {
-    let client = build_fresh_client()?;
+/// 对一个域名执行 HTTP 搜索。
+async fn search_domain(
+    search: &SearchHttp,
+    domain: &str,
+    query: &str,
+) -> anyhow::Result<Vec<SearchResult>> {
+    let url = build_search_url(domain, query);
+    let html = search.get(url).await?;
 
-    // 暖首页（拿初始 cookie）
-    let warm_ok = client
-        .get("https://cn.bing.com/")
-        .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .header("Sec-Fetch-Dest", "document")
-        .header("Sec-Fetch-Mode", "navigate")
-        .header("Sec-Fetch-Site", "none")
-        .header("Upgrade-Insecure-Requests", "1")
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // 诊断日志：把完整 HTML 写到文件，便于分析 Bing 实际返回内容
+    let diag_path = "/tmp/xrl-websearch-debug.html";
+    let _ = std::fs::write(diag_path, &html);
+    let preview: String = html.chars().take(500).collect();
+    tracing::info!(domain, query, html_len = html.len(), preview = %preview, "bing: http html received");
 
-    if !warm_ok {
-        tracing::warn!("bing: warm_home failed, proceeding anyway");
-    }
-
-    let resp = client
-        .get("https://cn.bing.com/search")
-        .query(&[("q", query), ("ensearch", "0")])
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .header("Sec-CH-UA", r#""Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24""#)
-        .header("Sec-CH-UA-Mobile", "?0")
-        .header("Sec-CH-UA-Platform", r#""Windows""#)
-        .header("Sec-Fetch-Dest", "document")
-        .header("Sec-Fetch-Mode", "navigate")
-        .header("Sec-Fetch-Site", "same-origin")
-        .header("Sec-Fetch-User", "?1")
-        .header("Upgrade-Insecure-Requests", "1")
-        .header("Referer", "https://cn.bing.com/")
-        .send()
-        .await?;
-
-    let html = resp.error_for_status()?.text().await?;
-
-    // 反爬检测
-    if html.contains("captcha") || html.contains("Challenge") {
-        tracing::warn!(query = %query, "bing: anti-bot page detected!");
-    }
-
-    let results = parse(&html);
-    tracing::info!(query = %query, results_count = results.len(), "bing: search complete");
-    Ok(results)
+    Ok(parse_results(&html))
 }
 
-/// cn.bing.com 搜索结果解析。
+/// Bing 结果链接解码：`https://www.bing.com/ck/a?u=a1<base64url>` → 真实 URL。
+fn decode_ck_href(href: &str) -> String {
+    if let Some(qs) = href.strip_prefix("https://www.bing.com/ck/a?") {
+        if let Some(u) = qs.split('&').find_map(|kv| kv.strip_prefix("u=")) {
+            if let Some(encoded) = u.strip_prefix("a1") {
+                // base64url without padding → 补 padding 后解码
+                let padded = format!("{}{}", encoded, "=".repeat((4 - encoded.len() % 4) % 4));
+                if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE.decode(padded.as_bytes()) {
+                    if let Ok(s) = String::from_utf8(decoded) {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    href.to_string()
+}
+
+/// 结果 URL 过滤：去掉 Bing 内部跳转/服务页链接。
+fn is_external_url(href: &str) -> bool {
+    href.starts_with("http")
+        && !href.contains("bing.com")
+        && !href.contains("microsoft.com")
+        && !href.contains("msn.com")
+}
+
+/// 解析 Bing 搜索结果：`ol#b_results > li.b_algo` 容器。
 ///
-/// 选择器策略：
-/// - `li.b_algo` 是 Bing 标准搜索结果容器（排除侧边栏/推荐区域）
-/// - `h2 a` 在 b_algo 内 → 真正的搜索结果链接
-/// - `.b_caption` → 摘要文本
-fn parse(html: &str) -> Vec<SearchResult> {
+/// 输入既可以是完整 HTML 文档，也可以是 JS 回传的 `li.b_algo` 容器片段
+/// （`Html::parse_document` 对片段同样成立，`ol#b_results li.b_algo` 选择器命中
+/// 包含 ol 的片段；实际回传即片段集合）。
+fn parse_results(html: &str) -> Vec<SearchResult> {
     let document = Html::parse_document(html);
-    let algo_sel = Selector::parse("li.b_algo").unwrap();
+    let algo_sel = Selector::parse("ol#b_results li.b_algo").unwrap();
     let link_sel = Selector::parse("h2 a").unwrap();
-    let snippet_sel = Selector::parse(".b_caption p, .b_caption .b_lineclamp2, .b_lineclamp4, .b_lineclamp2").unwrap();
+    let p_sel = Selector::parse("p").unwrap();
 
     let mut results = Vec::new();
-
-    for algo in document.select(&algo_sel) {
-        // 从 b_algo 容器内提取链接
-        let (title, url) = match algo.select(&link_sel).next() {
-            Some(a) => {
-                let href = a.value().attr("href").unwrap_or("").to_string();
-                if !href.starts_with("http")
-                    || href.contains("bing.com")
-                    || href.contains("microsoft.com")
-                    || href.contains("msn.com")
-                {
-                    continue;
-                }
-                let title = a.text().collect::<String>().trim().to_string();
-                if title.is_empty() {
-                    continue;
-                }
-                (title, href)
-            }
+    for item in document.select(&algo_sel) {
+        let link = match item.select(&link_sel).next() {
+            Some(l) => l,
             None => continue,
         };
 
-        // 从同一 b_algo 容器内提取摘要
-        let snippet = algo
-            .select(&snippet_sel)
-            .map(|e| e.text().collect::<String>().trim().to_string())
-            .find(|s| !s.is_empty())
-            .unwrap_or_default();
+        let href = link.value().attr("href").unwrap_or("").to_string();
+        let title = link.text().collect::<String>().trim().to_string();
+        if href.is_empty() || title.is_empty() {
+            continue;
+        }
 
-        results.push(SearchResult { title, url, snippet });
+        // 解码 Bing 重定向链接为真实 URL
+        let url = decode_ck_href(&href);
+        if !is_external_url(&url) {
+            continue;
+        }
+
+        // 摘要：取全部 <p> 文本拼接
+        let snippet = item
+            .select(&p_sel)
+            .map(|p| p.text().collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+
+        results.push(SearchResult {
+            title,
+            url,
+            snippet,
+        });
         if results.len() >= 8 {
             break;
         }
@@ -134,116 +256,210 @@ fn parse(html: &str) -> Vec<SearchResult> {
     results
 }
 
+/// 搜索入口：预热 cookie → www.bing.com 优先，空壳/失败/降级时 fallback cn.bing.com。
+pub async fn search(search: &SearchHttp, query: &str) -> anyhow::Result<Vec<SearchResult>> {
+    // 0. 预热：首次搜索前 GET 主页建 cookie（复用会话，后续不再降级）
+    search.ensure_prewarmed().await;
+
+    // 1. www.bing.com（国际版，质量更高）
+    match search_domain(search, "www.bing.com", query).await {
+        Ok(results) if !results.is_empty() && !is_degraded_results(&results, query) => {
+            tracing::info!(query = %query, results_count = results.len(), "bing: www http results");
+            return Ok(results);
+        }
+        Ok(results) if !results.is_empty() => {
+            tracing::warn!(query = %query, results_count = results.len(), "bing: www degraded results, retrying with simplified query");
+        }
+        Ok(_) => {
+            tracing::debug!(query = %query, "bing: www empty (shell page?), fallback to cn");
+        }
+        Err(e) => {
+            tracing::debug!(query = %query, error = %e, "bing: www failed, fallback to cn");
+        }
+    }
+
+    // 1.5 降级页检测：结果全是字典/百科释义（Bing 对热点人名+附加词的风控），
+    // 改用简化查询（仅第一个词）重搜——实测「张雪峰 高考志愿」降级，
+    // 但「张雪峰」单搜正常
+    if let Some(simplified) = simplify_query(query) {
+        tracing::info!(query = %query, simplified = %simplified, "bing: retrying with simplified query");
+        match search_domain(search, "www.bing.com", &simplified).await {
+            Ok(results) if !results.is_empty() && !is_degraded_results(&results, query) => {
+                tracing::info!(query = %simplified, results_count = results.len(), "bing: www simplified results");
+                return Ok(results);
+            }
+            Ok(_) => {
+                tracing::debug!(query = %simplified, "bing: www simplified also degraded/empty");
+            }
+            Err(e) => {
+                tracing::debug!(query = %simplified, error = %e, "bing: www simplified failed");
+            }
+        }
+    }
+
+    // 2. cn.bing.com 兜底
+    let results = search_domain(search, "cn.bing.com", query).await?;
+    tracing::info!(query = %query, results_count = results.len(), "bing: cn http results");
+    Ok(results)
+}
+
+/// 降级结果检测：结果与查询不相关时判定为 Bing 降级页。
+///
+/// 触发特征：热点人名 + 附加词的查询被 Bing 风控，返回与查询无关的
+/// 单字字典释义页（查「张雪峰 高考志愿」返回「张（汉语汉字）」）。
+/// 用「结果是否包含查询首词」判断相关性——正常搜索结果标题/摘要几乎
+/// 都包含核心实体（首词），降级页则几乎都不包含。
+fn is_degraded_results(results: &[SearchResult], query: &str) -> bool {
+    if results.len() < 3 {
+        return false;
+    }
+    let first_word = query.split_whitespace().next().unwrap_or("");
+    // 首词太短（虚词/单字）不可靠，不判定
+    let clean = first_word.trim_matches('"');
+    if clean.chars().count() < 2 {
+        return false;
+    }
+    // 检查结果标题/摘要里包含查询首词的比例（大小写不敏感）
+    let containing = results
+        .iter()
+        .filter(|r| {
+            r.title.to_lowercase().contains(&clean.to_lowercase())
+                || r.snippet.to_lowercase().contains(&clean.to_lowercase())
+        })
+        .count();
+    let ratio = containing as f64 / results.len() as f64;
+    // 少于 30% 的结果包含查询首词 → 降级
+    ratio < 0.3
+}
+
+/// 简化查询：取查询的第一个「词」（按空白/引号切分），用于降级重试。
+///
+/// 实测：Bing 对「张雪峰 高考志愿」这类热点人名+附加词降级，但单查人名
+/// 「张雪峰」返回正常结果。返回 None 表示查询无需简化（单词或不可切分）。
+fn simplify_query(query: &str) -> Option<String> {
+    let first = query.split_whitespace().next()?;
+    // 去掉可能的引号
+    let clean = first.trim_matches('"').trim();
+    if clean.is_empty() || clean == query.trim() {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore = "real network call"]
-    async fn test_real_search_zhangxuefeng() {
-        let query = "张雪峰的死因";
-        println!("\n=== Bing Search: {} ===\n", query);
-        match search(query).await {
-            Ok(results) => {
-                println!("Got {} results:\n", results.len());
-                for (i, r) in results.iter().enumerate() {
-                    println!("[{}] {}", i + 1, r.title);
-                    println!("    URL: {}", r.url);
-                    println!("    Snippet: {}", r.snippet);
-                    println!();
-                }
-            }
-            Err(e) => {
-                println!("Search failed: {}", e);
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "real network call"]
-    async fn test_real_search_gold_price() {
-        let query = "今日金价";
-        println!("\n=== Bing Search: {} ===\n", query);
-        match search(query).await {
-            Ok(results) => {
-                println!("Got {} results:\n", results.len());
-                for (i, r) in results.iter().enumerate() {
-                    println!("[{}] {}", i + 1, r.title);
-                    println!("    URL: {}", r.url);
-                    println!("    Snippet: {}", r.snippet);
-                    println!();
-                }
-            }
-            Err(e) => {
-                println!("Search failed: {}", e);
-            }
-        }
-    }
-
-    /// 连续多次搜索验证：cookie 不累积，每次都是干净结果
-    #[tokio::test]
-    #[ignore = "real network call"]
-    async fn test_consecutive_searches_no_cookie_pollution() {
-        let queries = ["今日金价", "张雪峰", "Python 教程"];
-        for query in queries {
-            println!("\n=== Search: {} ===", query);
-            match search(query).await {
-                Ok(results) => {
-                    println!("Got {} results", results.len());
-                    for (i, r) in results.iter().enumerate() {
-                        println!("  [{}] {} — {}", i + 1, r.title, r.url);
-                    }
-                }
-                Err(e) => println!("FAILED: {}", e),
-            }
-        }
+    #[test]
+    fn test_build_search_url() {
+        let u = build_search_url("www.bing.com", "张雪峰 2026");
+        assert_eq!(u.host_str(), Some("www.bing.com"));
+        assert!(u.query_pairs().any(|(k, v)| k == "q" && v == "张雪峰 2026"));
+        assert!(u.query_pairs().any(|(k, v)| k == "adlt" && v == "off"));
+        assert!(u.query_pairs().any(|(k, v)| k == "mkt" && v == "zh-CN"));
     }
 
     #[test]
-    fn test_parse_b_algo_container() {
+    fn test_decode_ck_href() {
+        // base64url("https://example.com/page?x=1") = aHR0cHM6Ly9leGFtcGxlLmNvbS9wYWdlP3g9MQ
+        let href = "https://www.bing.com/ck/a?u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9wYWdlP3g9MQ&ntb=1";
+        assert_eq!(decode_ck_href(href), "https://example.com/page?x=1");
+        // 非 ck/a 链接原样返回
+        assert_eq!(decode_ck_href("https://example.com/direct"), "https://example.com/direct");
+    }
+
+    #[test]
+    fn test_is_external_url() {
+        assert!(is_external_url("https://example.com/page"));
+        assert!(!is_external_url("https://www.bing.com/ck/a?u=xxx"));
+        assert!(!is_external_url("https://www.microsoft.com"));
+        assert!(!is_external_url("https://www.msn.com/zh-cn/news"));
+    }
+
+    #[test]
+    fn test_parse_results() {
         let html = r#"
         <html><body>
-        <li class="b_algo">
-            <h2><a href="https://example.com/page">Test Title</a></h2>
-            <div class="b_caption"><p>Test snippet here</p></div>
-        </li>
-        <li class="b_algo">
-            <h2><a href="https://other.com">Other Title</a></h2>
-            <div class="b_caption"><p>Other snippet</p></div>
-        </li>
+        <ol id="b_results">
+            <li class="b_algo">
+                <h2><a href="https://example.com/page">Test Title</a></h2>
+                <p>Test snippet here</p>
+            </li>
+            <li class="b_algo">
+                <h2><a href="https://www.bing.com/ck/a?u=a1aHR0cHM6Ly9uZXdzLmV4YW1wbGUuY29tL2I">News Title</a></h2>
+                <p>News snippet</p>
+            </li>
+            <li class="b_algo">
+                <h2><a href="https://www.bing.com/images/search?q=x">Internal Link</a></h2>
+            </li>
+        </ol>
         </body></html>
         "#;
-        let results = parse(html);
+        let results = parse_results(html);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "Test Title");
         assert_eq!(results[0].url, "https://example.com/page");
         assert_eq!(results[0].snippet, "Test snippet here");
-        assert_eq!(results[1].title, "Other Title");
-    }
-
-    #[test]
-    fn test_parse_filters_bing_internal() {
-        let html = r#"
-        <html><body>
-        <li class="b_algo">
-            <h2><a href="https://www.bing.com/images">Bing Images</a></h2>
-            <div class="b_caption"><p>Internal</p></div>
-        </li>
-        <li class="b_algo">
-            <h2><a href="https://example.com">Real Result</a></h2>
-            <div class="b_caption"><p>Good</p></div>
-        </li>
-        </body></html>
-        "#;
-        let results = parse(html);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "Real Result");
+        // ck/a 重定向解码
+        assert_eq!(results[1].url, "https://news.example.com/b");
     }
 
     #[test]
     fn test_parse_empty_html() {
         let html = "<html><body></body></html>";
-        let results = parse(html);
-        assert!(results.is_empty());
+        assert!(parse_results(html).is_empty());
     }
 }
+
+    // ── 降级检测测试 ──
+
+    /// 真实降级场景：热点人名+附加词 → 全是「张」字字典释义（标题高度雷同）
+    #[test]
+    fn test_is_degraded_dictionary_results() {
+        let results = vec![
+            SearchResult { title: "张（汉语汉字）_百度百科".into(), url: "https://baike.baidu.com/item/张".into(), snippet: "".into() },
+            SearchResult { title: "张姓（中国姓氏）_百度百科".into(), url: "https://baike.baidu.com/item/张姓".into(), snippet: "".into() },
+            SearchResult { title: "张的意思,张的解释,张的拼音,张的部首,张的笔顺-汉语国学".into(), url: "https://www.hanyuguoxue.com/zidian/zi-24352".into(), snippet: "".into() },
+            SearchResult { title: "《张》的拼音,张字的意思、组词、部首、笔画、笔顺 - 汉语查".into(), url: "https://www.hgcha.com/zidian/6721ca45.html".into(), snippet: "".into() },
+            SearchResult { title: "张-字典-意思-解释-拼音-注音-读音-部首-出处".into(), url: "https://www.shidianguji.com/character/张".into(), snippet: "".into() },
+        ];
+        assert!(is_degraded_results(&results, "张雪峰 高考志愿填报"), "字典释义页应判定为降级");
+    }
+
+    /// 正常结果：标题各不相同（真实新闻/百科混合）→ 不降级
+    #[test]
+    fn test_is_degraded_normal_results() {
+        let results = vec![
+            SearchResult { title: "张雪峰报志愿逻辑及核心观点（完整详细版） - 知乎".into(), url: "https://zhuanlan.zhihu.com".into(), snippet: "".into() },
+            SearchResult { title: "2025张雪峰最全高考志愿填报指南！！！ - 知乎".into(), url: "https://zhuanlan.zhihu.com".into(), snippet: "".into() },
+            SearchResult { title: "张雪峰：高考是全世界最公平的考试".into(), url: "https://www.163.com".into(), snippet: "".into() },
+            SearchResult { title: "峰学蔚来教育科技有限公司 - 企查查".into(), url: "https://www.qcc.com".into(), snippet: "".into() },
+        ];
+        assert!(!is_degraded_results(&results, "张雪峰 高考志愿填报"), "正常结果不应判定为降级");
+    }
+
+    /// 少量结果（<3 条）不判定降级（可能是真没结果）
+    #[test]
+    fn test_is_degraded_few_results() {
+        let results = vec![
+            SearchResult { title: "张（汉语汉字）".into(), url: "https://baike.baidu.com".into(), snippet: "".into() },
+            SearchResult { title: "张姓".into(), url: "https://baike.baidu.com".into(), snippet: "".into() },
+        ];
+        assert!(!is_degraded_results(&results, "张雪峰 高考志愿填报"), "少于 3 条不判定降级");
+    }
+
+    /// 简化查询：多词查询取第一个词
+    #[test]
+    fn test_simplify_query_multi_word() {
+        assert_eq!(simplify_query("张雪峰 高考志愿填报"), Some("张雪峰".to_string()));
+        assert_eq!(simplify_query("张雪峰 高考 志愿 填报"), Some("张雪峰".to_string()));
+        assert_eq!(simplify_query("今天北京天气"), None, "无空白不可简化");
+    }
+
+    /// 简化查询：带引号
+    #[test]
+    fn test_simplify_query_quoted() {
+        assert_eq!(simplify_query("\"张雪峰\" 最新消息"), Some("张雪峰".to_string()));
+        assert_eq!(simplify_query("张雪峰"), None, "单词查询无需简化");
+    }

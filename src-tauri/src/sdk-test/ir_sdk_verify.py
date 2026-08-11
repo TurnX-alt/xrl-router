@@ -249,6 +249,98 @@ def verify_parse():
     check("responses usage 提取", u["input_tokens"] == 500 and u["output_tokens"] == 25 and u["cache_read_input_tokens"] == 300, str(u))
 
 
+# ── WebSearch 场景：enriched IR（已注入搜索结果）→ SDK 消费验证 ────────────
+def verify_websearch():
+    print("\n── WebSearch 场景：enriched IR（已注入搜索结果） ──")
+    data = json.loads((FIXTURES / "websearch_req.json").read_text())
+
+    # ── 请求体结构验证 ──
+    msg_body = data["messages"]
+    msg_system = msg_body.get("system")
+    check("messages system 是数组", isinstance(msg_system, list), f"type={type(msg_system).__name__}")
+    if isinstance(msg_system, list):
+        check("messages system 有 2 个 block", len(msg_system) == 2, f"len={len(msg_system)}")
+        check("messages system[0] 是原始 prompt", msg_system[0].get("text") == "You are a helpful assistant.", str(msg_system[0])[:80])
+        check("messages system[1] 含搜索结果", "[Web Search Results" in msg_system[1].get("text", ""), str(msg_system[1])[:80])
+    check("messages tools 字段缺失", "tools" not in msg_body, f"tools={msg_body.get('tools')}")
+    check("messages tool_choice 字段缺失", "tool_choice" not in msg_body, f"tool_choice={msg_body.get('tool_choice')}")
+
+    chat_body = data["chat_completions"]
+    chat_msgs = chat_body.get("messages", [])
+    check("chat messages[0] 是 system", chat_msgs and chat_msgs[0].get("role") == "system", str(chat_msgs[:1])[:80])
+    if chat_msgs:
+        sys_content = chat_msgs[0].get("content", "")
+        check("chat system 含原始 prompt", "You are a helpful assistant." in sys_content, sys_content[:80])
+        check("chat system 含搜索结果", "[Web Search Results" in sys_content, sys_content[:80])
+    check("chat tools 字段缺失", "tools" not in chat_body, f"tools={chat_body.get('tools')}")
+    check("chat tool_choice 字段缺失", "tool_choice" not in chat_body, f"tool_choice={chat_body.get('tool_choice')}")
+
+    resp_body = data["responses"]
+    resp_input = resp_body.get("input", [])
+    check("responses input[0] 是 system", resp_input and resp_input[0].get("role") == "system", str(resp_input[:1])[:80])
+    if resp_input:
+        sys_content = resp_input[0].get("content", [])
+        check("responses system content 是数组", isinstance(sys_content, list), f"type={type(sys_content).__name__}")
+        if isinstance(sys_content, list):
+            check("responses system 有 2 个 part", len(sys_content) == 2, f"len={len(sys_content)}")
+            check("responses system[0] 是 input_text", sys_content[0].get("type") == "input_text", str(sys_content[0])[:80])
+            check("responses system[1] 含搜索结果", "[Web Search Results" in sys_content[1].get("text", ""), str(sys_content[1])[:80])
+    check("responses tools 字段缺失", "tools" not in resp_body, f"tools={resp_body.get('tools')}")
+    check("responses tool_choice 字段缺失", "tool_choice" not in resp_body, f"tool_choice={resp_body.get('tool_choice')}")
+
+    # ── SDK 实际发送验证（MockTransport 捕获 SDK 发出的请求体） ──
+    captured = {}
+
+    def anth_handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "msg_mock", "type": "message", "role": "assistant", "model": "claude-sonnet-4-20250514", "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1}})
+
+    anth_client = Anthropic(api_key="sk-mock", http_client=httpx.Client(transport=httpx.MockTransport(anth_handler), timeout=httpx.Timeout(5.0)))
+    try:
+        captured.clear()
+        anth_client.messages.create(
+            model=msg_body.get("model", "claude-sonnet-4-20250514"),
+            max_tokens=msg_body.get("max_tokens", 10),
+            **{k: v for k, v in msg_body.items() if k not in ("model", "max_tokens")}
+        )
+        sent = captured.get("body", {})
+        check("messages 请求体经 SDK 发出", bool(sent), str(sent)[:100])
+        sent_system = sent.get("system")
+        check("SDK 保留 system 数组", isinstance(sent_system, list) and len(sent_system) == 2, f"sent_system={str(sent_system)[:80]}")
+        check("SDK 不注入 tools", "tools" not in sent, f"tools={sent.get('tools')}")
+    except Exception as e:
+        check("messages 请求体经 SDK 发出", False, str(e)[:200])
+
+    def chat_handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "chatcmpl_mock", "object": "chat.completion", "created": 1, "model": "gpt-4o", "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
+
+    openai_client = OpenAI(api_key="sk-mock", base_url="http://mock", http_client=httpx.Client(transport=httpx.MockTransport(chat_handler), timeout=httpx.Timeout(5.0)))
+    try:
+        captured.clear()
+        openai_client.chat.completions.create(
+            model=chat_body.get("model", "gpt-4o"),
+            **{k: v for k, v in chat_body.items() if k not in ("model",)}
+        )
+        sent = captured.get("body", {})
+        check("chat 请求体经 SDK 发出", bool(sent), str(sent)[:100])
+        check("chat SDK 不注入 tools", "tools" not in sent, f"tools={sent.get('tools')}")
+    except Exception as e:
+        check("chat 请求体经 SDK 发出", False, str(e)[:200])
+
+    try:
+        captured.clear()
+        openai_client.responses.create(
+            model=resp_body.get("model", "gpt-4o"),
+            **{k: v for k, v in resp_body.items() if k not in ("model",)}
+        )
+        sent = captured.get("body", {})
+        check("responses 请求体经 SDK 发出", bool(sent), str(sent)[:100])
+        check("responses SDK 不注入 tools", "tools" not in sent, f"tools={sent.get('tools')}")
+    except Exception as e:
+        check("responses 请求体经 SDK 发出", False, str(e)[:200])
+
+
 def main():
     data = json.loads((FIXTURES / "req.json").read_text())
     if not data:
@@ -258,6 +350,7 @@ def main():
     verify_stream()
     verify_parse()
     verify_subagent()
+    verify_websearch()
     print(f"\n── 结果：{len(PASS)} 通过 / {len(FAIL)} 失败 ──")
     if FAIL:
         print("失败项：")

@@ -24,7 +24,8 @@ mod middleware;
 mod models;
 mod plugin;
 mod providers;
-mod search;
+// pub：MCP 搜索服务器（src/bin/mcp_server.rs）复用 SearchHttp / search()
+pub mod search;
 mod types;
 
 // SDK 合规验证（fixtures 导出 + Python 官方 SDK 校验脚本）。
@@ -240,7 +241,7 @@ pub fn run() {
             fm_pause,
             fm_get_state,
             fm_ready,
-            get_gateway_base
+            get_gateway_base,
         ])
         .setup(move |app| {
             // Resolve data directory using Tauri's path API:
@@ -390,8 +391,10 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Hide to tray on close instead of quitting, so the gateway keeps running.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
             }
         })
         .run(tauri::generate_context!())

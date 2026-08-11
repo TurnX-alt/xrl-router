@@ -131,6 +131,43 @@ fn subagent_stream_events() -> Vec<IrStreamEvent> {
     ]
 }
 
+/// 构造已注入搜索结果的 IR（模拟 enrich_ir_with_search 的输出）。
+/// 用于验证 enriched IR（system blocks 含搜索结果、tools 已清除）序列化后能被
+/// 官方 SDK（anthropic / openai）正确消费。
+fn websearch_enriched_ir() -> IrRequest {
+    let search_text = "[1] Rust Programming Language\nhttps://www.rust-lang.org/\nA language empowering everyone to build reliable and efficient software.\n\n[2] The Rust Book\nhttps://doc.rust-lang.org/book/\nAn introductory book about Rust.";
+
+    let search_block = IrSystemBlock {
+        text: format!(
+            "[Web Search Results for: what is rust]\n{}\n\nUse the above search results to answer the user's question. Cite sources using [N] notation.",
+            search_text
+        ),
+        cache_control: None,
+    };
+
+    IrRequest {
+        model: "claude-sonnet-4-20250514".to_string(),
+        system: Some(IrSystemContent::Blocks(vec![
+            IrSystemBlock { text: "You are a helpful assistant.".to_string(), cache_control: None },
+            search_block,
+        ])),
+        messages: vec![IrMessage {
+            role: IrRole::User,
+            content: vec![IrContentBlock::Text {
+                text: "what is rust".to_string(),
+                cache_control: None,
+            }],
+        }],
+        tools: vec![],
+        tool_choice: None,
+        max_tokens: Some(4096),
+        temperature: None,
+        top_p: None,
+        thinking: None,
+        stream: true,
+    }
+}
+
 fn usage_to_json(u: &IrUsage) -> Value {
     json!({
         "input_tokens": u.input_tokens,
@@ -248,6 +285,15 @@ mod tests {
             "responses": rf2,
         });
         std::fs::write(dir.join("subagent.json"), serde_json::to_string_pretty(&subagent).unwrap()).unwrap();
+
+        // ── websearch_req.json: enriched IR（已注入搜索结果）→ 三种客户端格式请求体 ──
+        let ir_ws = websearch_enriched_ir();
+        let websearch_req = json!({
+            "messages": crate::api::proxy::ir::to_messages::ir_req_to_messages(&ir_ws),
+            "chat_completions": crate::api::proxy::ir::to_chat_completions::ir_req_to_chat_completions(&ir_ws),
+            "responses": crate::api::proxy::ir::to_responses::ir_req_to_responses(&ir_ws),
+        });
+        std::fs::write(dir.join("websearch_req.json"), serde_json::to_string_pretty(&websearch_req).unwrap()).unwrap();
 
         // ── parse.json：三种上游 chunk 序列 → IR 事件 + usage ──
         let anthropic_chunks = json!([

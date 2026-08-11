@@ -29,7 +29,7 @@ use super::ir;
 use super::ir::types::IrRequest;
 use super::key_rotation::{pick_key_for, update_key_health};
 use super::route::{resolve_route, ResolvedRoute};
-use super::websearch::{enrich_ir_with_search, has_websearch_tool_ir};
+use super::websearch::{ensure_websearch_tool, execute_websearch_tool_loop};
 
 /// HTTP error tuple returned by proxy handlers.
 pub type ErrorTuple = (StatusCode, HeaderMap, Json<Value>);
@@ -97,13 +97,13 @@ pub async fn proxy_stream(
     state: Arc<AppState>,
     mut ctx: StreamContext,
 ) -> Result<Response, ErrorTuple> {
-    // ── 0. WebSearch 劫持：本地搜索 + 单次上游调用（在借用 ctx 之前） ──
-    if state.websearch_hijack.load(std::sync::atomic::Ordering::Relaxed)
-        && has_websearch_tool_ir(&ctx.ir_request)
-    {
-        info!(trace_id = %ctx.trace_id, "web_search: enriching IR with local Bing search");
-        ctx.ir_request = enrich_ir_with_search(ctx.ir_request).await;
-        // 清除工具后继续走正常流式路径（key failover 由 proxy_stream 天然支持）
+    // WebSearch 工具模式：功能开启时确保 web_search 工具存在于 IR 请求中，
+    // 模型通过标准 tool-calling 自主决定是否搜索。
+    // 只保留 server-side tool 模式（代理注入 web_search + tool-calling loop）：
+    // 移除客户端自带的内置搜索工具（WebSearch / web_search*），注入代理的 web_search。
+    let websearch_enabled = state.websearch_hijack.load(std::sync::atomic::Ordering::Relaxed);
+    if websearch_enabled {
+        ensure_websearch_tool(&mut ctx.ir_request);
     }
 
     let trace_id = &ctx.trace_id;
@@ -223,6 +223,7 @@ pub async fn proxy_stream(
         let mut last_key_id: Option<String> = None;
         let mut last_key_name: Option<String> = None;
         let mut last_key_masked: Option<String> = None;
+        let mut last_picked: Option<super::route::PickedKey> = None;
         let mut last_candidate: ResolvedRoute = candidates[0].clone();
         let mut provider_failure: Option<ProviderFailure> = None;
         let mut response: Option<reqwest::Response> = None;
@@ -259,6 +260,7 @@ pub async fn proxy_stream(
                 last_key_id = Some(picked.id.clone());
                 last_key_name = Some(picked.name.clone());
                 last_key_masked = Some(picked.key_masked.clone());
+                last_picked = Some(picked.clone());
                 let key_name = picked.name.clone();
                 let key_masked = picked.key_masked.clone();
 
@@ -521,13 +523,23 @@ pub async fn proxy_stream(
             "Upstream response received, starting stream"
         );
 
-        // ── 统一 IR 流式转发 ──────────────────────────────────────
-        super::forward::forward_stream_ir(
-            response, &tx, &state, trace_id, start_time,
-            &provider_id, &resolved, model_name, &service_key,
-            &last_key_id, &last_key_name, &last_key_masked, endpoint,
-            &resolved.provider_kind, client_format, est_input,
-        ).await;
+        // ── 统一 IR 流式转发（或 WebSearch 工具调用循环） ──────────────
+        if websearch_enabled {
+            info!(trace_id = %trace_id, "websearch: tool-calling loop");
+            let picked_key = last_picked.take().unwrap();
+            execute_websearch_tool_loop(
+                &state, ir_request, &tx, &resolved, &picked_key,
+                client_format, &client, trace_id, start_time, est_input,
+                model_name, &service_key, endpoint,
+            ).await;
+        } else {
+            super::forward::forward_stream_ir(
+                response, &tx, &state, trace_id, start_time,
+                &provider_id, &resolved, model_name, &service_key,
+                &last_key_id, &last_key_name, &last_key_masked, endpoint,
+                &resolved.provider_kind, client_format, est_input,
+            ).await;
+        }
     });
 
     // ── 立即返回 Response（客户端毫秒级收到首字节） ────────────────

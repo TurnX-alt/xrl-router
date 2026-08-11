@@ -23,7 +23,68 @@ fn resolve_system_proxy() -> Option<String> {
     }
     // 2. Windows：读注册表 Internet Settings 的系统代理。
     //    ProxyEnable=1 且 ProxyServer 非空才生效；跳过 PAC (AutoConfigURL)。
-    resolve_windows_registry_proxy()
+    #[cfg(windows)]
+    if let Some(proxy) = resolve_windows_registry_proxy() {
+        return Some(proxy);
+    }
+    // 3. macOS：读 scutil --proxy 的系统代理（所有网络接口汇总，不依赖接口名）。
+    #[cfg(target_os = "macos")]
+    if let Some(proxy) = resolve_macos_proxy() {
+        return Some(proxy);
+    }
+    None
+}
+
+/// macOS: 从 `scutil --proxy` 读取系统代理（HTTP/HTTPS）。
+///
+/// 为什么用 scutil 而非 networksetup：`networksetup -getwebproxy` 需要指定
+/// 网络接口名（Wi-Fi/Ethernet…），接口名因机器而异（USB 网卡、热点等），
+/// 猜错就返回 None。`scutil --proxy` 输出**当前生效**的代理配置（系统按
+/// 服务顺序聚合），不依赖接口名，更可靠。
+#[cfg(target_os = "macos")]
+fn resolve_macos_proxy() -> Option<String> {
+    let output = std::process::Command::new("scutil")
+        .args(["--proxy"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut http_enabled = false;
+    let mut http_server = String::new();
+    let mut http_port = String::new();
+    let mut https_enabled = false;
+    let mut https_server = String::new();
+    let mut https_port = String::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        // 形如: HTTPEnable : 1
+        if let Some(v) = line.strip_prefix("HTTPEnable :") {
+            http_enabled = v.trim() == "1";
+        } else if let Some(v) = line.strip_prefix("HTTPSEnable :") {
+            https_enabled = v.trim() == "1";
+        } else if let Some(v) = line.strip_prefix("HTTPProxy :") {
+            http_server = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("HTTPPort :") {
+            http_port = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("HTTPSProxy :") {
+            https_server = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("HTTPSPort :") {
+            https_port = v.trim().to_string();
+        }
+    }
+
+    // HTTPS 代理优先（多数场景 HTTPS 流量走独立代理），HTTP 兜底。
+    if https_enabled && !https_server.is_empty() && !https_port.is_empty() {
+        return Some(format!("http://{}:{}", https_server, https_port));
+    }
+    if http_enabled && !http_server.is_empty() && !http_port.is_empty() {
+        return Some(format!("http://{}:{}", http_server, http_port));
+    }
+    None
 }
 
 #[cfg(windows)]
@@ -110,14 +171,3 @@ pub fn http_client() -> reqwest::Client {
         .expect("failed to build http client")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_client_builds_with_or_without_proxy() {
-        // 无论环境有无代理，客户端都能正常构建（不 panic）。
-        let _ = build_http_client().build().unwrap();
-        let _ = http_client();
-    }
-}

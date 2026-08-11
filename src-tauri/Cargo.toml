@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Multi-Provider AI LLM API Routing Gateway"
 authors = ["xrl"]
 edition = "2021"
+default-run = "xrl-router"
 
 [lib]
 name = "xrl_router_lib"
@@ -56,6 +57,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 once_cell = "1"
 async-trait = "0.1"
 scraper = "0.20"
+url = "2"
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-fs = "2.5.1"

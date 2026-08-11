@@ -33,8 +33,23 @@ pub fn responses_req_to_ir(req: &Value) -> IrRequest {
                         if ty.starts_with("web_search") {
                             return Some(IrTool {
                                 name: "web_search".to_string(),
-                                description: None,
-                                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                                description: Some("Search the web for information".to_string()),
+                                // web_search 工具需要合理的 schema，让上游 LLM 知道如何填写 query
+                                input_schema: serde_json::json!({
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {
+                                            "type": "string",
+                                            "description": "The search query"
+                                        },
+                                        "max_results": {
+                                            "type": "integer",
+                                            "description": "Maximum number of results to return",
+                                            "default": 5
+                                        }
+                                    },
+                                    "required": ["query"]
+                                }),
                             });
                         }
                         return None;

@@ -36,6 +36,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// FM 广播电台引擎（单例，进程级广播）。
     pub fm: FmEngine,
+    /// 搜索 HTTP 客户端（完整浏览器头 + cookie 复用 + 懒预热）。
+    pub search_http: crate::search::bing::SearchHttp,
 }
 
 impl AppState {
@@ -98,6 +100,7 @@ impl AppState {
             plugins,
             http_client,
             fm,
+            search_http: Default::default(),
         }
     }
 }
