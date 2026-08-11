@@ -4,6 +4,7 @@
 import { reactive } from 'vue';
 import zhCN from './zh-CN';
 import en from './en';
+import { settingsApi } from '../api';
 
 export type Locale = 'zh-CN' | 'en';
 
@@ -38,11 +39,21 @@ async function syncToBackend(locale: Locale) {
   }
 }
 
+// 同步 UI 设置到后端（LAN install 页面可读取）
+async function syncLocaleToBackend(locale: Locale) {
+  try {
+    await settingsApi.update({ locale });
+  } catch {
+    // API 不可用，忽略
+  }
+}
+
 // 切换语言
 export function setLocale(locale: Locale) {
   i18n.locale = locale;
   localStorage.setItem(STORAGE_KEY, locale);
   void syncToBackend(locale);
+  void syncLocaleToBackend(locale);
 }
 
 // 翻译函数

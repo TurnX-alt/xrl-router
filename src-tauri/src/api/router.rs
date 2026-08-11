@@ -1,7 +1,7 @@
 //! 全部 Axum 路由的定义。
 //!
 //! 单 listener 绑 `0.0.0.0:port`，通过路径级 IP 中间件控制访问权限：
-//! - 公开路径：`/health`、`/ws`、`/ws/plugin`、`/install`、
+//! - 公开路径：`/health`、`/ws`、`/ws/plugin`、
 //!   `/v1/*` 代理（套 rate_limit，128 req/min）。
 //! - 管理路径：`/api/*`（CRUD + 密钥 + 数据导出等）——仅允许 loopback IP 访问，
 //!   非本机请求被 `admin_ip_guard` 中间件拦截返回 403。
@@ -9,11 +9,15 @@
 //! `build_router` 保留为兼容入口（`lib.rs` 与冒烟测试沿用）。
 
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use axum::extract::DefaultBodyLimit;
+use axum::http::StatusCode;
 use axum::middleware;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
+use tower_http::services::ServeDir;
 
 use crate::gateway::server::AppState;
 use crate::middleware::rate_limit::rate_limit_middleware;
@@ -39,9 +43,29 @@ fn proxy_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .layer(DefaultBodyLimit::max(super::proxy::MAX_REQUEST_BODY_BYTES))
 }
 
+/// SPA fallback：返回 `index.html`，让 Vue Router 处理前端路由。
+async fn spa_fallback() -> impl IntoResponse {
+    let dist_dir = std::env::var("DIST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("../dist"));
+
+    let index_path = dist_dir.join("index.html");
+    match tokio::fs::read(&index_path).await {
+        Ok(content) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(axum::body::Body::from(content))
+            .unwrap(),
+        Err(_) => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::from("index.html not found"))
+            .unwrap(),
+    }
+}
+
 /// 单 listener 全量 Router：公开路径 + 管理路径（IP 限制）。
 ///
-/// 公开路径（无需 loopback）：`/health`、`/ws`、`/ws/plugin`、`/install`、`/fm/*`、`/v1/*`。
+/// 公开路径（无需 loopback）：`/health`、`/ws`、`/ws/plugin`、`/v1/*`。
 /// 管理路径（仅 loopback，非本机返回 403）：`/api/*`。
 pub fn build_router(state: Arc<AppState>) -> Router {
     // /api/* 管理路由：仅 loopback IP 可访问（admin_ip_guard 中间件）
@@ -90,6 +114,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // admin_ip_guard：非 loopback IP → 403 Forbidden
         .layer(middleware::from_fn(crate::middleware::admin_ip_guard));
 
+    // 静态文件服务：从 `dist/assets/` 目录读取前端构建产物（JS、CSS、图片等）
+    let dist_dir = std::env::var("DIST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("../dist"));
+    let assets_dir = dist_dir.join("assets");
+
     Router::new()
         // Health check
         .route("/health", get(handlers::health_check))
@@ -97,11 +127,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // WebSocket endpoints (no rate limiting)
         .route("/ws", get(handlers::ws_handler))
         .route("/ws/plugin", get(handlers::plugin_ws_handler))
-        // Install 静态页（局域网设备访问）
-        .route("/install", get(handlers::serve_install_page))
+        // UI settings (theme/hue/locale) — public for LAN install page
+        .route("/api/ui-settings", get(handlers::get_ui_settings))
         // /api/* 管理路由（IP 限制）
         .merge(api_routes)
         // /v1/* 代理（套 rate_limit，128 req/min）
         .merge(proxy_routes(&state))
+        // 静态文件服务（前端构建产物）
+        .nest_service("/assets", ServeDir::new(&assets_dir))
+        // SPA fallback：所有未匹配的 GET 请求返回 `index.html`
+        .fallback(get(spa_fallback))
         .with_state(state)
 }

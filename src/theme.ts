@@ -11,7 +11,18 @@
 // 通过覆盖 --md-sys-color-primary 系列 CSS 变量驱动全局主题色。
 // 默认色相 264°（MD3 标准紫）。
 
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { settingsApi } from './api';
+
+// Tauri 窗口主题同步：动态导入，非 Tauri 环境不加载。
+async function applyWindowTheme(t: 'light' | 'dark' | null) {
+  if (!('__TAURI_INTERNALS__' in window)) return;
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    await getCurrentWindow().setTheme(t);
+  } catch {
+    // 非 Tauri 环境无原生窗口，忽略
+  }
+}
 
 export type Theme = 'light' | 'dark' | 'system';
 
@@ -165,14 +176,20 @@ function applyHue(hue: number) {
   }
 }
 
-// 同步 Tauri 原生窗口主题（标题栏等系统级 UI）。
-// t 为 null = 取消强制，窗口恢复跟随系统（WebView media query 同步恢复真实值）。
-// 非 Tauri 环境（纯浏览器调试）调用会抛错，静默忽略。
-async function applyWindowTheme(t: 'light' | 'dark' | null) {
+// 同步 UI 设置到后端（LAN install 页面可读取）
+async function syncThemeToBackend(t: Theme) {
   try {
-    await getCurrentWindow().setTheme(t);
+    await settingsApi.update({ theme: t });
   } catch {
-    // 非 Tauri 环境无原生窗口，忽略
+    // API 不可用（纯前端调试），忽略
+  }
+}
+
+async function syncHueToBackend(hue: number) {
+  try {
+    await settingsApi.update({ hue });
+  } catch {
+    // API 不可用，忽略
   }
 }
 
@@ -188,11 +205,13 @@ export function setTheme(t: Theme) {
     applyHue(getHue());
     void applyWindowTheme(t);
   }
+  void syncThemeToBackend(t);
 }
 
 export function setHue(hue: number) {
   localStorage.setItem(HUE_KEY, String(hue));
   applyHue(hue);
+  void syncHueToBackend(hue);
 }
 
 export function initTheme() {

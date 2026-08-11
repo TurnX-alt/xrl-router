@@ -9,16 +9,13 @@ export default {
   // ── Claude FM ──
   'fm.play': '播放',
   'fm.pause': '暂停',
-  'fm.error': '曲目无法播放，已自动跳过',
 
   // ── 通用 ──
   'common.cancel': '取消',
-  'common.confirm': '确定',
   'common.save': '保存',
   'common.delete': '删除',
   'common.edit': '编辑',
   'common.create': '创建',
-  'common.copy': '复制',
   'common.done': '完成',
   'common.empty': '空空如也',
   'common.unnamed': '未命名',
@@ -70,17 +67,14 @@ export default {
   'settings.data.title': '用户数据',
   'settings.data.desc': '将所有设置和数据导出为 SQL 备份文件，或从 SQL 文件导入恢复（导入会覆盖当前数据）',
   'settings.data.export.button': '导出',
-  'settings.data.export.success': '数据导出成功',
 
   'settings.data.import.button': '导入',
   'settings.data.import.confirm': '确定要导入数据吗？这将覆盖当前所有数据。',
-  'settings.data.import.success': '数据导入成功',
 
   'settings.data.reset.title': '重置所有数据',
   'settings.data.reset.desc': '清除所有本地存储的数据，此操作不可恢复',
   'settings.data.reset.button': '清除所有本地数据',
   'settings.data.reset.confirm': '确定清除所有本地存储的数据吗？此操作不可恢复。',
-  'settings.data.reset.success': '数据已清除',
 
   // ── 供应商列表 ──
   'providers.title': '供应商',
@@ -185,7 +179,6 @@ export default {
   'stats.log.col_status': '状态',
   'stats.log.status_ok': '成功',
   'stats.log.status_fail': '失败',
-  'stats.log.status_pending': '进行中',
   'stats.log.prev': '上一页',
   'stats.log.next': '下一页',
   'stats.log.page': '第 {current} / {total} 页',
@@ -197,7 +190,19 @@ export default {
   'plugin.dialog.ignore': '忽略',
   'plugin.dialog.add': '添加供应商',
 
-  // ── 托盘菜单（后端） ──
-  'tray.show': '显示窗口',
-  'tray.quit': '退出',
+
+  // ── Install 页面 ──
+  'install.title': '客户分发',
+  'install.no_key_title': '未携带密钥',
+  'install.no_key_desc': '请从主机的 XRL Router 密钥管理页「创建密钥」，复制弹出的「分发链接」打开此页面。',
+  'install.platform_label': '操作系统',
+  'install.consumer_label': '消费端',
+  'install.mode_claude_code': 'Claude Code',
+  'install.mode_chatgpt': 'ChatGPT',
+  'install.default_model': '默认模型',
+  'install.models_loading': '正在拉取网关可用模型…',
+  'install.models_fetch_error': '拉取模型失败：{msg}',
+  'install.models_error_ignore': '可忽略，命令将不写默认模型（Claude Code 会用其默认模型名，若网关无对应别名将 404）。',
+  'install.no_models': '网关暂无可用模型。请先在主机 XRL Router 配置供应商与模型。',
+  'install.command_title': '可执行命令 · {platform}',
 };

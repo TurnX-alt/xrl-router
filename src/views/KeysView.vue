@@ -3,7 +3,7 @@
     <div class="page__header">
       <h2 class="md-typescale-headline-medium page__title">{{ t('keys.title') }}</h2>
       <md-filled-button @click="openCreate">
-        <MdiIcon icon="plus" slot="icon" />
+        <MdiIcon :path="mdiPlus" slot="icon" />
         {{ t('keys.create') }}
       </md-filled-button>
     </div>
@@ -11,7 +11,7 @@
     <div v-if="loading" class="empty-state"><md-circular-progress indeterminate></md-circular-progress></div>
 
     <div v-else-if="!keys.length" class="empty-state">
-      <MdiIcon icon="inbox-outline" class="empty-state__icon" />
+      <MdiIcon :path="mdiInboxOutline" class="empty-state__icon" />
       <p class="md-typescale-body-large">{{ t('common.empty') }}</p>
     </div>
 
@@ -43,7 +43,7 @@
             <td class="time-cell">{{ formatTime(k.updated_at) }}</td>
             <td class="actions-cell">
               <md-icon-button :id="'key-btn-' + k.id" @click="toggleMenu(k)">
-                <MdiIcon icon="dots-vertical" />
+                <MdiIcon :path="mdiDotsVertical" />
               </md-icon-button>
             </td>
           </tr>
@@ -59,16 +59,16 @@
       @closed="menuOpen = null"
     >
       <md-menu-item @click="renameFromMenu">
-        <MdiIcon icon="pencil-outline" /> {{ t('keys.rename') }}
+        <MdiIcon :path="mdiPencilOutline" /> {{ t('keys.rename') }}
       </md-menu-item>
       <md-menu-item @click="permFromMenu">
-        <MdiIcon icon="shield-outline" /> {{ t('keys.edit_perm') }}
+        <MdiIcon :path="mdiShieldOutline" /> {{ t('keys.edit_perm') }}
       </md-menu-item>
       <md-menu-item @click="quotaFromMenu">
-        <MdiIcon icon="tune-variant" /> {{ t('keys.config_quota') }}
+        <MdiIcon :path="mdiTuneVariant" /> {{ t('keys.config_quota') }}
       </md-menu-item>
       <md-menu-item class="menu-item--danger" @click="deleteFromMenu">
-        <MdiIcon icon="delete-outline" /> {{ t('common.delete') }}
+        <MdiIcon :path="mdiDeleteOutline" /> {{ t('common.delete') }}
       </md-menu-item>
     </md-menu>
 
@@ -97,7 +97,7 @@
     <md-dialog :open="!!newKeyPlain" @close="newKeyPlain = ''">
       <div slot="headline">{{ t('keys.created_once') }}</div>
       <div slot="content" class="form">
-        <p class="warn md-typescale-body-medium"><MdiIcon icon="alert" />{{ t('keys.save_warning') }}</p>
+        <p class="warn md-typescale-body-medium"><MdiIcon :path="mdiAlert" />{{ t('keys.save_warning') }}</p>
         <p class="md-typescale-body-medium deploy-label">{{ t('keys.plain_key') }}</p>
         <div class="key-box mono md-typescale-body-large">{{ newKeyPlain }}</div>
         <template v-if="deployLink">
@@ -106,8 +106,8 @@
         </template>
       </div>
       <div slot="actions">
-        <md-text-button @click="copyKey"><MdiIcon icon="content-copy" slot="icon" />{{ t('keys.copy_key') }}</md-text-button>
-        <md-text-button :disabled="!deployLink" @click="copyDeployLink"><MdiIcon icon="link-variant" slot="icon" />{{ t('keys.copy_deploy') }}</md-text-button>
+        <md-text-button @click="copyKey"><MdiIcon :path="mdiContentCopy" slot="icon" />{{ t('keys.copy_key') }}</md-text-button>
+        <md-text-button :disabled="!deployLink" @click="copyDeployLink"><MdiIcon :path="mdiLinkVariant" slot="icon" />{{ t('keys.copy_deploy') }}</md-text-button>
         <md-filled-button @click="newKeyPlain = ''">{{ t('common.done') }}</md-filled-button>
       </div>
     </md-dialog>
@@ -168,6 +168,17 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import '@material/web/iconbutton/icon-button.js';
+import '@material/web/menu/menu.js';
+import '@material/web/menu/menu-item.js';
+import '@material/web/textfield/outlined-text-field.js';
+import '@material/web/checkbox/checkbox.js';
+import '@material/web/progress/circular-progress.js';
+import {
+  mdiPlus, mdiInboxOutline, mdiDotsVertical, mdiPencilOutline,
+  mdiShieldOutline, mdiTuneVariant, mdiDeleteOutline, mdiAlert,
+  mdiContentCopy, mdiLinkVariant,
+} from '@mdi/js';
 import { serviceKeysApi, providersApi, modelsApi, installApi, type ServiceKey } from '../api';
 import { wsClient } from '../ws';
 import { t } from '../i18n';
@@ -182,16 +193,17 @@ const newName = ref('');
 const newKeyPlain = ref('');
 // 分发链接：本机 IP + 公共端口 + 明文 key。newKeyPlain 有值时拉取本机 IP。
 const localIp = ref<string | null>(null);
-const PUBLIC_PORT = 19069;
+const localPort = ref<number>(19068);
 const deployLink = computed(() => {
   if (!newKeyPlain.value || !localIp.value) return '';
-  return `http://${localIp.value}:${PUBLIC_PORT}/install?t=${newKeyPlain.value}`;
+  return `http://${localIp.value}:${localPort.value}/install?t=${newKeyPlain.value}`;
 });
 watch(newKeyPlain, async (v) => {
   if (v && !localIp.value) {
     try {
       const r = await installApi.localIp();
       if (r.ip) localIp.value = r.ip;
+      if (r.port) localPort.value = r.port;
     } catch {
       // 取不到 IP 时 deployLink 留空，仅显示明文 key
     }

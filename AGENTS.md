@@ -4,7 +4,7 @@
 
 ## 项目范围
 
-xrl-router 是一个**单用户本地 LLM API 网关**，以 Tauri 2 桌面应用形式运行。Rust 后端（`src-tauri/src/`）跑 axum HTTP 服务：**单 listener 绑 `0.0.0.0:19068`**，通过路径级 IP 中间件（`admin_ip_guard`）限制 `/api/*` 管理端点仅 loopback 可访问，其余路径（`/v1/*`、`/install`、`/health`、`/ws`）对外开放。Vue 3 前端（`src/`）跑在 Tauri WebView 里。所有数据存本地 SQLite。
+xrl-router 是一个**单用户本地 LLM API 网关**，以 Tauri 2 桌面应用形式运行。Rust 后端（`src-tauri/src/`）跑 axum HTTP 服务：**单 listener 绑 `0.0.0.0:19068`**，通过路径级 IP 中间件（`admin_ip_guard`）限制 `/api/*` 管理端点仅 loopback 可访问，其余路径（`/v1/*`、`/api/ui-settings`、`/health`、`/ws`）对外开放，未匹配路由 fallback 到前端 SPA `index.html`。Vue 3 前端（`src/`）跑在 Tauri WebView 里，局域网设备也可通过浏览器直接访问 SPA 的 `/install` 页面。所有数据存本地 SQLite。
 
 ## 代码组织
 
@@ -18,8 +18,8 @@ src-tauri/src/                 后端 Rust
 ├── crypto/mod.rs              AES-256-GCM + Argon2 + master key
 ├── gateway/server.rs          AppState + start_gateway (单 listener) + CORS
 ├── api/
-│   ├── router.rs              axum 路由表（build_router）
-│   ├── handlers/*             管理 API 处理器（按实体分文件；install.rs 托管 /install 页面；data.rs 数据导出/导入/重置）
+│   ├── router.rs              axum 路由表（build_router）+ SPA fallback（ServeDir）
+│   ├── handlers/*             管理 API 处理器（按实体分文件；install.rs 提供 local-ip 接口；data.rs 数据导出/导入/重置；stats.rs 含 ui-settings）
 │   └── proxy/*                LLM 代理核心
 │       ├── handler.rs         薄入口层：认证 + 请求体准备，委托 stream::proxy_stream()
 │       ├── stream.rs          流式引擎核心：路由解析 → 立即返回 Response → 后台 spawn 双循环
@@ -62,19 +62,17 @@ src-tauri/src/                 后端 Rust
 
 src/                           前端 Vue 3
 ├── main.ts / App.vue / router.ts
-├── api.ts                     REST 客户端（BASE_URL 硬编码为 http://localhost:19068，含 installApi）
+├── api.ts                     REST 客户端（动态 BASE_URL：Tauri/localhost 用 http://localhost:19068，LAN 浏览器用当前 origin）
 ├── ws.ts                      WebSocket 客户端（自动重连 3s）
-├── theme.ts                   明/暗/跟随系统主题（localStorage 持久化，prefers-color-scheme 监听）
-├── i18n/                      自研 i18n：index.ts（t/setLocale/initI18n）+ zh-CN.ts / en.ts
+├── theme.ts                   明/暗/跟随系统主题（localStorage 持久化，prefers-color-scheme 监听，设置同步到后端供 LAN install 页读取）
+├── i18n/                      自研 i18n：index.ts（t/setLocale/initI18n，语言切换同步到后端）+ zh-CN.ts / en.ts
 ├── styles/global.css          全局样式（MD3 design tokens + [data-theme="dark"]）
 ├── fm/                        Claude FM 播放器（极简前端：~60 行纯命令/事件）
-├── views/*                    6 个页面（ClaudeFm/Providers/ProviderNew/Keys/Stats/Settings）
+├── views/*                    7 个页面（ClaudeFm/Providers/ProviderNew/Keys/Stats/Settings/Install）
 ├── components/*               AppShell / ConnectionStatus / PluginRegisterDialog / MdiIcon（动态 MDI 图标，@mdi/js SVG path）
 └── stores/*                   3 个 Pinia stores（providers/keys/models）
 
 > **Claude FM**：音频解码与播放由 Rust 后端 `FmEngine`（`api/handlers/fm.rs`）直接完成——rodio 输出到系统音频设备，souvlaki 接入系统媒体控制（macOS Now Playing / Windows SMTC / Linux MPRIS）。引擎以 `std::thread::spawn` 运行（rodio 需要稳定线程），通过 `mpsc` channel 接收播放控制消息。前端 `src/fm/player.ts`（~60 行）仅负责展示元信息（通过 `fm-meta` 事件）和控制播放暂停（通过 `fm_toggle` / `fm_play` / `fm_pause` Tauri command）。托盘 FM 菜单点击直接调用引擎（不再绕前端中转）。改 FM 逻辑改 `api/handlers/fm.rs`，改播放器 UI 改 `ClaudeFmView.vue`。
-
-src-tauri/assets/install.html   局域网 install 静态页（include_str! 编译进二进制）
 
 docs/                          文档（本目录）
 ```
@@ -133,19 +131,21 @@ docs/                          文档（本目录）
 
 - **单 listener** 绑 `0.0.0.0:19068`（`Config.host/port`），承载全部路由
 - **`/api/*` 管理端点**：仅 loopback IP（`127.0.0.1` / `::1`）可访问，由 `admin_ip_guard` 中间件拦截非本机请求返回 403
-- **公开端点**：`/health`、`/ws`、`/ws/plugin`、`/install`、`/v1/*` 代理（套 `rate_limit_middleware`）——不限 IP
+- **公开端点**：`/health`、`/ws`、`/ws/plugin`、`/api/ui-settings`、`/v1/*` 代理（套 `rate_limit_middleware`）——不限 IP
+- **静态文件 + SPA fallback**：`/assets/*` 由 `tower_http::ServeDir` 服务前端构建产物；所有未匹配 GET 请求 fallback 到 `index.html`，由 Vue Router 处理前端路由
 - **CORS**：统一使用 origin 白名单（`Config.cors_origins`）
 - **`/v1/*` 端点**：由 `router.rs` 的 `proxy_routes(state)` 构建，返回未 with_state 的 `Router<AppState>`，由调用方 `.with_state` 统一收敛
 - **新增端点**：管理/密钥读写端点挂 `/api/*` 子路由（自动受 IP 限制）；局域网设备该访问的路由挂公开区
-- **install 页面**：静态 HTML 放 `src-tauri/assets/install.html`，用 `include_str!` 编译进二进制（零运行时文件依赖），`handlers/install.rs` 的 `serve_install_page` 返回。页面契约（`?t=` 明文 key、生成命令的引号约定等）见 `docs/specs/spec-lan-deploy.md`，改页面必须同步该 spec
+- **install 页面**：Vue SPA 路由 `/install`（`src/views/InstallView.vue`），不再编译进二进制。后端 SPA fallback 返回 `index.html`，前端 Vue Router 接管渲染。页面契约（`?t=` 明文 key、命令生成、消费端选择等）见 `docs/specs/spec-lan-deploy.md`，改页面必须同步该 spec
 
 ### 前端
 
 - UI 用 Material Design 3（`@material/web`），**不要**引入其他组件库
 - 颜色用 CSS 变量 `var(--md-sys-color-*)`，**不要**硬编码 hex
 - MWC 组件在 `main.ts` 按需导入，**不要**导入 `all.js`
-- `api.ts` 的 `BASE_URL` 是写死的 `http://localhost:19068`，前端不走相对路径
+- `api.ts` 的 `BASE_URL` 是动态解析的：Tauri/localhost 环境用 `http://localhost:19068`，LAN 浏览器用当前 origin（避免 CORS）
 - 外链打开用 `@tauri-apps/plugin-shell` 的 `open()`（如 SettingsView），不要用 `window.open`（Tauri WebView 内不可靠）
+- **非 Tauri 环境兼容**：前端代码（`App.vue`、`theme.ts`、`fm/player.ts` 等）通过动态 `import()` 延迟加载 Tauri API，LAN 浏览器访问 install 页面时不会触发 Tauri 依赖报错
 
 ## 测试
 
@@ -210,7 +210,7 @@ Agent 倾向于扩展。以下功能**不要主动实现**，即使用户描述�
 | 改动类型 | 必读文件 |
 |---------|---------|
 | 新增 API 端点 | `api/router.rs`（区分 `/api/*` 管理路由与公开路由）、`api/handlers/` 任一文件看模式 |
-| 修改 install 页面 | `src-tauri/assets/install.html`（include_str! 编译进二进制）+ `docs/specs/spec-lan-deploy.md` 契约 |
+| 修改 install 页面 | `src/views/InstallView.vue`（Vue SPA 组件）+ `api/router.rs`（SPA fallback）+ `docs/specs/spec-lan-deploy.md` 契约 |
 | 修改网关启动/监听 | `gateway/server.rs`（单 listener + ConnectInfo）+ `config.rs` + `middleware/admin_guard.rs` |
 | 新增 DB 表/列 | `db/schema.rs`（追加迁移）、`db/mod.rs`（UPSERT 测试） |
 | 修改代理逻辑 | `api/proxy/stream.rs`（流式引擎核心）、`api/proxy/handler.rs`（薄入口）、`api/proxy/ir/`（IR 中间表示层）、`http.rs`（代理配置） |

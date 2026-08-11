@@ -151,11 +151,11 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-32 | **余额端点（/v1/user/balance）** | `api/proxy/quota.rs` |
 | F-33 | **系统代理自动继承（http.rs 统一工厂 + 多平台支持）** | `http.rs`（环境变量 → Windows 注册表 → macOS scutil，OnceLock 缓存） |
 | F-34 | **ConnectionStatus 绝对路径修复** | `ConnectionStatus.vue` |
-| F-35 | **局域网分发（install 页面 + 分发链接）** | `api/handlers/install.rs` + `assets/install.html` + `KeysView.vue` |
+| F-35 | **局域网分发（install 页面 + 分发链接）** | `api/handlers/install.rs`（local-ip 接口）+ `src/views/InstallView.vue`（Vue SPA）+ `api/router.rs`（SPA fallback）+ `KeysView.vue` |
 | F-36 | **单 listener + 路径级 IP 限制** | `gateway/server.rs` + `api/router.rs` + `middleware/admin_guard.rs` + `config.rs` |
 | F-37 | **故障转移（Provider Failover）** | `api/proxy/stream.rs`（双循环重试）+ `api/proxy/forward.rs`（流式转发）+ `api/proxy/failover.rs`（冷却表）+ `api/proxy/route.rs`（候选解析） |
 | F-38 | **请求日志分页** | `api/handlers/stats.rs` + `db/usage.rs` + `StatsView.vue` |
-| F-39 | **国际化（zh-CN/en，前端 + 托盘菜单 + install 页）** | `src/i18n/` + `lib.rs` + `assets/install.html` |
+| F-39 | **国际化（zh-CN/en，前端 + 托盘菜单 + install 页）** | `src/i18n/` + `lib.rs` + `src/views/InstallView.vue`（从 `/api/ui-settings` 读取语言） |
 | F-40 | **主题跟随系统（light/dark/system）** | `theme.ts` |
 | F-41 | **开机静默启动（--minimized 驻留托盘）** | `lib.rs` + `tauri-plugin-autostart` |
 | F-42 | **数据导出/导入/重置** | `api/handlers/data.rs` + `db/settings.rs` + `SettingsView.vue` |
@@ -171,16 +171,19 @@ LLM 生态的协议碎片化：Anthropic、OpenAI 等 Provider 的 API 格式互
 | F-52 | **MdiIcon 组件（@mdi/js SVG 动态图标）** | `src/components/MdiIcon.vue` + `src/components/AppShell.vue` |
 | F-53 | **主题色相滑块（hue slider）** | `src/theme.ts`（`setHue()` 生成 MD3 色阶）+ `SettingsView.vue` |
 | F-54 | **统一 IR 转发（forward_stream_ir 替代三路分支）** | `api/proxy/forward.rs`（单一函数处理所有格式组合） |
+| F-55 | **Install 页面迁移为 Vue SPA + 多消费端** | `src/views/InstallView.vue`（Claude Code + ChatGPT/Codex）+ `api/router.rs`（ServeDir + SPA fallback）+ `api/handlers/stats.rs`（`/api/ui-settings` 公开端点） |
+| F-56 | **UI 设置后端持久化（theme/hue/locale）** | `api/handlers/stats.rs`（settings 表读写）+ `src/theme.ts` + `src/i18n/index.ts`（同步到后端） |
+| F-57 | **动态 BASE_URL（LAN 浏览器同源访问）** | `src/api.ts`（按 hostname 判断 Tauri vs LAN，LAN 用当前 origin） |
 
 ### 4.4 未实现（计划中）
 
 | ID | 功能 | 计划版本 |
 |----|------|---------|
-| F-55 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
-| F-56 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
-| F-57 | 指数退避重试（failover 已实现 provider 级切换 + 60s 冷却，退避算法未做） | v0.3 |
-| F-58 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
-| F-59 | 自动更新机制 | v1.0 |
+| F-58 | 管理 API 认证层（Basic Auth / Session Token） | v0.3 |
+| F-59 | 路由规则引擎（`routes` 表，优先级 + 权重） | v0.3 |
+| F-60 | 指数退避重试（failover 已实现 provider 级切换 + 60s 冷却，退避算法未做） | v0.3 |
+| F-61 | 更多 Provider 内置（DeepSeek、Gemini） | v0.3 |
+| F-62 | 自动更新机制 | v1.0 |
 
 ### 4.5 已知断裂（待修复）
 
@@ -324,18 +327,22 @@ _无。前端 `dashboardApi` / `stores/dashboard.ts` 此前指向未注册的后
 
 ## 7.1 局域网分发规格（install 页面 + 单端口）
 
-把本机网关能力延伸到局域网设备：浏览器沙箱无法直接装 CLI、写客户端配置，所以 install 页面生成「一行命令」让用户在终端执行一次（装 Claude Code CLI + 写 `~/.claude/settings.json` 指向本机网关）。详见 [specs/spec-lan-deploy.md](specs/spec-lan-deploy.md)。
+把本机网关能力延伸到局域网设备：浏览器沙箱无法直接装 CLI、写客户端配置，所以 install 页面生成「一行命令」让用户在终端执行一次。Install 页面从旧版的静态 HTML（`assets/install.html`，`include_str!` 编译进二进制）迁移为 Vue SPA 组件（`src/views/InstallView.vue`），后端通过 `tower_http::ServeDir` 托管前端构建产物 + SPA fallback 到 `index.html`，由 Vue Router 处理 `/install` 路由。详见 [specs/spec-lan-deploy.md](specs/spec-lan-deploy.md)。
 
 | 项 | 规则 |
 |----|------|
-| 单 listener + IP 限制 | `0.0.0.0:19068`，`/api/*` 管理端点由 `admin_ip_guard` 中间件限 loopback；`/install`、`/v1/*` 对外开放 |
+| 单 listener + IP 限制 | `0.0.0.0:19068`，`/api/*` 管理端点由 `admin_ip_guard` 中间件限 loopback；`/api/ui-settings`、`/v1/*` 对外开放；未匹配 GET 请求 fallback 到 `index.html` |
 | 分发链接 | 密钥管理页创建密钥后弹窗展示：`http://<本机IP>:19068/install?t=<明文key>`，可一键复制 |
-| 本机 IP 来源 | `GET /api/install/local-ip`（UDP socket 连 8.8.8.8:80 取出口 IP，过滤回环） |
-| 页面行为 | 用 `?t=` 里的 key 调 `/v1/models` 取模型别名下拉；按平台（Windows PowerShell / macOS·Linux Bash）生成命令；勾选「已装 CLI」可省略安装段 |
-| 命令内容 | A 段 `npm i -g @anthropic-ai/claude-code`；B 段写 `settings.json`：`env.ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` + 4 模型槽位（`_MODEL`/`_MODEL_NAME` 统一用网关别名）+ `permissions.defaultMode=bypassPermissions`，**保留客户端既有字段** |
+| 本机 IP + 端口 | `GET /api/install/local-ip` 返回 `{ ip, port }`（UDP socket 连 8.8.8.8:80 取出口 IP + `Config.port`） |
+| UI 设置同步 | `GET /api/ui-settings`（公开端点）返回管理端的 `theme`/`hue`/`locale`，LAN install 页面加载时读取并应用，保持与主机应用一致的视觉风格 |
+| 消费端选择 | 支持 **Claude Code**（写 `~/.claude/settings.json`）和 **ChatGPT/Codex**（写 `~/.codex/config.toml` + `auth.json`）两种客户端，用户可切换 |
+| 模型选择 | 用 `?t=` 里的 key 调 `/v1/models` 取模型别名下拉；未选中别名时省略模型相关配置行 |
+| Claude Code 命令 | 按平台生成：A 段 `npm i -g @anthropic-ai/claude-code`（可勾选省略）；B 段写 `settings.json`：`env.ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` + 4 模型槽位（`_MODEL`/`_MODEL_NAME` 统一用网关别名）+ `permissions.defaultMode=bypassPermissions`，**保留客户端既有字段** |
+| ChatGPT/Codex 命令 | 写 `~/.codex/config.toml`（`model`/`model_provider`/`base_url`）+ `~/.codex/auth.json`（`OPENAI_API_KEY`） |
 | 安全边界 | 密钥明文嵌入 URL（局域网嗅探可见），只发给可信设备；撤销即在密钥列表删除，立即失效 |
+| 非 Tauri 兼容 | 前端代码通过动态 `import()` 延迟加载 Tauri API，LAN 浏览器访问时不触发 Tauri 依赖报错 |
 
-用途：团队成员/多设备快速接入同一网关，无需逐个手写 base URL、token、模型名——复制一条链接即完成 Claude Code 配置。
+用途：团队成员/多设备快速接入同一网关，无需逐个手写 base URL、token、模型名——复制一条链接即完成客户端配置。
 
 ---
 
@@ -360,7 +367,7 @@ _无。前端 `dashboardApi` / `stores/dashboard.ts` 此前指向未注册的后
 | Service Key 存储 | Argon2 哈希（随机盐 + PHC 格式） |
 | Provider Key 存储 | AES-256-GCM 加密（主密钥 `master.key`，权限 0600） |
 | 管理 API | `admin_ip_guard` 中间件限 loopback IP，仅本机可访问 `/api/*` 端点 |
-| 公共暴露面 | 单端口 `0.0.0.0:19068`，公开路径只暴露 `/v1/*`（需 key 鉴权）、`/install`（无 key 仅提示页）、`/health`、`/ws` |
+| 公共暴露面 | 单端口 `0.0.0.0:19068`，公开路径只暴露 `/v1/*`（需 key 鉴权）、`/api/ui-settings`（主题/语言）、前端 SPA fallback（含 `/install` 页面）、`/health`、`/ws` |
 | CORS | 统一 origin 白名单（localhost + 127.0.0.1 的 5173/19068 双端口 + tauri://localhost + https://tauri.localhost + http://tauri.localhost，共 7 个） |
 | 频率限制 | 令牌桶 128 req/min，按 Service Key |
 | 分发密钥 | install URL query 明文嵌入，仅限可信局域网设备，撤销即在密钥列表删除 |

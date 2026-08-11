@@ -1445,3 +1445,67 @@ fn resolve_macos_proxy() -> Option<String> {
     // 返回 "http://proxy:port" 格式
 }
 ```
+
+---
+
+## ADR-033: Install 页面从编译时静态 HTML 迁移为 Vue SPA + tower-http ServeDir
+
+**日期**: 2026-08-11  
+**状态**: 已接受  
+**关联**: ADR-017（单 listener + 路径级 IP 限制）、ADR-018（国际化）
+
+### 背景
+
+原 install 页面（`src-tauri/assets/install.html`，370 行内联 JS）通过 `include_str!` 编译进二进制，`handlers/install.rs` 的 `serve_install_page()` 返回 `Html<&'static str>`。这种"单文件自包含"方案在早期简单直接，但随着需求膨胀暴露了问题：
+
+1. **维护割裂**：页面逻辑用原生 JS 写在 HTML 里，无法复用前端的 Vue 组件（MD3 design tokens、MdiIcon、i18n 语言包）、无法访问 Pinia stores、无法共享 `api.ts` 的请求封装
+2. **视觉不一致**：静态页内联 CSS 变量与前端 `global.css` 的 MD3 tokens 是两套独立定义，暗色模式下色差明显；语言切换也是页面内联字典，与前端 `src/i18n/` 的语言包重复维护
+3. **功能受限**：无法使用 Vue Router 的导航守卫、无法接入 WebSocket 实时推送、无法共享主题色相（hue）设置——LAN 设备看到的 install 页面与主机应用风格完全脱节
+4. **扩展困难**：新增消费端（ChatGPT/Codex）需要在纯 JS 里写复杂的表单交互和命令生成逻辑，继续堆砌内联代码
+
+### 决策
+
+1. **删除 `assets/install.html`**：移除编译进二进制的静态页面，`handlers/install.rs` 的 `serve_install_page()` 一并删除（仅保留 `get_local_ip()`）
+2. **新增 `src/views/InstallView.vue`**：Vue SPA 组件，注册在 Vue Router 的 `/install` 路由，复用 MD3 组件（`md-outlined-segmented-button-set`、`md-outlined-select`、`md-circular-progress`）、MdiIcon、i18n 语言包
+3. **后端 SPA fallback**：`api/router.rs` 新增 `spa_fallback()` + `tower_http::ServeDir`：
+   - `/assets/*` → `ServeDir` 托管前端构建产物（`dist/assets/`）
+   - 所有未匹配 axum 路由的 GET 请求 → fallback 返回 `dist/index.html`
+   - Vue Router 接管 `/install` 路由，渲染 InstallView 组件
+4. **新增 `/api/ui-settings` 公开端点**：返回管理端的 `theme`/`hue`/`locale` 设置，LAN install 页面加载时读取并应用，保持与主机应用一致的视觉风格
+5. **UI 设置后端持久化**：`settings` 表新增 `theme`/`hue`/`locale` 键，前端 `theme.ts` 和 `i18n/index.ts` 在主题/语言切换时通过 `PUT /api/settings` 同步到后端
+6. **动态 BASE_URL**：`src/api.ts` 的 `getBaseUrl()` 按 hostname 判断——Tauri/localhost 用 `http://localhost:19068`，LAN 浏览器用当前 origin（避免 CORS）
+7. **非 Tauri 兼容**：前端代码（`App.vue`、`theme.ts`、`fm/player.ts`）通过动态 `import()` 延迟加载 Tauri API（`@tauri-apps/api/*`），LAN 浏览器访问时不触发 Tauri 依赖报错
+8. **多消费端支持**：InstallView 新增消费端选择（Claude Code / ChatGPT），按平台生成不同命令
+
+### 原因
+
+1. **统一技术栈**：install 页面用 Vue 组件 + MD3 设计系统，与前端其他页面风格一致；i18n 复用同一套语言包，不再维护两套翻译
+2. **视觉同步**：`/api/ui-settings` 让 LAN 页面自动继承主机应用的主题色、令牌色和语言设置，用户感知是"同一个应用"
+3. **维护成本降低**：删除 370 行内联 JS + CSS，InstallView 用 Vue 模板 + TypeScript 实现，可复用现有组件和工具函数
+4. **扩展性提升**：新增消费端只需在 InstallView 里加一个 `buildXxxCommand()` 函数 + 分段按钮，不需要在纯 JS 里手撸 DOM 操作
+5. **ServeDir + SPA fallback 是标准模式**：axum + tower-http 的成熟方案，`DIST_DIR` 环境变量支持开发/生产环境切换；fallback 到 `index.html` 是所有 SPA 框架的标准做法
+
+### 代价
+
+- **二进制不再包含 install 页面**：`include_str!` 的零运行时依赖优势丢失，需要 `dist/` 目录存在才能访问 install 页面（开发环境 `pnpm dev` 自动构建，生产环境 `pnpm build` 输出到 `dist/`）
+- **`/api/ui-settings` 公开暴露**：主题/语言设置不含敏感信息，但增加了一个公开端点——可接受，因为管理端点仍受 `admin_ip_guard` 保护
+- **冒烟测试调整**：原测试断言 `/install` 返回包含"客户分发 / Client Deploy"的 HTML，改为断言 200 或 404（测试环境无 `dist/` 目录时 fallback 返回 404）
+
+### 文件变更
+
+| 文件 | 变化 |
+|------|------|
+| `src-tauri/assets/install.html` | **删除**（370 行内联 JS + CSS） |
+| `src-tauri/src/api/handlers/install.rs` | 删除 `serve_install_page()`，仅保留 `get_local_ip()`（增加返回 `port`） |
+| `src-tauri/src/api/handlers/stats.rs` | 新增 `get_ui_settings()`（公开端点）+ `get_settings()`/`update_settings()` 增加 `theme`/`hue`/`locale` 字段 |
+| `src-tauri/src/api/router.rs` | 新增 `spa_fallback()`、`ServeDir` 托管 `/assets/*`、删除 `/install` 路由、新增 `/api/ui-settings` |
+| `src/views/InstallView.vue` | **新建**：Vue SPA 组件（消费端选择 + 模型下拉 + 命令生成） |
+| `src/api.ts` | 动态 `BASE_URL`（`getBaseUrl()`）+ 新增 `uiSettingsApi` + `settingsApi` 增加 `theme`/`hue`/`locale` + `installApi.localIp()` 返回 `port` |
+| `src/theme.ts` | Tauri API 动态导入 + `syncThemeToBackend()` / `syncHueToBackend()` |
+| `src/i18n/index.ts` | `syncLocaleToBackend()` 语言切换同步到后端 settings 表 |
+| `src/App.vue` | `/install` 路由时隐藏 AppShell + ConnectionStatus + Tauri API 动态导入 |
+| `src/fm/player.ts` | Tauri API 动态导入（`invoke`/`listen`） |
+| `src/views/KeysView.vue` | `localPort` 从 `installApi.localIp()` 动态获取（不再硬编码 `19069`） |
+| `src-tauri/Cargo.toml` | `tower-http` 增加 `fs` feature（`ServeDir` 依赖） |
+
+---

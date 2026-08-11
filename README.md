@@ -48,9 +48,9 @@ pnpm build
 
 ### 局域网分发（install 页面）
 
-把本机变成局域网 API 网关：在「密钥管理」页创建密钥后，弹窗里复制「分发链接」，发给局域网设备打开。页面按平台生成单行命令（装 Claude Code CLI + 写 `~/.claude/settings.json` 指向本机网关），复制到终端运行一次即可。详见 [docs/specs/spec-lan-deploy.md](docs/specs/spec-lan-deploy.md)。
+把本机变成局域网 API 网关：在「密钥管理」页创建密钥后，弹窗里复制「分发链接」，发给局域网设备打开。Install 页面（Vue SPA，`/install` 前端路由）支持两种消费端：Claude Code（写 `~/.claude/settings.json`）和 ChatGPT/Codex（写 `~/.codex/config.toml` + `auth.json`），按平台（Windows PowerShell / macOS·Linux Bash）生成单行命令，复制到终端运行一次即可。页面自动同步管理端的主题、令牌色和语言设置。详见 [docs/specs/spec-lan-deploy.md](docs/specs/spec-lan-deploy.md)。
 
-> 网关单端口 `19068` 绑 `0.0.0.0`，`/api/*` 管理端点通过 IP 中间件限制仅本机（loopback）可访问，`/install` 与 `/v1/*` 对外开放供局域网设备使用。局域网分发需放行防火墙 19068 端口。
+> 网关单端口 `19068` 绑 `0.0.0.0`，`/api/*` 管理端点通过 IP 中间件限制仅本机（loopback）可访问，前端 SPA 通过 fallback 机制由 Vue Router 处理 `/install` 路由，`/v1/*` 与 `/api/ui-settings` 对外开放供局域网设备使用。局域网分发需放行防火墙 19068 端口。
 
 ### 配置
 
@@ -104,11 +104,11 @@ pnpm build
 
 - Provider API Key: **AES-256-GCM** 加密存储，主密钥独立于数据库（`master.key`，权限 0600）
 - Service Key: **Argon2** 哈希存储（随机盐），创建时仅返回一次明文
-- 管理 API 通过 `admin_ip_guard` 中间件限制仅 loopback IP 可访问（`/api/*` 端点），CORS origin 白名单；公开路径（`/v1/*` 需 key 鉴权、`/install` 页面）对外开放，管理接口局域网不可达
+- 管理 API 通过 `admin_ip_guard` 中间件限制仅 loopback IP 可访问（`/api/*` 端点，`/api/ui-settings` 除外），CORS origin 白名单；公开路径（`/v1/*` 需 key 鉴权、`/api/ui-settings`、前端 SPA fallback）对外开放，管理接口局域网不可达
 
 ### 局域网分发（install 页面）
 
-密钥管理页创建密钥后可复制「分发链接」（`http://<本机IP>:19068/install?t=<明文key>`），局域网设备打开即得按平台生成的一行命令：装 Claude Code CLI + 写 `~/.claude/settings.json`（`ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` 指向网关，模型别名走下拉选择）。密钥明文嵌入 URL，仅限可信设备，撤销即在密钥列表删除。
+密钥管理页创建密钥后可复制「分发链接」（`http://<本机IP>:19068/install?t=<明文key>`），局域网设备打开即进入 Vue SPA 的 install 页面（通过 fallback 机制由 Vue Router 处理）。页面支持两种消费端：**Claude Code**（写 `~/.claude/settings.json`，含 `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` + 4 模型槽位）和 **ChatGPT/Codex**（写 `~/.codex/config.toml` + `auth.json`），按平台生成单行命令。页面自动从后端读取管理端的主题、令牌色和语言设置（`/api/ui-settings` 公开端点），保持与主机应用一致的视觉风格。密钥明文嵌入 URL，仅限可信设备，撤销即在密钥列表删除。
 
 ### 插件系统
 

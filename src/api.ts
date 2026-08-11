@@ -1,4 +1,19 @@
-export const BASE_URL = 'http://localhost:19068';
+// Dynamic BASE_URL: use current origin for LAN browsers, localhost for Tauri/local dev
+function getBaseUrl(): string {
+  if (typeof window === 'undefined') return 'http://localhost:19068';
+
+  const { hostname, protocol, port } = window.location;
+
+  // Tauri WebView or local development
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || protocol === 'tauri:') {
+    return 'http://localhost:19068';
+  }
+
+  // LAN browser: use same origin to avoid CORS
+  return `${protocol}//${hostname}:${port}`;
+}
+
+export const BASE_URL = getBaseUrl();
 
 interface RequestOptions {
   method?: string;
@@ -217,10 +232,29 @@ export const publicApi = {
 };
 
 // --- App Settings ---
+export interface AppSettings {
+  websearch_hijack: boolean;
+  failover_enabled: boolean;
+  theme: string;
+  hue: number;
+  locale: string;
+}
+
 export const settingsApi = {
-  get: () => request<{ websearch_hijack: boolean; failover_enabled: boolean }>('/api/settings'),
-  update: (data: { websearch_hijack?: boolean; failover_enabled?: boolean }) =>
+  get: () => request<AppSettings>('/api/settings'),
+  update: (data: { websearch_hijack?: boolean; failover_enabled?: boolean; theme?: string; hue?: number; locale?: string }) =>
     request<{ status: string }>('/api/settings', { method: 'PUT', body: data }),
+};
+
+// --- UI Settings (public, for LAN install page) ---
+export interface UiSettings {
+  theme: string;
+  hue: number;
+  locale: string;
+}
+
+export const uiSettingsApi = {
+  get: () => request<UiSettings>('/api/ui-settings'),
 };
 
 // --- Data (import / export / reset) ---
@@ -232,5 +266,5 @@ export const dataApi = {
 
 // --- Install（局域网分发）---
 export const installApi = {
-  localIp: () => request<{ ip: string | null }>('/api/install/local-ip'),
+  localIp: () => request<{ ip: string | null; port: number }>('/api/install/local-ip'),
 };

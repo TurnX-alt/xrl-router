@@ -9,16 +9,13 @@ export default {
   // ── Claude FM ──
   'fm.play': 'Play',
   'fm.pause': 'Pause',
-  'fm.error': 'Track unavailable, skipped',
 
   // ── Common ──
   'common.cancel': 'Cancel',
-  'common.confirm': 'Confirm',
   'common.save': 'Save',
   'common.delete': 'Delete',
   'common.edit': 'Edit',
   'common.create': 'Create',
-  'common.copy': 'Copy',
   'common.done': 'Done',
   'common.empty': 'Nothing here yet',
   'common.unnamed': 'Unnamed',
@@ -70,17 +67,14 @@ export default {
   'settings.data.title': 'User Data',
   'settings.data.desc': 'Export all settings and data to a SQL backup file, or import to restore from a SQL file (import overwrites current data)',
   'settings.data.export.button': 'Export',
-  'settings.data.export.success': 'Data exported successfully',
 
   'settings.data.import.button': 'Import',
   'settings.data.import.confirm': 'Are you sure you want to import data? This will overwrite all current data.',
-  'settings.data.import.success': 'Data imported successfully',
 
   'settings.data.reset.title': 'Reset All Data',
   'settings.data.reset.desc': 'Clear all locally stored data. This action cannot be undone',
   'settings.data.reset.button': 'Clear All Local Data',
   'settings.data.reset.confirm': 'Are you sure you want to clear all locally stored data? This action cannot be undone.',
-  'settings.data.reset.success': 'Data cleared',
 
   // ── Providers list ──
   'providers.title': 'Providers',
@@ -185,7 +179,6 @@ export default {
   'stats.log.col_status': 'Status',
   'stats.log.status_ok': 'Success',
   'stats.log.status_fail': 'Failed',
-  'stats.log.status_pending': 'In Progress',
   'stats.log.prev': 'Previous',
   'stats.log.next': 'Next',
   'stats.log.page': 'Page {current} of {total}',
@@ -197,7 +190,19 @@ export default {
   'plugin.dialog.ignore': 'Ignore',
   'plugin.dialog.add': 'Add Provider',
 
-  // ── Tray menu (backend) ──
-  'tray.show': 'Show Window',
-  'tray.quit': 'Quit',
+
+  // ── Install page ──
+  'install.title': 'Client Deploy',
+  'install.no_key_title': 'No key provided',
+  'install.no_key_desc': 'Create a key in the XRL Router key management page on the host, then open the "deploy link" from the popup.',
+  'install.platform_label': 'Operating System',
+  'install.consumer_label': 'Consumer',
+  'install.mode_claude_code': 'Claude Code',
+  'install.mode_chatgpt': 'ChatGPT',
+  'install.default_model': 'Default Model',
+  'install.models_loading': 'Fetching gateway models…',
+  'install.models_fetch_error': 'Failed to fetch models: {msg}',
+  'install.models_error_ignore': 'You can ignore this — the command will skip default models (Claude Code uses its own defaults; missing aliases may 404).',
+  'install.no_models': 'No models available on the gateway. Configure providers and models on the host XRL Router first.',
+  'install.command_title': 'Executable Command · {platform}',
 };

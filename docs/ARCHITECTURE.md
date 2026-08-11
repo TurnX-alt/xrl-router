@@ -31,10 +31,12 @@ xrl-router 是一个 **Tauri 2 桌面应用**，内部跑着一个 Rust axum HTT
 │               单 listener 绑 0.0.0.0:19068 (axum)                         │
 │                                                                           │
 │  公开路径（不限 IP）              /api/* 管理路径（IP 中间件限 loopback）  │
-│  ├─ /install 静态页 (局域网)      ├─ CRUD: providers,keys,models          │
-│  ├─ /v1/* 代理 (service key)     ├─ stats, settings, plugins             │
+│  ├─ /v1/* 代理 (service key)     ├─ CRUD: providers,keys,models          │
+│  ├─ /api/ui-settings (公开)      ├─ stats, settings, plugins             │
 │  ├─ /health  /  /ws  /ws/plugin  ├─ install/local-ip                     │
-│  └─ 同一套 proxy_routes           └─ data/export,import,reset             │
+│  ├─ /assets/* (ServeDir)         └─ data/export,import,reset             │
+│  ├─ SPA fallback → index.html                                           │
+│  └─ 同一套 proxy_routes                                                   │
 │                                                                           │
 │  请求入口 → 认证 → 路由解析 → 密钥选取 → 协议转换 → 上游转发 → 流式回传    │
 │                                                                           │
@@ -73,7 +75,7 @@ main.rs
             │    ├─ health.rs, providers.rs, keys.rs, models.rs
             │    ├─ service_keys.rs, stats.rs (含 /api/stats/requests 分页 + failover 开关)
             │    ├─ data.rs      (/api/data/export|import|reset)
-            │    ├─ install.rs  (/install 静态页 + /api/install/local-ip)
+            │    ├─ install.rs  (本机出口 IP 检测 /api/install/local-ip)
             │    ├─ websocket.rs  (/ws 端点)
             │    ├─ plugin.rs     (插件 REST + WS)
             │    └─ fm.rs         Claude FM 播放引擎 (rodio + souvlaki, std::thread)
@@ -122,7 +124,6 @@ main.rs
   │    └─ types.rs        消息类型定义
   ├─ middleware/rate_limit.rs  令牌桶 (128 req/min)
   ├─ search/bing.rs           Bing 搜索 (HTTP 浏览器头 + cookie 复用 + 懒预热 + 双域名 fallback + ck/a 重定向解码，绕过代理直连)
-  ├─ assets/install.html      局域网 install 静态页 (include_str! 编译进二进制)
   └─ types/                   数据结构定义
        ├─ provider.rs    ProviderKind / ProviderConfig / DelegateKeyConfig
        ├─ model.rs       Capability / ModelTier
@@ -231,12 +232,12 @@ SSE 流返回客户端
 ```
 src/
 ├── main.ts            Vue 入口 + MD3 组件按需导入 + initI18n + initSystemThemeListener
-├── App.vue            根组件: AppShell + PluginRegisterDialog + router-view
-├── router.ts          8 条路由 (7 个 lazy-loaded 组件路由 + 1 个 redirect)
-├── api.ts             REST 客户端 (BASE_URL=http://localhost:19068, 含 installApi/requestLogApi/dataApi)
+├── App.vue            根组件: AppShell（install 页面隐藏）+ PluginRegisterDialog + router-view
+├── router.ts          8 条路由 (8 个 lazy-loaded 组件路由 + 1 个 redirect, 含 /install)
+├── api.ts             REST 客户端 (动态 BASE_URL: Tauri/localhost → 19068, LAN 浏览器 → 当前 origin)
 ├── ws.ts              WebSocket 客户端 (自动重连 3s, 事件 pub/sub)
-├── theme.ts           主题 light/dark/system (localStorage 持久化, prefers-color-scheme 监听)
-├── i18n/              自研 i18n: index.ts (t/setLocale/initI18n, localStorage + 后端托盘同步) + zh-CN.ts / en.ts
+├── theme.ts           主题 light/dark/system (localStorage 持久化, prefers-color-scheme 监听, 同步到后端)
+├── i18n/              自研 i18n: index.ts (t/setLocale/initI18n, localStorage + 后端托盘 + 后端 settings 同步) + zh-CN.ts / en.ts
 ├── fm/                Claude FM 前端（极简 ~60 行：纯命令/事件，无音频逻辑）
 │    └─ player.ts      通过 Tauri command 控制播放，监听 fm-meta/fm-ready 事件
 │
@@ -250,6 +251,7 @@ src/
 │    KeysView.vue         Service Key 管理 (表格 + 权限对话框 + 分发链接)
 │    StatsView.vue        用量统计 (数据磁贴 + Chart.js 折线图 + 请求日志分页表)
 │    SettingsView.vue     设置 3 Tab: 通用(语言/主题/开机启动) + 路由(websearch/failover) + 数据(导出/导入/重置)
+│    InstallView.vue      局域网分发页: 消费端选择(Claude Code/ChatGPT) + 模型下拉 + 命令生成 (LAN 浏览器可访问)
 │
 ├── components/
 │    AppShell.vue              MD3 导航抽屉 (响应式, 使用 MdiIcon 渲染图标)
@@ -263,7 +265,7 @@ src/
      models.ts       Model 列表 (按 provider 分组)
 ```
 
-前端通过 HTTP 访问管理 API（无认证），通过 WebSocket 接收实时推送。语言切换经 `set_locale` Tauri command 同步到后端（托盘菜单文本），开机启动经 `@tauri-apps/plugin-autostart`，外链打开经 `@tauri-apps/plugin-shell`，数据文件读写经 `plugin-dialog` + `plugin-fs`（路径白名单见安全边界）。Claude FM 通过 `fm_toggle` / `fm_play` / `fm_pause` / `fm_get_state` Tauri command 控制播放，通过 `fm-meta` / `fm-ready` / `fm-state-changed` 事件接收状态更新。
+前端通过 HTTP 访问管理 API（无认证），通过 WebSocket 接收实时推送。Tauri API（window/event/core）通过动态 `import()` 延迟加载，LAN 浏览器访问 install 页面时不触发 Tauri 依赖报错。语言切换经 `set_locale` Tauri command + 后端 settings 表同步（托盘菜单文本 + LAN install 页面语言），开机启动经 `@tauri-apps/plugin-autostart`，外链打开经 `@tauri-apps/plugin-shell`，数据文件读写经 `plugin-dialog` + `plugin-fs`（路径白名单见安全边界）。Claude FM 通过 `fm_toggle` / `fm_play` / `fm_pause` / `fm_get_state` Tauri command 控制播放，通过 `fm-meta` / `fm-ready` / `fm-state-changed` 事件接收状态更新。
 
 ---
 
@@ -288,7 +290,7 @@ src/
 ┌─ 文件系统 ────────────────────────────────────────┐
 │  master.key       AES-256-GCM 主密钥 (权限 0600)  │
 │  xrl-router.db    SQLite 数据库                   │
-│  assets/install.html  编译进二进制的 install 页面  │
+│  dist/            Vite 构建产物（ServeDir 托管）    │
 └───────────────────────────────────────────────────┘
 
 ┌─ 纯内存 ──────────────────────────────────────────┐
@@ -334,7 +336,7 @@ src/
 
 | 路径类型 | 绑定 | 路由 | 访问方 | CORS |
 |----------|------|------|--------|------|
-| 公开 | `0.0.0.0:19068` (`HOST:PORT`) | `/health`、`/ws`、`/ws/plugin`、`/install` 静态页、`/v1/*` 代理 | Tauri WebView、本机客户端、局域网设备 | origin 白名单（7 个） |
+| 公开 | `0.0.0.0:19068` (`HOST:PORT`) | `/health`、`/ws`、`/ws/plugin`、`/api/ui-settings`、`/v1/*` 代理、`/assets/*` (ServeDir)、SPA fallback (`index.html`) | Tauri WebView、本机客户端、局域网设备 | origin 白名单（7 个） |
 | 管理（IP 限制） | 同上（`admin_ip_guard` 中间件限 loopback） | `/api/*` CRUD、`/api/install/local-ip`、`/api/data/*` | 仅本机（Tauri WebView、CC Switch 等） | origin 白名单（7 个） |
 
 - `/v1/*` 由 `proxy_routes()` 构建（套 `rate_limit_middleware` + 64MiB body limit）
@@ -357,7 +359,7 @@ src/
 | 密钥状态纯内存 | 减少 DB 写入开销，启动全 green 可接受 |
 | 轮询指针持久化 | 重启后跳过已失效的 key |
 | usage_log 无 FK | 删除 Provider/Model/Key 不影响历史统计 |
-| 管理 API 无认证 | `admin_ip_guard` IP 中间件限 loopback 是安全模型，本机进程访问是接受的代价；公开路径只暴露需 key 的 `/v1/*` 与无敏感信息的 `/install` |
+| 管理 API 无认证 | `admin_ip_guard` IP 中间件限 loopback 是安全模型，本机进程访问是接受的代价；公开路径只暴露需 key 的 `/v1/*`、无敏感信息的 `/api/ui-settings` 与 LAN install 页面 |
 | IR 真实值覆盖估算值 | `forward.rs` 预填的 `chars/4` 估算值偏大，max 合并会永久压住真实值，污染 usage_log 与客户端上下文条 |
 | Responses input_tokens 增量口径 | 减去 `cached_tokens`，与 Chat Completions `prompt_tokens - cached_tokens` 一致 |
 | 上下文超限预警而非硬拒绝 | 估算口径偏保守，硬拒绝会阻断客户端 auto-compact（死锁） |

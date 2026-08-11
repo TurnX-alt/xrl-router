@@ -74,9 +74,16 @@ pub(crate) async fn get_stats(
 }
 
 pub(crate) async fn get_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let theme = state.database.get_setting("theme").ok().flatten().unwrap_or_else(|| "system".to_string());
+    let hue = state.database.get_setting("hue").ok().flatten().unwrap_or_else(|| "264".to_string());
+    let locale = state.database.get_setting("locale").ok().flatten().unwrap_or_else(|| "zh-CN".to_string());
+
     Json(serde_json::json!({
         "websearch_hijack": state.websearch_hijack.load(std::sync::atomic::Ordering::Relaxed),
         "failover_enabled": state.failover_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        "theme": theme,
+        "hue": hue.parse::<i32>().unwrap_or(264),
+        "locale": locale,
     }))
 }
 
@@ -84,6 +91,9 @@ pub(crate) async fn get_settings(State(state): State<Arc<AppState>>) -> impl Int
 pub(crate) struct UpdateSettingsRequest {
     websearch_hijack: Option<bool>,
     failover_enabled: Option<bool>,
+    theme: Option<String>,
+    hue: Option<i32>,
+    locale: Option<String>,
 }
 
 pub(crate) async fn update_settings(
@@ -110,5 +120,43 @@ pub(crate) async fn update_settings(
             ));
         }
     }
+    if let Some(ref v) = req.theme {
+        if let Err(e) = state.database.set_setting("theme", v) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ));
+        }
+    }
+    if let Some(v) = req.hue {
+        if let Err(e) = state.database.set_setting("hue", &v.to_string()) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ));
+        }
+    }
+    if let Some(ref v) = req.locale {
+        if let Err(e) = state.database.set_setting("locale", v) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ));
+        }
+    }
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// GET /api/ui-settings — 公开端点，返回 UI 设置（主题/令牌色/语言）。
+/// 供 LAN 浏览器 install 页面读取管理端配置，无需 loopback 限制。
+pub(crate) async fn get_ui_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let theme = state.database.get_setting("theme").ok().flatten().unwrap_or_else(|| "system".to_string());
+    let hue = state.database.get_setting("hue").ok().flatten().unwrap_or_else(|| "264".to_string());
+    let locale = state.database.get_setting("locale").ok().flatten().unwrap_or_else(|| "zh-CN".to_string());
+
+    Json(serde_json::json!({
+        "theme": theme,
+        "hue": hue.parse::<i32>().unwrap_or(264),
+        "locale": locale,
+    }))
 }

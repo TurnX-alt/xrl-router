@@ -8,5 +8,6 @@ export const routes: RouteRecordRaw[] = [
   { path: '/keys', name: 'Keys', component: () => import('./views/KeysView.vue') },
   { path: '/stats', name: 'Stats', component: () => import('./views/StatsView.vue') },
   { path: '/settings', name: 'Settings', component: () => import('./views/SettingsView.vue') },
+  { path: '/install', name: 'Install', component: () => import('./views/InstallView.vue') },
   { path: '/', redirect: '/providers' },
 ];
