@@ -40,10 +40,10 @@ pnpm build
 
 ### 接入 CC Switch
 
-- **Base URL**：`http://localhost:19068`
+- **Base URL**：`http://127.0.0.1:19068`
 - **API Key**：在应用内「密钥管理」页创建的 Service Key
 - **模型**：使用应用内配置的模型别名（网关负责路由到真实上游）
-- **余额查询**：使用 TokenPlan 模板所需的 ZenMux 兼容格式，请求地址 `http://localhost:19068/v1/user/balance?zenmux`，API Key 同上方配置的 API Key
+- **余额查询**：使用 TokenPlan 模板所需的 ZenMux 兼容格式，请求地址 `http://127.0.0.1:19068/v1/user/balance?zenmux`，API Key 同上方配置的 API Key
 - **配额**：Service Key 可在「密钥管理」页配置 5h/7d 滚动窗口 token 上限，触顶返回 429（`quota_error` + `retry-after`）
 
 ### 局域网分发（install 页面）

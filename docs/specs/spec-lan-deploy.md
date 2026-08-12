@@ -176,7 +176,7 @@ Claude Code 用 `ANTHROPIC_AUTH_TOKEN` 走 `Authorization: Bearer`，网关已�
 ## 动态 BASE_URL
 
 `src/api.ts` 的 `getBaseUrl()` 按运行环境动态选择：
-- **Tauri/localhost**（hostname 为 `localhost`/`127.0.0.1` 或 protocol 为 `tauri:`）→ `http://localhost:19068`
+- **Tauri/localhost**（hostname 为 `localhost`/`127.0.0.1` 或 protocol 为 `tauri:`）→ `http://127.0.0.1:19068`
 - **LAN 浏览器**（hostname 为本机局域网 IP）→ 使用当前 origin（`${protocol}//${hostname}:${port}`），避免 CORS
 
 前端代码（`App.vue`、`theme.ts`、`fm/player.ts`）通过动态 `import()` 延迟加载 Tauri API（`@tauri-apps/api/*`），LAN 浏览器访问时不触发 Tauri 依赖报错。`App.vue` 在 `/install` 路由时隐藏 AppShell + ConnectionStatus，install 页面全屏展示。

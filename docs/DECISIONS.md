@@ -1473,9 +1473,10 @@ fn resolve_macos_proxy() -> Option<String> {
    - Vue Router 接管 `/install` 路由，渲染 InstallView 组件
 4. **新增 `/api/ui-settings` 公开端点**：返回管理端的 `theme`/`hue`/`locale` 设置，LAN install 页面加载时读取并应用，保持与主机应用一致的视觉风格
 5. **UI 设置后端持久化**：`settings` 表新增 `theme`/`hue`/`locale` 键，前端 `theme.ts` 和 `i18n/index.ts` 在主题/语言切换时通过 `PUT /api/settings` 同步到后端
-6. **动态 BASE_URL**：`src/api.ts` 的 `getBaseUrl()` 按 hostname 判断——Tauri/localhost 用 `http://localhost:19068`，LAN 浏览器用当前 origin（避免 CORS）
+6. **动态 BASE_URL**：`src/api.ts` 的 `getBaseUrl()` 按 hostname 判断——Tauri/localhost 用 `http://127.0.0.1:19068`，LAN 浏览器用当前 origin（避免 CORS）。**用 `127.0.0.1` 而非 `localhost`**：Windows 上 `localhost` 优先解析为 `::1`（后端只绑 IPv4），且代理工具（Clash 等）的 bypass 规则通常覆盖 `127.0.0.1` 而未必覆盖 `localhost`——后者被代理劫持时响应是 HTML，前端 `JSON.parse` 会报 `Unexpected token '<'`。**必须同时命中 `tauri.localhost` hostname**：Tauri 2 在 Windows 生产模式页面地址是 `http://tauri.localhost`（macOS/Linux 是 `tauri://localhost` 协议），漏掉它 BASE_URL 会拼成 `http://tauri.localhost`，请求打到 asset protocol 返回 index.html（200 HTML），表现为「构建版保存 Provider 报 Unexpected token '<'，dev 模式正常」
 7. **非 Tauri 兼容**：前端代码（`App.vue`、`theme.ts`、`fm/player.ts`）通过动态 `import()` 延迟加载 Tauri API（`@tauri-apps/api/*`），LAN 浏览器访问时不触发 Tauri 依赖报错
 8. **多消费端支持**：InstallView 新增消费端选择（Claude Code / ChatGPT），按平台生成不同命令
+9. **后端双栈监听**：`start_gateway` 对通配 host 用 socket2 绑 `[::]` + `IPV6_V6ONLY=false`（IPv6 不可用回退 `0.0.0.0`）——localhost 无论解析成 `::1` 还是 `127.0.0.1` 都能连上，不再依赖客户端 hostname 选择。**连带修正**：`admin_ip_guard` 的 loopback 判断需 `to_canonical()` 兼容 IPv4-mapped（`::ffff:127.0.0.1`），否则双栈下本机管理请求被误拒 403（纯 `::1` 由 `is_loopback()` 原生覆盖）
 
 ### 原因
 

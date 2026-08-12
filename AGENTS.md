@@ -62,7 +62,7 @@ src-tauri/src/                 后端 Rust
 
 src/                           前端 Vue 3
 ├── main.ts / App.vue / router.ts
-├── api.ts                     REST 客户端（动态 BASE_URL：Tauri/localhost 用 http://localhost:19068，LAN 浏览器用当前 origin）
+├── api.ts                     REST 客户端（动态 BASE_URL：Tauri/localhost 用 http://127.0.0.1:19068，LAN 浏览器用当前 origin）
 ├── ws.ts                      WebSocket 客户端（自动重连 3s）
 ├── theme.ts                   明/暗/跟随系统主题（localStorage 持久化，prefers-color-scheme 监听，设置同步到后端供 LAN install 页读取）
 ├── i18n/                      自研 i18n：index.ts（t/setLocale/initI18n，语言切换同步到后端）+ zh-CN.ts / en.ts
@@ -143,7 +143,7 @@ docs/                          文档（本目录）
 - UI 用 Material Design 3（`@material/web`），**不要**引入其他组件库
 - 颜色用 CSS 变量 `var(--md-sys-color-*)`，**不要**硬编码 hex
 - MWC 组件在 `main.ts` 按需导入，**不要**导入 `all.js`
-- `api.ts` 的 `BASE_URL` 是动态解析的：Tauri/localhost 环境用 `http://localhost:19068`，LAN 浏览器用当前 origin（避免 CORS）
+- `api.ts` 的 `BASE_URL` 是动态解析的：Tauri/localhost 环境用 `http://127.0.0.1:19068`，LAN 浏览器用当前 origin（避免 CORS）
 - 外链打开用 `@tauri-apps/plugin-shell` 的 `open()`（如 SettingsView），不要用 `window.open`（Tauri WebView 内不可靠）
 - **非 Tauri 环境兼容**：前端代码（`App.vue`、`theme.ts`、`fm/player.ts` 等）通过动态 `import()` 延迟加载 Tauri API，LAN 浏览器访问 install 页面时不会触发 Tauri 依赖报错
 
