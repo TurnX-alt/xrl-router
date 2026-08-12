@@ -1,52 +1,6 @@
 //! usage_log 写入与统计聚合（V12 起统计自包含，不再 JOIN 父表）。
 
 impl super::Database {
-    // Statistics methods
-    pub fn get_stats(&self) -> anyhow::Result<(i64, i64)> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT
-                COALESCE(SUM(prompt_tokens + completion_tokens + cache_read_input_tokens), 0) as total_tokens,
-                COUNT(*) as total_requests
-             FROM usage_log"
-        )?;
-
-        let stats = stmt.query_row([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-            ))
-        })?;
-
-        Ok(stats)
-    }
-
-    pub fn get_stats_by_provider(&self) -> anyhow::Result<Vec<serde_json::Value>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT
-                u.provider_name,
-                COUNT(*) as requests,
-                COALESCE(SUM(u.prompt_tokens + u.completion_tokens + u.cache_read_input_tokens), 0) as tokens
-             FROM usage_log u
-             GROUP BY u.provider_id, u.provider_name"
-        )?;
-
-        let stats = stmt.query_map([], |row| {
-            Ok(serde_json::json!({
-                "provider_name": row.get::<_, String>(0)?,
-                "requests": row.get::<_, i64>(1)?,
-                "tokens": row.get::<_, i64>(2)?,
-            }))
-        })?;
-
-        let mut result = Vec::new();
-        for stat in stats {
-            result.push(stat?);
-        }
-        Ok(result)
-    }
-
     /// 指定 service key 在 5h / 7d 固定窗口内已用的 tokens。
     /// 窗口按 epoch 对齐（`now - now % window_secs`），与 quota.rs 的
     /// `window_reset_ts` 保持一致，确保新窗口开始时用量归零。
@@ -293,7 +247,6 @@ impl super::Database {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// 分页拉取：时间逆序、总数正确、越界页空、success 字段回传。
     #[test]

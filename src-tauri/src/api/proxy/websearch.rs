@@ -93,6 +93,7 @@ fn is_search_tool_name(name: &str) -> bool {
 }
 
 /// IR 请求的 tools 里是否含搜索类工具。
+#[cfg(test)]
 pub(super) fn has_websearch_tool_ir(req: &IrRequest) -> bool {
     req.tools.iter().any(|t| is_search_tool_name(&t.name))
 }
@@ -1251,7 +1252,7 @@ mod exhausted_loop_tests {
     /// 验证清理后的请求序列化为 Chat Completions 时不再补回 web_search 工具。
     #[test]
     fn test_exhausted_loop_chat_completions_no_tool_readd() {
-        let mut req = IrRequest {
+        let req = IrRequest {
             model: "qwen3.7-max".to_string(),
             system: None,
             messages: vec![
@@ -1561,7 +1562,6 @@ mod server_tool_render_tests {
 #[cfg(test)]
 mod preliminary_brand_tests {
     use super::*;
-    use crate::api::proxy::ir::types::IrUsage;
 
     /// emit_preliminary_brand_message 应发送完整的 message 流（start → text → delta → stop）
     #[tokio::test]

@@ -339,9 +339,6 @@ onUnmounted(() => {
 .card__body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .card__name { margin: 0; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .card__name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.card__enabled-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.dot--on { background: var(--md-sys-color-primary); }
-.dot--off { background: var(--md-sys-color-outline-variant); }
 .card__key-stats {
   display: inline-flex;
   align-items: center;
@@ -357,7 +354,6 @@ onUnmounted(() => {
   background: var(--md-sys-color-error-container);
   color: var(--md-sys-color-on-error-container);
 }
-.card__chip { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: var(--md-sys-shape-corner-full); font-size: 0.75rem; font-weight: 500; }
 .chip { display: inline-flex; align-items: center; padding: 2px 10px; border-radius: var(--md-sys-shape-corner-full); background: var(--md-sys-color-secondary-container); color: var(--md-sys-color-on-secondary-container); font-size: 0.75rem; width: fit-content; margin-top: 2px; }
 .card__endpoint { color: var(--md-sys-color-on-surface-variant); font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; margin-top: 4px; }
 .card__actions { display: flex; justify-content: flex-end; position: relative; }

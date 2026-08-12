@@ -81,6 +81,7 @@ impl PluginManager {
         }
     }
 
+    #[allow(dead_code)]
     fn get_plugin_id_for_provider(&self, provider_id: &str) -> Option<String> {
         let conn = self.database.conn();
         let mut stmt = conn.prepare(

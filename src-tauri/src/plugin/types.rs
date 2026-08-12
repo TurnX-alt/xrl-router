@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// In-memory state for a connected plugin.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PluginConnection {
     pub plugin_id: String,
@@ -15,6 +16,7 @@ pub struct PluginConnection {
 }
 
 /// Model info sent by a plugin during registration.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginModel {
     pub model_id: String,
@@ -44,6 +46,7 @@ pub struct PluginProviderInfo {
 }
 
 /// keys_update message.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginKeysUpdateMsg {
     #[serde(rename = "type")]
@@ -52,6 +55,7 @@ pub struct PluginKeysUpdateMsg {
 }
 
 /// heartbeat message.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginHeartbeatMsg {
     #[serde(rename = "type")]
@@ -61,6 +65,7 @@ pub struct PluginHeartbeatMsg {
 }
 
 /// config_update message.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfigUpdateMsg {
     #[serde(rename = "type")]
@@ -72,6 +77,7 @@ pub struct PluginConfigUpdateMsg {
 }
 
 /// Generic WS message from plugin (loosely typed for flexible parsing).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginWsMsg {
     #[serde(rename = "type")]
@@ -81,6 +87,7 @@ pub struct PluginWsMsg {
 }
 
 /// Database record for a plugin.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PluginRecord {
     pub id: String,

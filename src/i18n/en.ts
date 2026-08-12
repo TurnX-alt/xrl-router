@@ -76,6 +76,9 @@ export default {
   'settings.data.reset.button': 'Clear All Local Data',
   'settings.data.reset.confirm': 'Are you sure you want to clear all locally stored data? This action cannot be undone.',
 
+  'settings.cancel': 'Cancel',
+  'settings.confirm': 'Confirm',
+
   // ── Providers list ──
   'providers.title': 'Providers',
   'providers.add': 'Add Provider',

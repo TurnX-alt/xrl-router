@@ -5,7 +5,6 @@ use std::sync::Arc;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::hash_service_key;

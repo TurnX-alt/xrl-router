@@ -3,7 +3,6 @@
 //! 调用 `mod.rs` 的共享私有 helper（emit_event、save_plugin、
 //! update_plugin_status、get_plugin_by_id）与 `keys::sync_keys`。
 
-use serde_json::json;
 use tracing::{info, warn};
 
 use crate::crypto::MasterKey;

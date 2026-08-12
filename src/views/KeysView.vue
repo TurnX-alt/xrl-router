@@ -267,12 +267,6 @@ function resetsIn(remainingSecs: number): string {
   return `${m}m`;
 }
 
-/** 当前滚动窗口的剩余时间读数（与后端 format_resets_in 口径一致）。 */
-function windowResetsIn(windowSecs: number): string {
-  const now = Math.floor(Date.now() / 1000);
-  return resetsIn(windowSecs - (now % windowSecs));
-}
-
 /** 省略读数：≥1e8 → x.xx亿/B，≥1e4 → x.xx万/K，否则原样；0 → 不设限。 */
 function formatAbbrev(n: number): string {
   if (!n || n <= 0) return t('keys.unlimited');
@@ -449,7 +443,6 @@ onUnmounted(() => {
 .table td { padding: 12px 16px; vertical-align: middle; white-space: nowrap; }
 .table tr { border-bottom: 1px solid var(--md-sys-color-outline-variant); }
 .table tr:last-child { border-bottom: none; }
-.name-cell { color: var(--md-sys-color-on-surface); }
 .models-inner { display: inline-flex; flex-wrap: nowrap; gap: 4px 6px; align-items: center; vertical-align: middle; }
 .quota-lines { display: flex; flex-direction: column; gap: 2px; }
 .quota-line { font-size: 0.78rem; line-height: 1.5; color: var(--md-sys-color-on-surface-variant); }

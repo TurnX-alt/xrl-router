@@ -7,9 +7,6 @@
 //!
 //! 纯内存、不持久化、不广播——与密钥健康（keys/pool/health.rs）同一哲学。
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-
 use crate::gateway::server::AppState;
 
 /// provider 级冷却时长（秒）。5xx/网络/超时通常短暂（重启、抖动），
@@ -39,6 +36,7 @@ pub(super) fn is_provider_cooling(state: &AppState, provider_id: &str) -> bool {
 }
 
 /// 清空冷却表（开关关闭/测试用）。
+#[cfg(test)]
 pub(super) fn clear_cooldowns(state: &AppState) {
     let mut map = state.provider_cooldowns.write().unwrap();
     map.clear();
@@ -48,6 +46,7 @@ pub(super) fn clear_cooldowns(state: &AppState) {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use std::sync::Arc;
 
     fn test_state() -> Arc<AppState> {
         let db = Database::open_in_memory().unwrap();

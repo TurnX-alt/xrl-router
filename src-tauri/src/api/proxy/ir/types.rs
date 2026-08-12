@@ -243,6 +243,7 @@ impl IrStopReason {
     }
 
     /// 从 OpenAI Chat Completions finish_reason 解析。
+    #[cfg(test)]
     pub fn from_chat_completions(s: &str) -> Self {
         match s {
             "tool_calls" => Self::ToolUse,
@@ -276,6 +277,7 @@ pub struct IrUsage {
 // ═══════════════════════════════════════════════════════════════════
 
 /// 统一错误。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IrError {
     pub error_type: String,

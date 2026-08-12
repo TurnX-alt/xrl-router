@@ -635,7 +635,7 @@ impl ResponsesRenderState {
             }
             IrStreamEvent::MessageDelta {
                 stop_reason,
-                usage,
+                usage: _,
             } => {
                 // 暂存 stop_reason（finalize 时决定 status/incomplete_details）；
                 // usage 由 forward.rs 累积后传入 finalize

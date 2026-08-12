@@ -92,24 +92,6 @@ async function pause() {
 
 export const fmPlayer = { toggle };
 
-// ── 托盘联动（Tauri） ──
-
-let trayBound = false;
-
-async function bindTray() {
-  if (trayBound || !('__TAURI_INTERNALS__' in window)) return;
-  trayBound = true;
-
-  // 托盘菜单点击 → toggle
-  // 注意：托盘现在直接调用引擎 toggle（不再通过前端中转），
-  // 但前端仍需监听以更新 state（如果未来需要 UI 响应）。
-  // 暂时移除 fm-toggle 事件监听——托盘已直接调引擎。
-}
-
 export function initFm() {
   void init();
-}
-
-export function initTraySync() {
-  void bindTray();
 }

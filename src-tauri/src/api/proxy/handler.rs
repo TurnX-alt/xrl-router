@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::gateway::server::AppState;
 
-use super::auth::{verify_service_key, ServiceKeyInfo};
+use super::auth::verify_service_key;
 use super::ir;
 use super::ir::types::IrRequest;
 use super::quota::check_quota;

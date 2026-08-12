@@ -1,7 +1,3 @@
-pub mod adapter;
-pub mod anthropic;
-pub mod openai;
-
 use crate::db::Database;
 use crate::types::{Provider, ProviderKind};
 use anyhow::Result;
@@ -98,11 +94,13 @@ impl ProviderRegistry {
     }
 
     /// Find a provider by ID.
+    #[allow(dead_code)]
     pub fn find_by_id(&self, id: &str) -> Option<Provider> {
         self.providers.get(id).map(|p| p.value().clone())
     }
 
     /// Create a new provider.
+    #[allow(dead_code)]
     pub fn create(&self, provider: &Provider) -> Result<()> {
         let conn = self.database.conn();
         let config_json = serde_json::to_string(&provider.config)?;
@@ -128,6 +126,7 @@ impl ProviderRegistry {
     }
 
     /// Delete a provider.
+    #[allow(dead_code)]
     pub fn delete(&self, id: &str) -> Result<()> {
         let conn = self.database.conn();
         conn.execute("DELETE FROM providers WHERE id = ?", params![id])?;
@@ -154,6 +153,7 @@ impl ProviderRegistry {
     }
 
     /// Check if registry is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
@@ -184,27 +184,5 @@ impl ProviderRegistry {
     /// Remove a provider.
     pub fn remove(&self, id: &str) -> Option<Provider> {
         self.providers.remove(id).map(|(_, p)| p)
-    }
-
-    /// Create a new adapter for a provider with the given API key.
-    pub fn create_adapter(
-        &self,
-        provider: &Provider,
-        api_key: &str,
-    ) -> Result<Box<dyn adapter::Adapter>> {
-        use crate::providers::{anthropic::AnthropicAdapter, openai::OpenAIAdapter};
-
-        let key = api_key.to_string();
-
-        let adapter: Box<dyn adapter::Adapter> = match provider.kind {
-            ProviderKind::ChatCompletions | ProviderKind::Responses => {
-                Box::new(OpenAIAdapter::new(provider.base_url.clone(), key))
-            }
-            ProviderKind::Messages => {
-                Box::new(AnthropicAdapter::new(provider.base_url.clone(), key))
-            }
-        };
-
-        Ok(adapter)
     }
 }

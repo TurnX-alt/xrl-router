@@ -123,7 +123,6 @@ impl super::Database {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// list_service_keys 应带回 5h/7d 固定窗口已用量（与 get_service_key_usage 同口径）。
     #[test]

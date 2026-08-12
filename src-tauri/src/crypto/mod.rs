@@ -63,6 +63,7 @@ pub fn encrypt(plain: &str, key: &MasterKey) -> Result<String> {
     let cipher = cipher(key)?;
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plain.as_bytes())
@@ -83,6 +84,7 @@ pub fn decrypt(blob: &str, key: &MasterKey) -> Result<String> {
     }
     let (nonce_bytes, ciphertext) = bytes.split_at(12);
     let cipher = cipher(key)?;
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(nonce_bytes);
     let plain = cipher
         .decrypt(nonce, ciphertext)

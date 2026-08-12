@@ -9,7 +9,6 @@
 //! `build_router` 保留为兼容入口（`lib.rs` 与冒烟测试沿用）。
 
 use std::sync::Arc;
-use std::path::PathBuf;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::{header, StatusCode};

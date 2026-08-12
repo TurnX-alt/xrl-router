@@ -27,6 +27,7 @@ pub enum KeyPoolError {
     #[error("Key not found: {0}")]
     KeyNotFound(String),
     #[error("Database error: {0}")]
+    #[allow(dead_code)]
     DatabaseError(String),
 }
 

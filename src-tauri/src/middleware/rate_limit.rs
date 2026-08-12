@@ -35,6 +35,7 @@ impl RateLimiter {
     }
 
     /// Create a rate limiter with custom settings.
+    #[cfg(test)]
     pub fn with_limit(max_requests: u32, interval_secs: u64) -> Self {
         Self {
             buckets: Arc::new(DashMap::new()),
@@ -70,6 +71,7 @@ impl RateLimiter {
     }
 
     /// Get remaining tokens for a key.
+    #[cfg(test)]
     pub fn remaining(&self, key: &str) -> u32 {
         self.buckets
             .get(key)

@@ -18,10 +18,3 @@ pub mod to_responses;
 pub mod usage;
 
 // SDK 合规验证已移至 crate 根 src/sdk-test/（见 lib.rs 的 #[cfg(test)] 挂载）
-
-// Re-export 常用类型
-pub use types::{
-    IrContentBlock, IrContentBlockStart, IrContentDelta, IrError, IrImageSource, IrMessage,
-    IrRequest, IrRole, IrStopReason, IrStreamEvent, IrSystemContent, IrThinkingConfig, IrTool,
-    IrToolChoice, IrToolResultContent, IrUsage,
-};

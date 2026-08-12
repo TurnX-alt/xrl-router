@@ -59,6 +59,7 @@ impl super::PluginManager {
     }
 
     /// Get the active connection info for a provider (by provider_id).
+    #[allow(dead_code)]
     pub fn get_connection_for_provider(&self, provider_id: &str) -> Option<PluginConnection> {
         let plugin_id = self.get_plugin_id_for_provider(provider_id)?;
         self.connections.get(&plugin_id).map(|c| c.clone())
@@ -80,6 +81,7 @@ impl super::PluginManager {
     }
 
     /// Get a specific plugin connection by plugin_id.
+    #[allow(dead_code)]
     pub fn get_connection(&self, plugin_id: &str) -> Option<PluginConnection> {
         self.connections.get(plugin_id).map(|c| c.clone())
     }

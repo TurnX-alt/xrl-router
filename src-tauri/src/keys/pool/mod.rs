@@ -20,7 +20,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub use types::{KeyEntry, KeyPoolError, KeyPoolStats, Result};
+pub use types::KeyEntry;
 
 /// Key pool manager with traffic light health tracking and DB persistence
 #[derive(Clone)]
@@ -178,6 +178,7 @@ impl Default for KeyPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::types::KeyPoolError;
     use crate::types::KeyStatus;
 
     fn create_test_key(id: &str, status: KeyStatus) -> KeyEntry {

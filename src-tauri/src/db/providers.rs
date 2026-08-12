@@ -1,6 +1,6 @@
 //! Provider 表 CRUD（UPSERT，避免 REPLACE 触发子表级联删除）。
 
-use crate::types::{Provider, ProviderKind};
+use crate::types::Provider;
 
 impl super::Database {
     pub fn save_provider(&self, provider: &Provider) -> anyhow::Result<()> {
@@ -61,35 +61,5 @@ impl super::Database {
         // usage_log 已自包含（V12），不再预清理；直接删除 provider 即可。
         conn.execute("DELETE FROM providers WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
-    }
-
-    pub fn list_all_providers(&self) -> anyhow::Result<Vec<Provider>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, kind, base_url, api_path, config_json, enabled, created_at, updated_at, sort_order FROM providers ORDER BY sort_order, created_at"
-        )?;
-
-        let providers = stmt.query_map([], |row| {
-            let kind_str: String = row.get(2)?;
-            let config_str: String = row.get(5)?;
-            Ok(Provider {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                kind: ProviderKind::from_str(&kind_str),
-                base_url: row.get(3)?,
-                api_path: row.get(4)?,
-                config: serde_json::from_str(&config_str).unwrap_or_default(),
-                enabled: row.get(6)?,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                sort_order: row.get(9)?,
-            })
-        })?;
-
-        let mut result = Vec::new();
-        for provider in providers {
-            result.push(provider?);
-        }
-        Ok(result)
     }
 }

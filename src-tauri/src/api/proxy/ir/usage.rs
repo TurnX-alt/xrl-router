@@ -13,6 +13,7 @@ use super::types::{IrRequest, IrSystemContent, IrUsage};
 ///   + cache_creation + cache_read
 /// - `message_delta`: output_tokens + cache_read
 /// - `content_block_delta`: output_chars（text/thinking 字符数，回退估算用）
+#[cfg(test)]
 pub fn extract_messages_usage(chunk: &Value) -> IrUsage {
     let event_type = chunk["type"].as_str().unwrap_or("");
     let mut usage = IrUsage::default();

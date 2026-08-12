@@ -196,17 +196,6 @@ const keyLabelMap = computed(() => {
   return m;
 });
 
-// Build per-key-per-model data for hover drilldown
-const drillData = computed(() => {
-  const map: Record<string, Record<string, number>> = {};
-  for (const row of data.value) {
-    const kid = row.key_id || '(all)';
-    if (!map[`${row.day}|${kid}`]) map[`${row.day}|${kid}`] = {};
-    map[`${row.day}|${kid}`]['total'] = (map[`${row.day}|${kid}`]['total'] || 0) + row.total_tokens;
-  }
-  return map;
-});
-
 function mdVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
@@ -332,9 +321,6 @@ function setRange(r: 'today' | '1d' | '7d' | '30d') {
   showPicker.value = false;
   fetchStats();
 }
-
-const customFrom = ref('');
-const customTo = ref('');
 
 async function fetchStats() {
   const now = Math.floor(Date.now() / 1000);

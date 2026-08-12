@@ -308,11 +308,6 @@ onMounted(async () => {
   color: var(--md-sys-color-on-surface);
 }
 
-.subtitle {
-  margin: 4px 0 0;
-  color: var(--md-sys-color-on-surface-variant);
-}
-
 .section {
   background: var(--md-sys-color-surface-container-low);
   border-radius: var(--md-sys-shape-corner-medium);

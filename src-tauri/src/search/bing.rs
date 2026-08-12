@@ -18,7 +18,6 @@
 //!   base64url 解码还原真实 URL（SearXNG bing.py 同款逻辑）
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use base64::Engine as _;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, UPGRADE_INSECURE_REQUESTS, USER_AGENT};

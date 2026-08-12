@@ -1,14 +1,10 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(deprecated)]
 
 use crate::config::Config;
 use crate::db::Database;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tracing::{info, error};
 
 mod config;

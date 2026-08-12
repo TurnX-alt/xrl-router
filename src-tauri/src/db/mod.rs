@@ -120,12 +120,6 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(sql, params)
     }
-
-    /// Execute a batch of SQL statements.
-    pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(sql)
-    }
 }
 
 #[cfg(test)]

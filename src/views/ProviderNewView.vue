@@ -279,8 +279,6 @@ onMounted(async () => {
 
 <style scoped>
 .page { max-width: 640px; }
-.back-btn { display: inline-flex; align-items: center; gap: 4px; border: none; background: transparent; color: var(--md-sys-color-on-surface-variant); cursor: pointer; font-family: inherit; font-size: 0.875rem; padding: 0; margin-bottom: 12px; }
-.back-btn:hover { color: var(--md-sys-color-on-surface); }
 .page__title { margin: 0 0 24px; }
 .field { width: 100%; margin-bottom: 16px; display: block; }
 .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }

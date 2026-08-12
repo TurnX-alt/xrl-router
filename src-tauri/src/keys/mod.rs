@@ -1,3 +1,3 @@
 pub mod pool;
 
-pub use pool::{KeyPool, KeyPoolError, KeyPoolStats};
+pub use pool::KeyPool;

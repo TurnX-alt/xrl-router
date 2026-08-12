@@ -249,11 +249,6 @@ export const requestLogApi = {
       `/api/stats/requests?page=${params.page ?? 1}&page_size=${params.page_size ?? 10}`),
 };
 
-// --- Public API ---
-export const publicApi = {
-  health: () => request<any>('/health'),
-};
-
 // --- App Settings ---
 export interface AppSettings {
   websearch_hijack: boolean;

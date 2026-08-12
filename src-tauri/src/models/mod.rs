@@ -65,11 +65,13 @@ impl ModelRegistry {
     }
 
     /// Find a model by ID.
+    #[allow(dead_code)]
     pub fn find_by_id(&self, id: &str) -> Option<Model> {
         self.models.get(id).map(|m| m.value().clone())
     }
 
     /// Get all enabled models.
+    #[allow(dead_code)]
     pub fn get_enabled(&self) -> Vec<Model> {
         self.models
             .iter()
@@ -79,6 +81,7 @@ impl ModelRegistry {
     }
 
     /// Get models by tier.
+    #[allow(dead_code)]
     pub fn get_by_tier(&self, tier: &str) -> Vec<Model> {
         self.by_tier
             .get(tier)
@@ -96,6 +99,7 @@ impl ModelRegistry {
     }
 
     /// Check if registry is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
     }

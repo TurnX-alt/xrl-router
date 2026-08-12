@@ -76,6 +76,9 @@ export default {
   'settings.data.reset.button': '清除所有本地数据',
   'settings.data.reset.confirm': '确定清除所有本地存储的数据吗？此操作不可恢复。',
 
+  'settings.cancel': '取消',
+  'settings.confirm': '确定',
+
   // ── 供应商列表 ──
   'providers.title': '供应商',
   'providers.add': '添加供应商',

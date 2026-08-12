@@ -75,9 +75,4 @@ impl Config {
 
         config
     }
-
-    /// Get the socket address string for the HTTP listener.
-    pub fn addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
 }
