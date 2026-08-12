@@ -1,12 +1,25 @@
-// Dynamic BASE_URL: use current origin for LAN browsers, localhost for Tauri/local dev
+// Dynamic BASE_URL: use current origin for LAN browsers, 127.0.0.1 for Tauri/local dev.
+// 注意用 127.0.0.1 而非 localhost：Windows 上 localhost 优先解析为 ::1（后端只绑 IPv4），
+// 且代理工具（Clash 等）的 bypass 规则通常覆盖 127.0.0.1 而未必覆盖 localhost——
+// 后者被代理劫持时响应是 HTML，会导致 JSON.parse 报 "Unexpected token '<'"。
 function getBaseUrl(): string {
-  if (typeof window === 'undefined') return 'http://localhost:19068';
+  if (typeof window === 'undefined') return 'http://127.0.0.1:19068';
 
   const { hostname, protocol, port } = window.location;
 
   // Tauri WebView or local development
-  if (hostname === 'localhost' || hostname === '127.0.0.1' || protocol === 'tauri:') {
-    return 'http://localhost:19068';
+  // 注意：Tauri 2 在 Windows 生产模式用 http://tauri.localhost（hostname=tauri.localhost，
+  // protocol=http:），macOS/Linux 用 tauri://localhost（protocol=tauri:）——两者都必须
+  // 命中本分支。漏掉 tauri.localhost 会落到下方 LAN 分支拼出 http://tauri.localhost，
+  // 请求打到 Tauri asset protocol 返回 index.html（200 HTML），JSON.parse 报
+  // "Unexpected token '<'"。dev 模式页面是 localhost:5173，故只有构建版触发。
+  if (
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname.endsWith('.localhost') ||
+    protocol === 'tauri:'
+  ) {
+    return 'http://127.0.0.1:19068';
   }
 
   // LAN browser: use same origin to avoid CORS
@@ -56,7 +69,17 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     connectionState.isOnline = true;
     connectionState.lastCheck = Date.now();
     const text = await res.text();
-    return text ? JSON.parse(text) : ({} as T);
+    try {
+      return text ? JSON.parse(text) : ({} as T);
+    } catch {
+      // 2xx 但不是 JSON：多半是请求被代理/端口占用者劫持，返回了 HTML 页。
+      // 把响应特征带进错误，便于直接定位来源（vite index.html / 代理拦截页等）。
+      const snippet = text.slice(0, 200).replace(/\s+/g, ' ').trim();
+      const ctype = res.headers.get('content-type') || 'unknown';
+      throw new Error(
+        `API error: 响应不是 JSON（content-type: ${ctype}，请求 ${opts.method || 'GET'} ${path}）: ${snippet}`,
+      );
+    }
   } catch (err: any) {
     // Network error = offline
     if (err.name === 'TypeError' || err.message?.includes('fetch')) {

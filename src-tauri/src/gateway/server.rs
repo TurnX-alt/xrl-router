@@ -11,7 +11,7 @@ use axum::http::HeaderValue;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Shared application state accessible by all handlers.
 #[derive(Clone)]
@@ -144,11 +144,13 @@ pub async fn start_gateway(state: Arc<AppState>) -> Result<()> {
         });
     }
 
-    // 单 listener：0.0.0.0:port，承载全部路由（/api/* 由 admin_ip_guard 限制 loopback）
+    // 单 listener：默认 host 0.0.0.0 时优先 IPv6 双栈 `[::]`（v6only=false，IPv4-mapped
+    // 兼容）——localhost 无论解析成 ::1 还是 127.0.0.1 都能连上；IPv6 不可用的环境
+    // 回退 IPv4。显式 host（如测试 127.0.0.1）按原样绑定。
+    // /api/* 由 admin_ip_guard 限制 loopback（已兼容 ::ffff:127.0.0.1）。
     let router = crate::api::build_router(state.clone()).layer(cors);
-    let addr = state.config.addr();
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("HTTP server on http://{}", addr);
+    let listener = bind_listener(&state.config.host, state.config.port).await?;
+    info!("HTTP server on http://{}", listener.local_addr()?);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(
             listener,
@@ -161,6 +163,35 @@ pub async fn start_gateway(state: Arc<AppState>) -> Result<()> {
     });
 
     Ok(())
+}
+
+/// 绑定监听 socket：通配 host 走 IPv6 双栈，否则按原样绑定。
+async fn bind_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener> {
+    if host == "0.0.0.0" {
+        match bind_dual_stack(port).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => warn!("IPv6 dual-stack bind failed ({}), falling back to IPv4", e),
+        }
+    }
+    Ok(tokio::net::TcpListener::bind((host, port)).await?)
+}
+
+/// 绑定 `[::]:port` 且 v6only=false：一个 socket 同时服务 IPv4 与 IPv6。
+/// IPv4 连接以 `::ffff:127.0.0.1` 形式进入，下游按 IPv4-mapped 处理。
+/// （tokio TcpSocket 不暴露 IPV6_V6ONLY 设置，故经 socket2 创建后转回 tokio。）
+async fn bind_dual_stack(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(
+        &std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into(),
+    )?;
+    socket.listen(1024)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    std_listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(std_listener)
 }
 
 /// Build a CORS layer constrained to configured local origins (tightens the
@@ -484,5 +515,45 @@ mod tests {
         assert_eq!(resp.status(), 200, "failover 关闭时 5xx 以 SSE error event 表达（HTTP 200）");
         let text = resp.text().await.unwrap();
         assert!(text.contains("error"), "应包含 error event: {}", text);
+    }
+
+    /// 双栈 listener 应同时接受 IPv4 与 IPv6 连接（v6only=false）。
+    #[tokio::test]
+    async fn test_dual_stack_listener_accepts_ipv4_and_ipv6() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if tokio::net::TcpSocket::new_v6().is_err() {
+            eprintln!("no IPv6 support on this host, skipping");
+            return;
+        }
+        let listener = bind_dual_stack(0).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // IPv4 直连应成功（双栈 socket 接受 IPv4-mapped 连接）
+        let mut client4 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // 纯 IPv6 回环直连也应成功
+        let mut client6 = tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+
+        let (mut srv4, _) = listener.accept().await.unwrap();
+        let (mut srv6, _) = listener.accept().await.unwrap();
+
+        // 客户端地址：IPv4 连接应为 IPv4-mapped（::ffff:127.0.0.1），并判为回环
+        let peer4 = srv4.peer_addr().unwrap();
+        assert!(
+            peer4.ip().to_canonical().is_loopback(),
+            "IPv4-mapped 连接应判为 loopback: {}",
+            peer4
+        );
+
+        // 双向写读验证连接可用
+        srv4.write_all(b"v4").await.unwrap();
+        srv6.write_all(b"v6").await.unwrap();
+        let mut buf = [0u8; 2];
+        client4.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"v4");
+        client6.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"v6");
     }
 }

@@ -14,6 +14,7 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useRouter } from 'vue-router';
+import { BASE_URL } from '../api';
 import { t } from '../i18n';
 
 const router = useRouter();
@@ -45,7 +46,7 @@ async function cancel() {
   // 下次插件重连时会重新注册、重新弹窗
   if (pluginId.value) {
     try {
-      await fetch(`http://localhost:19068/api/plugins/${pluginId.value}`, {
+      await fetch(`${BASE_URL}/api/plugins/${pluginId.value}`, {
         method: 'DELETE',
       });
     } catch (e) {

@@ -24,17 +24,28 @@ function stripPingFangOnDarwin(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [vue(), stripPingFangOnDarwin()],
+  plugins: [
+    vue({
+      // MD3 Web Components 是原生 custom element（main.ts 副作用 import 注册），
+      // 不是 Vue 组件：告知编译器避免 "Failed to resolve component: md-*" 警告
+      template: {
+        compilerOptions: {
+          isCustomElement: (tag: string) => tag.startsWith('md-'),
+        },
+      },
+    }),
+    stripPingFangOnDarwin(),
+  ],
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://localhost:19068',
-      '/v1': 'http://localhost:19068',
-      '/health': 'http://localhost:19068',
-      '/fm': 'http://localhost:19068',
-      '/install': 'http://localhost:19068',
+      '/api': 'http://127.0.0.1:19068',
+      '/v1': 'http://127.0.0.1:19068',
+      '/health': 'http://127.0.0.1:19068',
+      '/fm': 'http://127.0.0.1:19068',
+      '/install': 'http://127.0.0.1:19068',
       '/ws': {
-        target: 'ws://localhost:19068',
+        target: 'ws://127.0.0.1:19068',
         ws: true,
       },
     },

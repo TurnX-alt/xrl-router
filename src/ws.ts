@@ -15,7 +15,7 @@ class WebSocketClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private url: string;
 
-  constructor(url: string = 'ws://localhost:19068/ws') {
+  constructor(url: string = 'ws://127.0.0.1:19068/ws') {
     this.url = url;
   }
 

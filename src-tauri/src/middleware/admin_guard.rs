@@ -18,7 +18,10 @@ pub async fn admin_ip_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    if !addr.ip().is_loopback() {
+    // 双栈 listener（v6only=false）上 IPv4 连接以 ::ffff:127.0.0.1 形式出现，
+    // 需 to_canonical() 归一化后再判 loopback，否则本机请求被误拒 403
+    let ip = addr.ip();
+    if !(ip.is_loopback() || ip.to_canonical().is_loopback()) {
         warn!(
             path = %request.uri().path(),
             client_ip = %addr.ip(),
@@ -77,5 +80,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// 双栈 listener 下 IPv4 回环连接以 ::ffff:127.0.0.1 呈现，必须放行。
+    #[tokio::test]
+    async fn test_ipv4_mapped_loopback_allowed() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        // ::ffff:127.0.0.1
+        let ipv4_mapped_loopback = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1];
+        let app = app_with_guard().layer(MockConnectInfo(SocketAddr::from((ipv4_mapped_loopback, 0))));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// 双栈下非回环 IPv4-mapped 地址仍应 403。
+    #[tokio::test]
+    async fn test_ipv4_mapped_non_loopback_forbidden() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        // ::ffff:192.168.1.50
+        let ipv4_mapped = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 50];
+        let app = app_with_guard().layer(MockConnectInfo(SocketAddr::from((ipv4_mapped, 0))));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// 纯 IPv6 回环 ::1 也应放行。
+    #[tokio::test]
+    async fn test_ipv6_loopback_allowed() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        let app = app_with_guard().layer(MockConnectInfo(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0))));
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

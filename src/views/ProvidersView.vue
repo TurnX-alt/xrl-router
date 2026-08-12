@@ -105,7 +105,7 @@ import {
   mdiPlus, mdiInboxOutline, mdiDragHorizontalVariant, mdiDotsVertical,
   mdiPencilOutline, mdiDeleteOutline,
 } from '@mdi/js';
-import { providersApi, keysApi, type Provider } from '../api';
+import { providersApi, keysApi, BASE_URL, type Provider } from '../api';
 import { wsClient } from '../ws';
 import { useProviderStore } from '../stores/providers';
 import { t } from '../i18n';
@@ -204,7 +204,7 @@ function onKeyStats(event: any) {
 // 初始加载用；之后由 plugin-online/offline/activated 事件实时刷新。
 async function loadPluginStatuses() {
   try {
-    const resp = await fetch('http://localhost:19068/api/plugins');
+    const resp = await fetch(`${BASE_URL}/api/plugins`);
     if (!resp.ok) return;
     const plugins = await resp.json();
     for (const p of plugins) {

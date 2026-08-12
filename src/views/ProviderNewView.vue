@@ -75,7 +75,7 @@ import '@material/web/select/outlined-select.js';
 import '@material/web/select/select-option.js';
 import { useRouter, useRoute } from 'vue-router';
 import { mdiKey } from '@mdi/js';
-import { providersApi, keysApi, modelsApi } from '../api';
+import { providersApi, keysApi, modelsApi, BASE_URL } from '../api';
 import { t } from '../i18n';
 import MdiIcon from '../components/MdiIcon.vue';
 
@@ -187,7 +187,7 @@ async function save() {
 
     // 插件模式首次添加：确认激活插件供应商（编辑模式不重复确认）
     if (isPluginMode.value && !isEdit.value) {
-      await fetch(`http://localhost:19068/api/plugins/${pluginId.value}/confirm`, {
+      await fetch(`${BASE_URL}/api/plugins/${pluginId.value}/confirm`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });
@@ -207,7 +207,7 @@ onMounted(async () => {
   if (qPluginId) {
     pluginId.value = qPluginId;
     try {
-      const resp = await fetch(`http://localhost:19068/api/plugins/${qPluginId}`);
+      const resp = await fetch(`${BASE_URL}/api/plugins/${qPluginId}`);
       if (resp.ok) {
         const data = await resp.json();
         pluginInfo.value = data;
@@ -244,7 +244,7 @@ onMounted(async () => {
       pluginId.value = cfgPluginId;
       // 加载插件详情获取 key_count 等信息
       try {
-        const resp = await fetch(`http://localhost:19068/api/plugins/${cfgPluginId}`);
+        const resp = await fetch(`${BASE_URL}/api/plugins/${cfgPluginId}`);
         if (resp.ok) {
           pluginInfo.value = await resp.json();
         }

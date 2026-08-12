@@ -12,18 +12,23 @@ use std::sync::Arc;
 use std::path::PathBuf;
 
 use axum::extract::DefaultBodyLimit;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
-use tower_http::services::ServeDir;
+use include_dir::{include_dir, Dir};
 
 use crate::gateway::server::AppState;
 use crate::middleware::rate_limit::rate_limit_middleware;
 
 use super::handlers;
 use super::proxy;
+
+/// 编译期嵌入的前端构建产物（`dist/`）。
+/// 消除生产环境的 cwd/DIST_DIR 路径解析问题：无论 exe 装在哪、cwd 是啥，
+/// SPA fallback 都能从二进制自身读到 index.html。
+static DIST_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../dist");
 
 /// /v1/* 代理端点（套 rate_limit，128 req/min）。
 /// 注意：返回 `Router<AppState>`（未 with_state），由调用方 `.with_state` 统一收敛。
@@ -44,22 +49,84 @@ fn proxy_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
 }
 
 /// SPA fallback：返回 `index.html`，让 Vue Router 处理前端路由。
+/// 从编译期嵌入的 `DIST_DIR` 读取，消除生产环境 cwd 依赖。
 async fn spa_fallback() -> impl IntoResponse {
-    let dist_dir = std::env::var("DIST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("../dist"));
-
-    let index_path = dist_dir.join("index.html");
-    match tokio::fs::read(&index_path).await {
-        Ok(content) => Response::builder()
+    match DIST_DIR.get_file("index.html") {
+        Some(file) => Response::builder()
             .status(StatusCode::OK)
-            .header("content-type", "text/html; charset=utf-8")
-            .body(axum::body::Body::from(content))
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(axum::body::Body::from(file.contents()))
             .unwrap(),
-        Err(_) => Response::builder()
+        None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(axum::body::Body::from("index.html not found"))
             .unwrap(),
+    }
+}
+
+/// /favicon.ico：从嵌入 dist 的根目录读取（vite 构建产物在 dist/ 根下）。
+async fn serve_favicon() -> impl IntoResponse {
+    match DIST_DIR.get_file("favicon.ico") {
+        Some(file) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/x-icon")
+            .header(header::CACHE_CONTROL, "public, max-age=86400")
+            .body(axum::body::Body::from(file.contents()))
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::from(""))
+            .unwrap(),
+    }
+}
+
+/// `/assets/*` 静态资源：从嵌入的 `DIST_DIR/assets/` 读取（与 spa_fallback 同源）。
+/// 路径参数是 vite 构建时生成的 hash 文件名，带 `&str` 即可。
+async fn serve_asset(axum::extract::Path(name): axum::extract::Path<String>) -> impl IntoResponse {
+    // 防路径穿越：只允许安全字符（hash + 扩展名）
+    if name.contains("..") || name.contains('\\') {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(axum::body::Body::from("invalid path"))
+            .unwrap();
+    }
+    let asset_path = format!("assets/{}", name);
+    match DIST_DIR.get_file(&asset_path) {
+        Some(file) => {
+            let ctype = mime_for_filename(&name);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, ctype)
+                // vite hash 文件名 + 短期缓存：文件名本身决定内容变化，安全缓存
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .body(axum::body::Body::from(file.contents()))
+                .unwrap()
+        }
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::from("asset not found"))
+            .unwrap(),
+    }
+}
+
+/// 按扩展名返回 MIME 类型（vite 构建只产出 JS/CSS/woff2/svg/png）。
+fn mime_for_filename(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("");
+    match ext {
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
     }
 }
 
@@ -114,16 +181,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // admin_ip_guard：非 loopback IP → 403 Forbidden
         .layer(middleware::from_fn(crate::middleware::admin_ip_guard));
 
-    // 静态文件服务：从 `dist/assets/` 目录读取前端构建产物（JS、CSS、图片等）
-    let dist_dir = std::env::var("DIST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("../dist"));
-    let assets_dir = dist_dir.join("assets");
-
     Router::new()
         // Health check
         .route("/health", get(handlers::health_check))
-        .route("/", get(handlers::health_check))
         // WebSocket endpoints (no rate limiting)
         .route("/ws", get(handlers::ws_handler))
         .route("/ws/plugin", get(handlers::plugin_ws_handler))
@@ -133,9 +193,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(api_routes)
         // /v1/* 代理（套 rate_limit，128 req/min）
         .merge(proxy_routes(&state))
-        // 静态文件服务（前端构建产物）
-        .nest_service("/assets", ServeDir::new(&assets_dir))
-        // SPA fallback：所有未匹配的 GET 请求返回 `index.html`
+        // /favicon.ico
+        .route("/favicon.ico", get(serve_favicon))
+        // /assets/* 静态资源（从嵌入的 dist/assets/ 读取）
+        .route("/assets/*name", get(serve_asset))
+        // SPA fallback：未匹配 GET → 嵌入的 dist/index.html
         .fallback(get(spa_fallback))
         .with_state(state)
 }

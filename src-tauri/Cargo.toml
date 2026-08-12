@@ -21,6 +21,10 @@ tauri-plugin-shell = "2"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+# 双栈监听需显式设置 IPV6_V6ONLY（tokio TcpSocket 不暴露该方法）
+socket2 = "0.6"
+# SPA fallback / 静态资源：编译期嵌入 dist，消除生产环境的路径解析问题
+include_dir = "0.7"
 
 # HTTP framework
 axum = { version = "0.7", features = ["ws"] }
