@@ -341,11 +341,20 @@ pub fn run() {
             // souvlaki 在主线程创建 MediaControls。macOS 的 MPRemoteCommandCenter /
             // MPNowPlayingInfoCenter 必须在主线程调用，故 MediaControls 存入 managed
             // state（`MediaControlsState`），引擎线程经 `run_on_main_thread` dispatch
-            // 到这里访问。Windows SMTC 暂降级为 stub（Tauri 2 难以提取 HWND，传 None）。
+            // 到这里访问。
+            // Windows SMTC：souvlaki 的 `MediaControls::new` 对 hwnd=None 会 expect
+            // panic（无 stub 降级），必须传真实窗口 HWND（tauri::WebviewWindow::hwnd）。
+            #[cfg(target_os = "windows")]
+            let hwnd: Option<*mut std::ffi::c_void> = app
+                .get_webview_window("main")
+                .and_then(|w| w.hwnd().ok())
+                .map(|h| h.0 as *mut std::ffi::c_void);
+            #[cfg(not(target_os = "windows"))]
+            let hwnd: Option<*mut std::ffi::c_void> = None;
             let media_controls = souvlaki::MediaControls::new(souvlaki::PlatformConfig {
                 display_name: "Claude FM",
                 dbus_name: "im.xrl.router",
-                hwnd: None,
+                hwnd,
             });
             let mut media_controls = match media_controls {
                 Ok(mut ctrl) => {
